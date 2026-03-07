@@ -1,632 +1,191 @@
-● TLS-before-main mechanism: what I found
+# TLS / loader / CRT guarded-static investigation notes
+
+## Scope
+
+Target: live `conhost.exe` process in WinDbg.
+
+Goal: understand how TLS relates to loader startup, `main`, and real runtime initialization.
+
+## 1. Initial debugger state
+
+- Initial stack was a debugger break-in thread, not the app's crash/work stack:
+  - `ntdll!DbgBreakPoint`
+  - `ntdll!DbgUiRemoteBreakin`
+  - `KERNEL32!BaseThreadInitThunk`
+  - `ntdll!RtlUserThreadStart`
+- Process identified as `conhost.exe`.
+
+## 2. Loader structure walk
+
+- Inspected `TEB`, `PEB`, `PEB->Ldr`, loader lists, and `_LDR_DATA_TABLE_ENTRY` records.
+- Loader state looked sane and internally consistent.
+- Main image resolved from loader state as `conhost.exe`.
+
+## 3. Loader -> entrypoint -> app startup
+
+- `ntdll!LdrpImageEntry` pointed to the main image loader entry.
+- Main image `EntryPoint` resolved to `conhost!wWinMainCRTStartup`.
+- Startup path reconstructed as:
+  1. `ntdll!LdrInitializeThunk`
+  2. `ntdll!LdrpInitializeProcess`
+  3. `conhost!wWinMainCRTStartup`
+  4. `conhost!__scrt_common_main_seh`
+  5. `conhost!wWinMain`
+- `wWinMain` then hands off real work to `conhost!ConsoleIoThread` via `ConsoleCreateIoThreadLegacy`.
+
+## 4. TLS directory and pre-main TLS setup
 
-  I investigated how TLS is set up before main/wWinMain in this conhost.exe.
-
-  Short version:
-
-    • conhost.exe does have a PE TLS directory
-    • it uses static TLS storage
-    • it appears to have no PE TLS callback functions
-    • it also has no CRT dynamic TLS init callback active
-    • so the loader still allocates/copies TLS for each thread, but there is no extra TLS callback code running before `wWinMain` in this specific binary
-
-  Evidence from the image
-
-  From the PE headers:
-
-    • TLS directory RVA: 0x9E190
-    • entrypoint: 0x1F760 → conhost!wWinMainCRTStartup
-
-  The TLS directory lives at:
-
-    • conhost!tls_used = 0x00007ff603aae190
-
-  Decoded from memory, it contains:
-
-    • StartAddressOfRawData = conhost!tls_start = 0x00007ff603abadb0
-    • EndAddressOfRawData   = conhost!tls_end   = 0x00007ff603abadb8
-    • AddressOfIndex        = conhost!tls_index = 0x00007ff603ad2a28
-    • AddressOfCallbacks    = 0x00007ff603aafac0
-
-  So the static TLS template size is:
-
-    • tls_end - tls_start = 8 bytes
-
-  That is tiny, but real.
-
-  Also:
-
-    • conhost!tls_index = 0
-
-  So the loader assigned this module TLS slot 0.
-
-  What the static TLS contains
-
-  At conhost!tls_start I dumped the template:
-
-    • first 8 bytes: 0x80000000_00000000
-
-  WinDbg also resolved tls_start next to:
-
-    • conhost!Init_thread_epoch
-
-  That strongly suggests this TLS block is used for MSVC/CRT per-thread initialization bookkeeping, not for some big application-owned TLS structure.
-
-  PE TLS callbacks: apparently none
-
-  The TLS callback array pointer is:
-
-    • AddressOfCallbacks = 0x00007ff603aafac0
-
-  Dumping that area showed:
-
-    • first several entries are 0
-
-  So for this image, the PE TLS callback array is effectively empty.
-
-  That means:
-
-    • the OS loader still recognizes the image as a TLS user
-    • but it has no callback functions to invoke from that array
-
-  CRT dynamic TLS callback: also not active here
-
-  I also checked the CRT-side hook:
-
-    • conhost!_scrt_get_dyn_tls_init_callback returns &conhost!_dyn_tls_init_callback
-    • conhost!_dyn_tls_init_callback = 0
-    • conhost!_dyn_tls_dtor_callback = 0
-
-  So the MSVC CRT startup code does this:
-
-    1. get &_dyn_tls_init_callback
-    2. check whether *_dyn_tls_init_callback != 0
-    3. only then call it
-
-  In this binary that pointer is null, so the path is skipped.
-
-  Why the CRT checks a TLS init callback at all
-
-  This is the subtle part.
-
-  There are two related but different TLS mechanisms here:
-
-  1. Loader / PE TLS
-  This is the OS-level mechanism driven by the PE TLS directory:
-
-    • static TLS template
-    • TLS slot index
-    • optional TLS callback array
-
-  2. CRT dynamic thread-local initialization
-  MSVC also supports dynamic initialization for thread_local / TLS-backed C++ objects.
-
-  In __scrt_common_main_seh, I already saw the CRT logic:
-
-    • it fetches _dyn_tls_init_callback
-    • if non-null, it calls it with reason 2 = DLL_THREAD_ATTACH
-
-  That manual call exists to make sure the primary thread gets dynamic thread-local initialization when needed.
-
-  But in this conhost.exe build:
-
-    • _dyn_tls_init_callback == 0
-
-  So there is no dynamic TLS init routine to run.
-
-  What the loader does before wWinMain
-
-  Process-start side
-  The loader-side helper for TLS data is:
-
-    • ntdll!LdrpHandleTlsData
-
-  From its disassembly, it:
-
-    • reads image directory 9 (TLS directory)
-    • allocates loader TLS bookkeeping
-    • assigns/registers a TLS slot
-    • links the module into the loader TLS list
-
-  I also dumped the loader TLS bookkeeping list:
-
-    • ntdll!LdrpTlsList
-    • first entry at 0x00000000004250b0
-
-  That entry mirrors the conhost TLS directory exactly:
-
-    • raw data start = conhost!tls_start
-    • raw data end = conhost!tls_end
-    • index addr = conhost!tls_index
-    • callback addr = 0x00007ff603aafac0
-    • owning module entry = 0x0000000000424ce0 = main image _LDR_DATA_TABLE_ENTRY
-
-  So conhost is definitely registered as a TLS-bearing image.
-
-  Per-thread allocation path
-
-  For thread startup, I disassembled:
-
-    • ntdll!LdrpInitializeThread
-    • ntdll!LdrpAllocateTls
-    • ntdll!LdrpCallTlsInitializers
-
-  That path is very clear:
-
-    1. LdrpInitializeThread
-    2. calls LdrpAllocateTls
-    3. allocates/extends the thread TLS vector
-    4. walks LdrpTlsList
-    5. copies each module’s TLS template into that thread’s slot
-    6. calls LdrpCallTlsInitializers(..., DLL_THREAD_ATTACH) for modules that have callbacks
-
-  In LdrpInitializeThread, I saw:
-
-    • call ntdll!LdrpAllocateTls
-    • later call ntdll!LdrpCallTlsInitializers
-    • with ecx = 2 → DLL_THREAD_ATTACH
-
-  So for secondary threads, TLS is prepared before normal thread entry logic.
-
-  Concrete proof from actual thread TLS vectors
-
-  The working threads’ TEB.ThreadLocalStoragePointer values are non-null.
-
-  Examples:
-
-    • thread 0 TLS vector at 0x000000000044c6e0
-    • thread 1 TLS vector at 0x000000000044c0a0
-
-  Slot 0 of those vectors points to per-thread TLS blocks:
-
-    • thread 0 slot 0 → 0x00000000004366a0
-    • thread 1 slot 0 → 0x0000000002c3d720
-
-  That matches conhost!tls_index = 0.
-
-  So the loader really did allocate per-thread storage for this image.
-
-  Important conclusion
-
-  For this conhost.exe, the actual “TLS before main” story is:
-
-    1. loader sees a TLS directory
-    2. loader registers the image in LdrpTlsList
-    3. loader assigns tls_index = 0
-    4. loader creates/copies the 8-byte static TLS block for threads
-    5. there are no PE TLS callbacks to invoke
-    6. CRT startup checks for _dyn_tls_init_callback
-    7. _dyn_tls_init_callback is null, so no CRT dynamic TLS init runs
-    8. execution continues into:
-       • wWinMainCRTStartup
-       • __scrt_common_main_seh
-       • wWinMain
-
-  So in this binary, TLS is mostly a data allocation/copy mechanism, not a “run code before main” mechanism.
-
-  Practical takeaway
-
-  If your question is:
-
-  “Does TLS execute code before main here?”
-  Answer:
-
-    • Not via PE TLS callbacks
-    • Not via CRT dynamic TLS init callback
-    • only static TLS allocation/copy is happening before wWinMain
-
-  “Is TLS still active in this image?”
-  Yes:
-
-    • the image has a real TLS directory
-    • the loader registers it
-    • per-thread TLS blocks exist
-    • slot index is assigned and used
-
-  Best next step
-
-  If you want, I can now investigate one of these:
-
-    1. where that 8-byte TLS variable is used inside conhost
-    2. how the loader sets up the main thread TLS vector during process init
-    3. compare main-image TLS vs DLL TLS entries in `LdrpTlsList`
-
-
-
-● What TLS is actually doing here
-
-  I traced the concrete mechanism further.
-
-  The key finding is:
-
-    • conhost.exe uses TLS mainly for the CRT’s thread-safe static initialization epoch
-    • not for PE TLS callbacks
-    • not for a custom “run code before main” callback
-
-  So TLS is still part of the pre-main setup, but as per-thread data provisioning, not as a TLS-callback code path.
-
-  The TLS payload in this image
-
-  The PE TLS template is only 8 bytes:
-
-    • conhost!tls_start = 0x00007ff603abadb0
-    • conhost!tls_end   = 0x00007ff603abadb8
-
-  Raw template:
-
-    • +0x0 = 0x00000000
-    • +0x4 = 0x80000000
-
-  The symbol at +0x4 is:
-
-    • conhost!Init_thread_epoch
-
-  So the image’s TLS block is basically:
-
-    1. one dword at offset 0
-    2. Init_thread_epoch at offset 4
-
-  The loader part
-
-  Earlier we confirmed:
-
-    • conhost!tls_index = 0
-    • the loader registered this image in ntdll!LdrpTlsList
-    • each thread gets a per-thread TLS block for this image in TLS slot 0
-
-  Live thread examples:
-
-    • thread 0 slot 0 → 0x004366a0
-    • thread 1 slot 0 → 0x02c3d720
-
-  Their contents:
-
-  Thread 0
-    • [slot0+0] = 0x00000000
-    • [slot0+4] = 0x80000007
-
-  Thread 1
-    • [slot0+0] = 0x00000000
-    • [slot0+4] = 0x80000000
-
-  So the loader copied the TLS template, and later the main thread’s epoch advanced.
-
-  The global epoch
-
-  There is also:
-
-    • conhost!Init_global_epoch = 0x80000007
-
-  That matches the main thread’s TLS epoch value exactly:
-
-    • main thread Init_thread_epoch = 0x80000007
-
-  while another thread still has:
-
-    • Init_thread_epoch = 0x80000000
-
-  That is strong evidence this TLS value is used as a per-thread cache of the global initialization epoch.
-
-  The actual CRT logic
-
-  I disassembled the helpers that use this TLS field.
-
-  conhost!Init_thread_header
-
-  This is the most important one.
-
-  It does:
-
-    1. enter CRT lock
-    2. inspect the guarded static’s state
-    3. if another thread already initialized it:
-       • read the TLS vector from gs:[58h]
-       • load tls_index
-       • fetch current thread’s TLS block
-       • write Init_global_epoch into TLS_block + 4
-
-  The critical instructions are:
-
-    • mov rax, qword ptr gs:[58h]
-    • mov ecx, dword ptr [conhost!tls_index]
-    • mov rdx, qword ptr [rax+rcx*8]
-    • mov eax, dword ptr [conhost!Init_global_epoch]
-    • mov dword ptr [rdx+4], eax
-
-  So this directly proves:
-
-    • the CRT uses loader-provided TLS slot lookup
-    • then writes to the TLS field at offset +4
-    • which is exactly Init_thread_epoch
-
-  conhost!Init_thread_footer
-
-  This completes successful initialization of a guarded static.
-
-  It does:
-
-    1. enter lock
-    2. increment Init_global_epoch
-    3. store the new epoch into the guard object
-    4. fetch current thread TLS block via gs:[58h] + tls_index
-    5. store the new epoch into TLS_block + 4
-
-  Again, directly:
-
-    • mov edx, dword ptr [conhost!tls_index]
-    • mov rax, qword ptr gs:[58h]
-    • mov r8, qword ptr [rax+rdx*8]
-    • mov eax, dword ptr [conhost!Init_global_epoch]
-    • mov dword ptr [r8+4], eax
-
-  So the thread that performs the initialization updates its own TLS epoch cache.
-
-  conhost!Init_thread_abort
-
-  If initialization fails/aborts:
-
-    • it resets the guard state to 0
-    • then notifies waiters
-
-  So the usual CRT guarded-static state machine is present.
-
-  What this means semantically
-
-  This is the classic MSVC CRT model for thread-safe local static initialization.
-
-  Conceptually:
-
-    • each guarded static has a global state / epoch
-    • each thread has a TLS Init_thread_epoch
-    • the CRT compares thread epoch vs global epoch to know whether the thread has observed the latest initialized state
-    • this avoids unnecessary locking in some paths and supports safe lazy initialization
-
-  Relationship to “before main”
-
-  Here is the important distinction.
-
-  What happens before main
-  Before wWinMain runs, the loader:
-
-    1. recognizes the TLS directory
-    2. assigns tls_index
-    3. allocates the main thread’s TLS block
-    4. copies the TLS template into that block
-
-  That means the per-thread Init_thread_epoch storage already exists before CRT/app startup.
-
-  What does not happen before main
-  For this image, I found no active:
-
-    • PE TLS callbacks
-    • CRT dynamic TLS init callback
-
-  So no TLS callback code is executing before main.
-
-  Why TLS still matters before main
-  Because the CRT thread-safe-static machinery depends on that TLS block being ready from the start.
-
-  Without loader TLS setup, these helpers:
-
-    • Init_thread_header
-    • Init_thread_footer
-
-  would have nowhere to store/read the per-thread epoch.
-
-  The clean execution picture
-
-  So the actual mechanism is:
-
-    1. loader sets up TLS slot and per-thread TLS block
-    2. entry goes to wWinMainCRTStartup
-    3. CRT startup runs
-    4. later, whenever code hits a guarded local static, CRT helpers use:
-       • gs:[58h] → thread TLS vector
-       • tls_index
-       • TLS_block + 4 → Init_thread_epoch
-
-  That is the real TLS→main connection in this binary.
-
-  Best conclusion
-
-  For conhost.exe:
-
-    • TLS is present and active
-    • but it is used as runtime per-thread state storage
-    • specifically for CRT thread-safe statics
-    • not as a custom callback mechanism that executes code before main
-
-  If you want, I can go one step deeper
-
-  Next useful directions are:
-
-    1. find a concrete guarded static site that calls Init_thread_header/footer
-    2. inspect the main thread’s TLS slot 0 block symbolically
-    3. trace exactly where in startup Init_global_epoch advanced from 0x80000000 to 0x80000007
-
-
-
-
-● I found the concrete TLS-backed mechanism
-
-  The real mechanism in conhost.exe is now clear:
-
-    • PE TLS exists
-    • PE TLS callbacks are effectively absent here
-    • global C++ constructors are a separate CRT startup path
-    • the actual TLS consumer is MSVC’s thread-safe local static / singleton guard logic
-
-  So TLS is not “running code before main” here.
-  Instead, the loader gives each thread a TLS block, and later the CRT uses that block to decide whether a function-local static has already been safely initialized.
-
-
-  ─────────────────────────────────────────────────
-
-  The key assembly pattern
-
-  In the real singleton sites, the pattern is:
-
-    1. read gs:[58h]
-       • this is the thread TLS vector pointer path
-    2. dereference slot 0
-       • conhost!tls_index was already found to be 0
-    3. read +4 from that TLS block
-       • that is the per-thread Init_thread_epoch
-    4. compare it against a guard variable
-       • named things like $TSS0 or __PchSym_+offset
-    5. if needed, call:
-       • Init_thread_header
-       • constructor / lazy resolver
-       • atexit
-       • Init_thread_footer
-
-  That is the concrete TLS → CRT guarded-static connection.
-
-
-  ─────────────────────────────────────────────────────────
-
-  Direct proof sites
-
-  Telemetry::Instance
-
-  This is a perfect example.
-
-  It does exactly this:
-
-    • reads current thread TLS epoch via gs:[58h]
-    • compares it with
-    conhost!\Telemetry::Instance'::\2'::$TSS0
-    • if slow path is needed, calls conhost!Init_thread_header
-    • constructs Telemetry::Telemetry
-    • registers
-    dynamic atexit destructor for 's_Instance'
-    • calls conhost!Init_thread_footer
-
-  So this is a classic function-local singleton protected by CRT thread-safe static logic.
-
-  CommandLine::Instance
-
-  Same mechanism again:
-
-    • reads thread TLS epoch
-    • compares against guard at conhost!__PchSym_+0x4
-    • calls Init_thread_header
-    • allocates/builds the singleton
-    • registers atexit
-    • calls Init_thread_footer
-
-  It also has an abort helper:
-
-    • CommandLine::Instance::dtor$0 -> Init_thread_abort
-
-  That is more proof we are looking at the compiler’s guarded-static machinery.
-
-  Microsoft::Console::VirtualTerminal::TermTelemetry::Instance
-
-  Again the same sequence:
-
-    • TLS epoch read
-    • compare against
-    TermTelemetry::Instance::$TSS0
-    • Init_thread_header
-    • construct object
-    • atexit
-    • Init_thread_footer
-
-  NtPrivApi::_Instance
-
-  This one is especially useful because it shows the same mechanism used for lazy module loading:
-
-    • TLS epoch read
-    • guard compare
-    • Init_thread_header
-    • LoadLibraryExW
-    • store cached module handle
-    • atexit
-    • Init_thread_footer
-
-  So the guarded-static logic is not just for C++ objects; it is also protecting lazy runtime initialization.
-
-  NtPrivApi::s_NtClose, s_NtOpenProcess, s_NtQueryInformationProcess
-
-  These do the same pattern around lazy `GetProcAddress` resolution:
-
-    • call NtPrivApi::_Instance
-    • read TLS epoch
-    • compare guard
-    • Init_thread_header
-    • GetProcAddress
-    • cache function pointer
-    • Init_thread_footer
-
-  This is excellent evidence that the TLS epoch is actively used in ordinary runtime code.
-
-
-  ───────────────────────────────────────────────────────────────
-
-  What about the “dynamic initializer” functions I found earlier?
-
-  Those are a different bucket.
-
-  Things like:
-
-    • dynamic initializer for 'g_featureStateManager'
-    • dynamic initializer for 'widthDetector'
-    • dynamic initializer for 'DEFAULT_FONT_FACE'
-
-  are ordinary global/static constructors that the CRT runs during startup, typically via initterm/initterm_e.
-
-  So:
-
-    • global constructors = CRT startup work
-    • TLS callbacks = not the active story here
-    • TLS epoch = used later by guarded local statics
-
-
-  ───────────────────────────────────────────────────────────────
-
-  Bottom line
-
-  The final picture is:
-
-    1. loader allocates/copies conhost static TLS for each thread
-    2. that TLS block contains the per-thread CRT field Init_thread_epoch
-    3. execution reaches CRT/app startup normally
-    4. later, when code enters singleton/lazy-init functions, compiler-generated code reads:
-       • gs:[58h] → TLS vector
-       • slot 0 → conhost TLS block
-       • +4 → Init_thread_epoch
-    5. that thread epoch is compared with guard variables like $TSS0
-    6. Init_thread_header/footer enforce safe one-time initialization
-
-  So the real TLS-load-main relationship in this binary is:
-
-    • TLS is prepared before main
-    • but it is consumed by CRT guarded-static logic after startup
-    • not by PE TLS callback execution
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+- `conhost.exe` has a real PE TLS directory.
+- Important TLS symbols found:
+  - `conhost!tls_used`
+  - `conhost!tls_start`
+  - `conhost!tls_end`
+  - `conhost!tls_index`
+- TLS template size is 8 bytes:
+  - `+0x0 = 0x00000000`
+  - `+0x4 = conhost!Init_thread_epoch`
+- `tls_index` was assigned slot `0` in this run.
+
+## 5. What TLS is *not* doing here
+
+- No meaningful PE TLS callback execution was found.
+- No active CRT dynamic TLS init callback was found.
+- Therefore TLS here is not mainly a "run code before main" mechanism.
+
+## 6. What TLS *is* doing here
+
+- TLS is used by MSVC CRT thread-safe local static initialization.
+- Key CRT helpers found:
+  - `conhost!Init_thread_header`
+  - `conhost!Init_thread_footer`
+  - `conhost!Init_thread_abort`
+  - `conhost!Init_thread_wait`
+  - `conhost!Init_global_epoch`
+  - `conhost!Init_thread_epoch`
+
+## 7. Concrete guarded-static call sites found
+
+### `Telemetry::Instance`
+- Reads TLS via `gs:[58h]`
+- Reads current thread epoch from TLS slot block `+4`
+- Compares against `Telemetry::Instance::$TSS0`
+- Calls `Init_thread_header`
+- Constructs singleton
+- Registers `atexit`
+- Calls `Init_thread_footer`
+
+### `CommandLine::Instance`
+- Same guarded-static pattern
+- Guard stored at `__PchSym_+0x4`
+- Has failure path through `Init_thread_abort`
+
+### `Microsoft::Console::VirtualTerminal::TermTelemetry::Instance`
+- Same guarded-static pattern
+- Guard stored in `$TSS0`
+
+### `NtPrivApi::_Instance`
+- Same guarded-static pattern
+- Lazy loads DLL with `LoadLibraryExW`
+- Registers `atexit`
+
+### `NtPrivApi::s_NtClose / s_NtOpenProcess / s_NtQueryInformationProcess`
+- Same TLS/guard logic around lazy `GetProcAddress`
+- Caches function pointers after guarded initialization
+
+## 8. Distinction from global constructors
+
+- Separate `dynamic initializer for ...` functions were found.
+- Those are normal CRT global/static constructors run through startup init tables.
+- They are distinct from the TLS-backed guarded local-static mechanism above.
+
+## 9. Live runtime proof from real threads
+
+### Global epoch
+- `conhost!Init_global_epoch = 0x80000007`
+
+### Thread 0 (`ConsoleIoThread`)
+- `TEB.ThreadLocalStoragePointer = 0x44c6e0`
+- TLS slot 0 -> `0x4366a0`
+- Slot 0 block:
+  - `+0x0 = 0x00000000`
+  - `+0x4 = 0x80000007`
+
+### Thread 1 (render thread)
+- `TEB.ThreadLocalStoragePointer = 0x44c0a0`
+- TLS slot 0 -> `0x02c3d720`
+- Slot 0 block:
+  - `+0x0 = 0x00000000`
+  - `+0x4 = 0x80000000`
+
+This proves different threads can carry different cached TLS epochs.
+
+## 10. Live guard values
+
+- `Telemetry::Instance::$TSS0 = 0x80000001`
+- `CommandLine::Instance guard = 0x80000004`
+- `TermTelemetry::Instance::$TSS0 = 0x80000007`
+- `NtPrivApi::_Instance guard = 0x00000000`
+
+Interpretation:
+
+- `0` = never initialized
+- `0xFFFFFFFF` = initialization in progress
+- `epoch value` = initialized when global epoch had that value
+
+## 11. What the CRT helpers do
+
+### `Init_thread_header`
+- Enters a CRT critical section.
+- If guard == `0`, sets guard to `0xFFFFFFFF` (initialization in progress).
+- If guard == `0xFFFFFFFF`, waits.
+- Otherwise updates the current thread TLS epoch from `Init_global_epoch`.
+
+### `Init_thread_footer`
+- Enters critical section.
+- Increments `Init_global_epoch`.
+- Writes the new epoch to:
+  - the guard variable
+  - current thread TLS slot block `+4`
+- Leaves critical section and notifies waiters.
+
+### `Init_thread_abort`
+- Resets guard back to `0`.
+- Notifies waiters.
+
+## 12. Final conclusion
+
+For this `conhost.exe` session:
+
+- the loader prepares TLS before `main`
+- the TLS block contains per-thread CRT epoch state
+- the main consumer of that TLS is MSVC guarded local-static initialization
+- TLS is therefore acting as a runtime synchronization/cache mechanism, not mainly as a TLS-callback pre-main execution path
+
+## 13. Next live target
+
+- `NtPrivApi::_Instance` guard is still `0`
+- Best next live step: catch the first transition of that guard in real time:
+  - `0 -> 0xFFFFFFFF -> epoch`
+
+## 14. Follow-up on `NtPrivApi`
+
+- The lazy-loaded module string for `NtPrivApi::_Instance` is `"ntdll.dll"`.
+- The lazily resolved export names are:
+  - `NtOpenProcess`
+  - `NtQueryInformationProcess`
+  - `NtClose`
+- Current cached state is still completely empty:
+  - cached module handle = `0`
+  - cached `NtOpenProcess` pointer = `0`
+  - cached `NtQueryInformationProcess` pointer = `0`
+  - cached `NtClose` pointer = `0`
+- Therefore this whole lazy-init path has not executed yet in the observed session.
+
+### What would trigger it
+
+- `NtPrivApi::s_GetProcessParentId` is the concrete consumer.
+- That helper performs:
+  1. `NtOpenProcess`
+  2. `NtQueryInformationProcess`
+  3. `NtClose`
+- So the first real use of parent-process querying logic should trigger the guarded-static transition in `NtPrivApi`.
