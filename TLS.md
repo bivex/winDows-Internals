@@ -405,3 +405,81 @@ So the failure was **not** in the TLS plan or the breakpoint placement. The fail
   - a brand-new `conhost` thread stopped immediately after TLS allocation with slot 0 still at the initial template value
 
 So from this point onward, the remaining TLS gap is no longer reverse-engineering; it is only the lack of a continue-capable debugger session needed for the final live proof.
+
+## 19. Reattached-session live TLS check
+
+After reattaching to `conhost` in a fresh session, live thread inspection produced an important new distinction: **ordinary `conhost` threads still showed normal static TLS state, but the debugger-created attach thread did not.**
+
+### Live thread set in the reattached session
+
+- The process had three threads:
+  - `conhost!ConsoleIoThread`
+  - `conhost!Microsoft::Console::Render::RenderThread::_ThreadProc`
+  - `ntdll!DbgUiRemoteBreakin`
+- The `DbgUiRemoteBreakin` thread was the debugger-created attach thread, not an ordinary application worker thread.
+
+### TLS state of the ordinary `conhost` threads
+
+- Thread 0 (`ConsoleIoThread`):
+  - `TEB = 0x22b000`
+  - `ThreadLocalStoragePointer = 0x5f23d0`
+  - TLS slot 0 block = `0x5e6880`
+  - first 8 bytes = `00000000 80000003`
+- Thread 1 (render thread):
+  - `TEB = 0x231000`
+  - `ThreadLocalStoragePointer = 0x5f1fb0`
+  - TLS slot 0 block = `0x2819300`
+  - first 8 bytes = `00000000 80000000`
+
+So the earlier live TLS result still held in the reattached session:
+
+- one ordinary thread had caught up to the current epoch
+- another ordinary thread still had the initial per-thread epoch value
+
+### Global state still matched the thread-local state
+
+- `conhost!Init_global_epoch = 0x80000003`
+- `conhost!tls_index = 0`
+- `conhost!tls_start` still held the 8-byte template:
+  - `00 00 00 00 00 00 00 80`
+
+This remained consistent with the observed thread state:
+
+- caught-up thread: `Init_thread_epoch = 0x80000003`
+- not-yet-caught-up thread: `Init_thread_epoch = 0x80000000`
+
+### New special-case finding: the debugger attach thread had no TLS vector
+
+- For the `ntdll!DbgUiRemoteBreakin` thread:
+  - `TEB = 0x239000`
+  - `ThreadLocalStoragePointer = 0`
+- So this brand-new attach-created thread did **not** have a normal TLS vector installed at the observed stop.
+
+This is important because it means the debugger-created thread cannot be treated as an ordinary example of loader-created application thread TLS state.
+
+### Why this attach thread differs
+
+- Comparing `TEB+0x17EE` (`SameTebFlags`) across threads showed:
+  - ordinary threads: `SameTebFlags = 0`
+  - `DbgUiRemoteBreakin` thread: `SameTebFlags = 8`
+- Re-checking `ntdll!LdrpInitializeThread` showed that it tests bit `0x08` in `SameTebFlags` before the normal `LdrpAllocateTls` call.
+- If that bit is set, control goes to a special path.
+- That special path tests bit `0x20`; if `0x20` is not set, it exits before the normal TLS-allocation path.
+
+That exactly matched the attach thread:
+
+- `SameTebFlags = 8`
+- no observed `0x20` bit
+- `ThreadLocalStoragePointer = 0`
+
+### Meaning of this result
+
+- Ordinary `conhost` threads still behave exactly as the earlier TLS model predicts.
+- The debugger-created attach thread is a **special loader/debugger case** that bypasses the normal `LdrpAllocateTls` path.
+- Therefore it cannot serve as the missing live proof of a normal new `conhost` worker thread receiving the initial copied TLS template.
+
+### Updated practical conclusion
+
+- The earlier loader analysis remains supported.
+- The new reattached-session result does not weaken that TLS model.
+- It adds a new caveat: **a debugger attach thread is not a valid stand-in for an ordinary thread-start TLS event in `conhost`.**
