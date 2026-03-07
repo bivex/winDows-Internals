@@ -483,3 +483,99 @@ That exactly matched the attach thread:
 - The earlier loader analysis remains supported.
 - The new reattached-session result does not weaken that TLS model.
 - It adds a new caveat: **a debugger attach thread is not a valid stand-in for an ordinary thread-start TLS event in `conhost`.**
+
+## 20. Real-thread trigger path after reattach
+
+After identifying the debugger-created `DbgUiRemoteBreakin` thread as a special case, the next step was to find a **real, retriggerable, non-debugger thread-creation path** inside the already-running `conhost`.
+
+### What thread-creation paths exist in this image
+
+Direct-call tracing over on-disk `conhost.exe` showed these relevant thread-start helpers:
+
+- `Microsoft::Console::Interactivity::ServiceLocator::CreateConsoleInputThread`
+- `Microsoft::Console::VirtualTerminal::VtIo::CreateAndStartSignalThread`
+- `Microsoft::Console::HostSignalInputThread::Start`
+- `Microsoft::Console::PtySignalInputThread::Start`
+
+### Which paths are startup-only vs plausibly retriggerable
+
+- `VtIo::CreateAndStartSignalThread` was only reached from startup-style paths:
+  - `wWinMain`
+  - `Entrypoints::StartConsoleForCmdLine`
+- `HostSignalInputThread::Start` was only reached from `attemptHandoff`.
+- `CreateConsoleInputThread` was different:
+  - it is called from `ConsoleAllocateConsole`
+  - `ConsoleAllocateConsole` is directly called from `IoDispatchers::ConsoleHandleConnectionRequest`
+
+So the only realistically retriggerable live path in an already-running `conhost` was:
+
+1. `IoDispatchers::ConsoleHandleConnectionRequest`
+2. `ConsoleAllocateConsole`
+3. `CreateConsoleInputThread`
+4. normal loader thread start / `LdrpAllocateTls`
+
+### Practical trigger attempt with `AttachConsole`
+
+To drive that connection-request path from outside the debugger, a helper process was prepared to call:
+
+- `FreeConsole()`
+- `AttachConsole(targetPid)`
+
+The first attempt used the **`conhost.exe` PID itself** (`13944` / `0x3678`).
+
+That failed with:
+
+- `GetLastError() = 0x6`
+
+This was useful because it confirmed that `AttachConsole` does **not** want the console host PID. It wants a **console client process PID**.
+
+### Correct target type identified
+
+The attached `conhost` was then correlated with one of its hosted client processes:
+
+- PID `11720`
+- image name: `node-spawn-server.exe`
+
+That is the right kind of PID for a follow-up `AttachConsole` trigger attempt.
+
+### Why the follow-up trigger still did not complete
+
+When the helper targeted the client PID instead, it hung rather than completing normally.
+
+The reason was consistent with the already-seen debugger behavior:
+
+- the debuggee was still parked on the debugger attach break thread
+- the current stack still showed:
+  - `ntdll!DbgBreakPoint`
+  - `ntdll!DbgUiRemoteBreakin`
+- execution-control commands still could not reliably resume the target in a usable way
+
+So the helper-side connection request could not complete through the paused `conhost`.
+
+### Breakpoints that were armed for the intended live capture
+
+The live trap was prepared on the right path:
+
+- `conhost!IoDispatchers::ConsoleHandleConnectionRequest`
+- `conhost!ConsoleAllocateConsole`
+- `conhost!Microsoft::Console::Interactivity::Win32::ConsoleInputThread::Start`
+- `ntdll!LdrpInitializeThread+0x6f`
+
+So the remaining failure was **not** in breakpoint placement or path identification.
+
+### Updated conclusion from this phase
+
+- A plausible real-thread trigger path has now been identified.
+- The best practical trigger is a new console connection request, not the debugger-created attach thread.
+- The right external API shape is `AttachConsole(<client process pid>)`, not `AttachConsole(<conhost pid>)`.
+- The remaining blocker is still debugger execution control: the debuggee must be attached in a state where it can actually continue running past the initial attach break.
+
+### Current best next step
+
+To complete the missing live proof, the debugger must attach in a way that leaves `conhost` genuinely runnable. Once that exists, the next proof sequence is:
+
+1. arm the connection-request and post-`LdrpAllocateTls` breakpoints
+2. resume the debuggee
+3. trigger `AttachConsole(<client pid>)`
+4. catch a normal non-debugger thread birth
+5. inspect `TEB+0x58`, TLS slot 0, and the first 8 bytes of the copied `conhost` TLS block
