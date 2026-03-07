@@ -247,3 +247,89 @@ For this `conhost.exe` session:
 
 - The cold `NtPrivApi` singleton is not first exercised by ordinary process connection telemetry.
 - It is exercised by the **console control-event generation path**, specifically when `ServerGenerateConsoleCtrlEvent` must translate a request pid to its parent pid to find the owning console process entry.
+
+## 17. Loader-side TLS lifecycle for `conhost`
+
+This fills in the main TLS-specific gap left by the earlier notes: **how the loader actually creates and maintains the per-thread TLS state that `conhost` later reads through `gs:[58h]` and `tls_index`.**
+
+### Process startup: `ntdll!LdrpInitializeTls`
+
+- `LdrpInitializeTls` walks the loader module list from `PebLdr`.
+- For each loaded image, it checks PE directory entry **9** (the TLS directory) via `RtlpImageDirectoryEntryToDataEx`.
+- If an image has static TLS, it calls `LdrpAllocateTlsEntry` and links that image into the loader's TLS bookkeeping.
+- After scanning all images, it initializes the TLS bitmap / bitmap vector and then calls `LdrpAllocateTls`.
+
+So the loader-side meaning is:
+
+1. discover which loaded images have static TLS
+2. assign/track TLS slots for them
+3. allocate the initial per-thread TLS vector for the current thread
+
+### Per-thread allocation: `ntdll!LdrpAllocateTls`
+
+- `LdrpAllocateTls` acquires `LdrpTlsLock` shared and reads `LdrpTlsBitmap`.
+- It allocates a TLS vector with `LdrpGetNewTlsVector`.
+- It then walks `LdrpTlsList`.
+- For each TLS entry, it allocates heap memory for that thread's TLS block, copies the image TLS template with `memcpy`, and stores the resulting block pointer into the vector slot for that image.
+- Finally it writes the TLS vector pointer into the TEB at `TEB+0x58` and increments `LdrpActiveThreadCount`.
+
+This is the missing concrete explanation for the live `conhost` observations:
+
+- `conhost!tls_index = 0`
+- each thread has a TLS vector at `gs:[58h]`
+- slot 0 points at that thread's private copy of the `conhost` TLS template
+
+### Thread start: `ntdll!LdrpInitializeThread`
+
+- On thread startup, `LdrpInitializeThread` calls `LdrpAllocateTls` early.
+- It then acquires the loader lock and iterates loaded modules.
+- For eligible modules, it calls `LdrpCallTlsInitializers(..., reason = 2)` and also runs general init routines.
+
+So a newly created `conhost` thread gets its static TLS storage **before** normal module thread-attach/init work continues.
+
+### Thread exit: `ntdll!LdrShutdownThread`
+
+- On thread shutdown, `LdrShutdownThread` acquires the loader lock and walks loaded modules.
+- It calls TLS initializers with thread-detach reason **3**.
+- After that, it calls `LdrpFreeTls`.
+- The same path also performs FLS cleanup and activation-context-stack cleanup.
+
+So the loader does not just create static TLS blocks; it also tears them down on thread exit.
+
+### Dynamic TLS updates: `ntdll!LdrpHandleTlsData`
+
+- `LdrpHandleTlsData` handles the harder case where TLS state must be propagated while threads already exist.
+- It uses `LdrpTlsLock`, sizes work from `LdrpActiveThreadCount`, allocates/copies TLS template blocks for active threads, expands TLS vectors with `LdrpGetNewTlsVector` when needed, and updates process information with `NtSetInformationProcess`.
+- It also queues deferred TLS cleanup or frees old TLS blocks when entries are removed.
+
+This matters because the loader's TLS story is not only a one-time process-start event; it also has machinery for keeping TLS-consistent state across already-active threads.
+
+### Why some `conhost` threads still show `Init_thread_epoch = 0x80000000`
+
+- The `conhost` TLS template is only 8 bytes.
+- Earlier live inspection showed it begins as:
+  - `+0x0 = 0x00000000`
+  - `+0x4 = 0x80000000` (`Init_thread_epoch`)
+- `LdrpAllocateTls` copies that template into each thread's private TLS block.
+
+So a new thread starts with the **initial** thread epoch value. It only "catches up" later if that thread executes code that participates in the CRT guarded-static machinery.
+
+That explains the earlier live split:
+
+- one `conhost` thread had `Init_thread_epoch = 0x80000007`
+- another still had `Init_thread_epoch = 0x80000000`
+
+The second thread was not evidence of missing TLS. It was evidence that the loader had copied the initial TLS template correctly, but that thread had not yet advanced through the guarded-static epoch path.
+
+### Final TLS-specific conclusion
+
+- The loader creates the TLS slot and per-thread block.
+- The per-thread block starts as a copy of the image TLS template.
+- The CRT later consumes that block for thread-safe local static initialization.
+
+So the complete `conhost` picture is:
+
+1. `ntdll` discovers `conhost` static TLS
+2. `ntdll` allocates a per-thread slot/vector entry and copies the 8-byte template
+3. `conhost`/CRT later read that block through `gs:[58h]` and `tls_index`
+4. `Init_thread_epoch` stays at `0x80000000` until that thread actually participates in guarded-static initialization
