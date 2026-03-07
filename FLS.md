@@ -354,3 +354,62 @@ This means the process uses FLS simultaneously for:
 - C++/UCRT helper state
 - COM per-thread apartment / COM-local cleanup
 - Adobe / CEF / UI-library private thread state in the remaining unresolved slots
+
+## 17. Best next deep-dive
+
+After proving a live nonzero COM slot, the best next reverse-engineering step is now one of these:
+
+- resolve the exact meaning of one Adobe slot (`VulcanWrapper` / `VulcanControl`)
+- resolve one Chromium slot (`chrome_elf` or `libcef`)
+
+## 18. Live thread with nonzero slot 20
+
+A full thread sweep found that, in the current snapshot, only one live thread had a nonzero COM FLS slot:
+
+- thread index `2`
+- OS thread id `0x48b0`
+- `FlsData = 0x00518c10`
+- second value chunk (`FlsData+0x18`) = `0x0050a960`
+- slot 20 value (`chunk2+0x28`) = `0x0270f520`
+
+Direct evidence chain:
+- `~2e dq poi(@$teb+0x17c8) L4`
+  - showed `FlsData+0x18 = 0x0050a960`
+- `~2e dq poi(poi(@$teb+0x17c8)+0x18) L6`
+  - showed the last qword in that 5-entry extension chunk was `0x0270f520`
+
+Conclusion:
+- slot 20 is not just globally registered in `RtlpFlsContext`
+- it is live and populated on at least one real thread in this process
+
+## 19. Correlating slot 20 with actual COM usage
+
+Typing the slot-20 value through `combase` symbols gave:
+- `dt combase!tagSOleTlsData 0x0270f520`
+
+This resolved the pointed object as COM's per-thread `tagSOleTlsData` structure and exposed COM-specific fields such as:
+- `dwApartmentID`
+- `dwFlags`
+- `cComInits`
+- `pServerCall`
+- `pObjServer`
+- `pNativeApt`
+- `hwndSTA`
+- `pClipboardBroker`
+
+The same thread also had:
+- `TEB.ReservedForOle = 0x00561a30`
+
+The current stack for that thread was not inside `combase`; it was blocked in a long-lived `VulcanMessage5` wait path.
+That is still consistent with COM usage:
+- COM per-thread state persists in TLS/FLS even when the thread is currently executing application code or waiting
+- therefore COM activity does not need to be visible on the instantaneous stack to be proven
+
+Conclusion:
+- slot 20 is a real live pointer to COM per-thread TLS/FLS state
+- in this process, COM is active on at least one `VulcanMessage5`-owned worker thread
+- this confirms that `combase!FlsThreadCleanupCallback` is not dormant metadata; it has live thread-local state to clean up
+
+Note:
+- the public `dt` output for `tagSOleTlsData` is somewhat noisy in later fields, so the safest claim is the type identity and the presence of clearly COM-specific members, not every individual field value
+
