@@ -333,3 +333,75 @@ So the complete `conhost` picture is:
 2. `ntdll` allocates a per-thread slot/vector entry and copies the 8-byte template
 3. `conhost`/CRT later read that block through `gs:[58h]` and `tls_index`
 4. `Init_thread_epoch` stays at `0x80000000` until that thread actually participates in guarded-static initialization
+
+## 18. Attempted live thread-birth trace
+
+After documenting the loader-side TLS lifecycle, the next planned proof was to catch a **newly created `conhost` thread** immediately after loader TLS allocation and inspect its fresh TLS state live.
+
+### Intended live proof
+
+- Break in `ntdll!LdrpInitializeThread` just after `LdrpAllocateTls` returns.
+- Inspect:
+  - `@$teb`
+  - `poi(@$teb+58)` = thread TLS vector
+  - `poi(poi(@$teb+58))` = TLS slot 0 block for `conhost`
+  - first two dwords of that block
+- Expected result for a new thread:
+  - `+0x0 = 0`
+  - `+0x4 = 0x80000000`
+
+That would have been the direct live confirmation that the loader copied the initial 8-byte `conhost` TLS template into a just-created thread before guarded-static code advanced the per-thread epoch.
+
+### What was armed in WinDbg
+
+- Thread-create event break:
+  - `sxe ct`
+- One-shot breakpoint after `LdrpAllocateTls` inside `ntdll!LdrpInitializeThread`:
+  - `bp /1 ntdll!LdrpInitializeThread+0x6f ...`
+- The breakpoint command was set up to dump:
+  - current thread
+  - `@$teb`
+  - `poi(@$teb+58)`
+  - the TLS vector contents
+  - TLS slot 0 block contents
+  - stack backtrace
+
+### Baseline state observed before resume
+
+- Existing one-shot breakpoints from the earlier `NtPrivApi` work were still present but disabled.
+- On the currently selected thread, live inspection still showed a valid TLS vector:
+  - `$teb = 0x00000000002eb000`
+  - `poi(@$teb+58) = 0x000000000044c0a0`
+- The current stack was still consistent with an already-running `conhost` worker thread, not a fresh thread-start stop.
+
+### Actual blocker
+
+- The session still could not resume execution.
+- Both of the usual resume commands failed:
+  - `g`
+  - `gh`
+- Both returned the same failure:
+  - `hr = -2147220987`
+- `.lastevent` still reported a first-chance break instruction exception.
+
+So the failure was **not** in the TLS plan or the breakpoint placement. The failure was that this debugger session remained non-resumable for execution control.
+
+### What this means
+
+- The loader-side TLS explanation is already strong and consistent with the earlier static and live inspections.
+- The missing piece is only the final live thread-birth capture.
+- No contradictory TLS evidence appeared during this attempt.
+- The session limitation prevented catching a newly created thread after `LdrpAllocateTls`.
+
+### Current final status
+
+- Documented and supported:
+  - static TLS discovery in `LdrpInitializeTls`
+  - per-thread TLS block copy in `LdrpAllocateTls`
+  - thread attach path in `LdrpInitializeThread`
+  - thread detach cleanup in `LdrShutdownThread`
+  - explanation for threads still showing `Init_thread_epoch = 0x80000000`
+- Not yet captured live:
+  - a brand-new `conhost` thread stopped immediately after TLS allocation with slot 0 still at the initial template value
+
+So from this point onward, the remaining TLS gap is no longer reverse-engineering; it is only the lack of a continue-capable debugger session needed for the final live proof.
