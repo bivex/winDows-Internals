@@ -458,3 +458,77 @@ So the two statements can both be true at once:
 
 That is why this thread does not look like a simple classic STA message-pump thread, even though its COM state is not plain explicit MTA either.
 
+## 22. What `EnterNTA` / `LeaveNTA` actually do
+
+Disassembly of `combase!EnterNTA` showed a very small and direct mechanism:
+- call `SwitchContext`
+- read `TEB.ReservedForOle` (`gs:[0x30] + 0x1758`)
+- set bit `0x800` / bit 11 in `tagSOleTlsData.dwFlags`
+
+In other words, entering NTA is not just an abstract state change:
+- COM switches the thread's current context pointers
+- then explicitly marks the thread-local COM state as being in NTA via `dwFlags`
+
+Disassembly of `combase!LeaveNTA` showed the inverse path:
+- call `SwitchContext` to restore the previous context
+- if the restored context is not the special `gpNTAApartment` case, clear bit `0x800` in `dwFlags`
+
+Conclusion:
+- the `0x800` flag seen in thread 2's `tagSOleTlsData.dwFlags = 0x2de0` is directly explained by the `EnterNTA` path
+- this gives a concrete implementation-level reason why `CoGetApartmentType` classified the thread as `APTTYPE_NA`
+
+## 23. Candidate dynamic entry paths into NTA
+
+Known code paths that inline or call the `EnterNTA` / `LeaveNTA` mechanism included:
+- `combase!ComInvokeWithLockAndIPID`
+- `combase!CStdIdentity::QueryInterface`
+- `combase!CStaticMarshaler::MarshalInterface`
+- `combase!CStdMarshal::UnmarshalObjRef`
+- `combase!CStdMarshal::ReleaseMarshalObjRef`
+- `combase!MTAThreadDispatchCrossApartmentCall`
+
+Two especially useful semantic hits:
+
+### `ComInvokeWithLockAndIPID`
+
+This path was seen to:
+- save the previous context from `tagSOleTlsData+0x68`
+- switch to `g_pNTAEmptyCtx`
+- set `dwFlags |= 0x800`
+- later restore the saved context and clear `0x800`
+
+Conclusion:
+- cross-apartment COM invoke machinery is a real, concrete source of temporary NTA entry
+
+### `CStdIdentity::QueryInterface`
+
+This path was seen to:
+- check `IsThreadInNTA`
+- if not already in NTA, switch to `g_pNTAEmptyCtx`
+- set bit `0x800`
+- perform the interface operation
+- restore the prior context and clear the bit on exit
+
+Conclusion:
+- even `QueryInterface`-style identity operations may temporarily run under NTA semantics when COM decides that is required
+
+## 24. Where this session stopped
+
+We attempted the next live step:
+- thread-filtered breakpoint on `combase!EnterNTA`
+- restricted to the already-identified COM thread `tid 0x48b0`
+
+Goal of that breakpoint:
+- catch the exact dynamic caller that moves this thread into NTA
+- dump caller / stack / `rcx` context argument on hit
+
+Result in this session:
+- the breakpoint was set successfully
+- but the live run/continue step did not produce a usable hit before the session became unproductive / appeared stuck
+
+So the current boundary is:
+- static mechanism is established
+- live slot-20 COM state is established
+- public apartment classification (`NA_ON_STA`) is established
+- but the precise dynamic trigger for this specific thread's NTA entry remains to be captured in a later session
+
