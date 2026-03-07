@@ -413,3 +413,48 @@ Conclusion:
 Note:
 - the public `dt` output for `tagSOleTlsData` is somewhat noisy in later fields, so the safest claim is the type identity and the presence of clearly COM-specific members, not every individual field value
 
+## 20. Apartment type / COM mode for the live slot-20 thread
+
+For thread `2` (`tid 0x48b0`), the live COM slot-20 object had:
+- `dwFlags = 0x2de0`
+
+This value can be decoded directly against `combase!CoGetApartmentType`.
+
+Relevant control flow from `CoGetApartmentType`:
+- if bit `0x800` (bit 11) is set, COM writes `2` to the `_APTTYPE` output
+- then it uses additional flag bits and the main-thread test to choose the `_APTTYPEQUALIFIER`
+
+Applying that logic to `0x2de0`:
+- bit `0x800` is set
+  - so `_APTTYPE = 2`
+- low-byte sign bit (`0x80`) is also set
+  - so it takes the qualifier branch used for this neutral-apartment case
+- the main-thread special case does not fire in this snapshot
+  - so qualifier becomes `3`
+
+Using the standard COM public enum values:
+- `_APTTYPE = 2` -> `APTTYPE_NA`
+- `_APTTYPEQUALIFIER = 3` -> `APTTYPEQUALIFIER_NA_ON_STA`
+
+Conclusion:
+- the live slot-20 thread is best described as a **Neutral Apartment thread running on top of an STA base**
+- this is more specific than simply calling it "STA" or "MTA"
+
+## 21. Important nuance: public apartment type vs internal thread-behavior class
+
+`combase!ThreadTypeSpecific` uses a different decision tree than `CoGetApartmentType`.
+
+For the same thread-local `dwFlags = 0x2de0`, `ThreadTypeSpecific`:
+- sees the `0x820` pattern in the flags
+- and routes the thread to `g_DispatchOrImplicitMTAThreadRoutines`
+
+Interpretation:
+- `CoGetApartmentType` answers the public COM apartment identity question
+- `ThreadTypeSpecific` chooses which internal behavior/routine family COM should use on that thread
+
+So the two statements can both be true at once:
+- public apartment classification: `NA_ON_STA`
+- internal COM execution behavior: dispatched through the `DispatchOrImplicitMTA` routine family
+
+That is why this thread does not look like a simple classic STA message-pump thread, even though its COM state is not plain explicit MTA either.
+
