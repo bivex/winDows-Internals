@@ -189,3 +189,61 @@ For this `conhost.exe` session:
   2. `NtQueryInformationProcess`
   3. `NtClose`
 - So the first real use of parent-process querying logic should trigger the guarded-static transition in `NtPrivApi`.
+
+## 15. Follow-up on telemetry / connection flow
+
+- `ConsoleProcessHandle::ConsoleProcessHandle` does **not** use `NtPrivApi`.
+- It calls imported Win32 `OpenProcess` directly:
+  - desired access = `0x02000000`
+  - inherit handle = `FALSE`
+  - process id = constructor input
+- If that succeeds, it stores the process handle, creates `ConsoleProcessPolicy`, then calls:
+  - `Telemetry::Instance`
+  - `Telemetry::LogProcessConnected(handle)`
+
+### What `Telemetry::LogProcessConnected` actually does
+
+- On the active telemetry-enabled path it:
+  1. calls `Telemetry::TotalCodesForPreviousProcess`
+  2. calls `QueryFullProcessImageNameW` on the process handle
+  3. strips the basename with `PathFindFileNameW`
+  4. calls `Telemetry::FindProcessName`
+  5. updates telemetry tables / counters for the process image name
+- `Telemetry::TotalCodesForPreviousProcess` itself only drains counters from `TermTelemetry::Instance` and clears them.
+
+### Why this matters
+
+- The main process-connection telemetry path is real and active.
+- But it still does **not** explain the cold `NtPrivApi` singleton.
+- So the first caller of `NtPrivApi::s_GetProcessParentId` is likely in a different feature path than ordinary console process connection telemetry.
+
+## 16. Direct caller of `NtPrivApi::s_GetProcessParentId`
+
+- Additional eliminations from nearby symbol tracing:
+  - `Tracing::s_TraceConsoleAttachDetach` uses `Telemetry::Instance`, calls `ConsoleProcessHandle::GetProcessCreationTime`, then emits TraceLogging.
+  - `ConsoleProcessHandle::GetProcessCreationTime` only lazy-caches `GetProcessTimes` on the stored process handle.
+  - `capture_previous_context` is only unwind/context logic (`RtlCaptureContext`, `RtlLookupFunctionEntry`, `RtlVirtualUnwind`).
+  - `ConsoleArguments::_GetClientCommandline` only rebuilds / escapes a client command line string and does not use `NtPrivApi`.
+  - `attemptHandoff` is a handoff/delegation path (`CoInitializeEx`, `CoCreateInstance`, `CreatePipe`, `DuplicateHandle`, host signal thread startup) and showed no direct parent-process query.
+
+### Static xref result
+
+- A direct static scan of on-disk `C:\Windows\System32\conhost.exe` for `call rel32` sites targeting `NtPrivApi::s_GetProcessParentId` found exactly **one** hit.
+- The only direct call site resolves to:
+  - `ApiDispatchers::ServerGenerateConsoleCtrlEvent+0x73`
+
+### What that function does with the parent id
+
+- `ApiDispatchers::ServerGenerateConsoleCtrlEvent`:
+  1. enters the console-process-list critical section
+  2. reads a process id from the request message (`[rdi+8Ch]`)
+  3. searches the console process list for that id
+  4. if not found, calls `NtPrivApi::s_GetProcessParentId(&pid)`
+  5. searches the console process list again using the returned parent id
+  6. if found, allocates process data for the original pid
+  7. stores the original pid into global state and calls `HandleCtrlEvent`
+
+### Updated conclusion
+
+- The cold `NtPrivApi` singleton is not first exercised by ordinary process connection telemetry.
+- It is exercised by the **console control-event generation path**, specifically when `ServerGenerateConsoleCtrlEvent` must translate a request pid to its parent pid to find the owning console process entry.
