@@ -576,6 +576,54 @@ Minimal conclusion for this step:
 - a real live hit on `RtlGrowFunctionTable` was reproduced and captured by the agent in a controlled process
 - at function entry, the observed record was a `Type == 3` `_DYNAMIC_FUNCTION_TABLE` with `EntryCount == 1`, and the caller requested growth to `2`
 
+## Post-grow state and lookup after grow in a controlled repro
+
+Commands used:
+
+- `|1s`
+- `~0s`
+- `kb`
+- `u growable_ft_repro_x64+0x12b0 L100`
+- `.frame 2`
+- `dq 00000000\`0014fe70 L24`
+- `dps 00000000\`0014fe70 L24`
+- `dq ntdll!RtlpDynamicFunctionTable L2`
+- `dt ntdll!_DYNAMIC_FUNCTION_TABLE poi(ntdll!RtlpDynamicFunctionTable)`
+- `dd 00000000\`00533ed0 L6`
+- `dt ntdll!_IMAGE_RUNTIME_FUNCTION_ENTRY 00000000\`00533ed0`
+- `dt ntdll!_IMAGE_RUNTIME_FUNCTION_ENTRY 00000000\`00533edc`
+- `.fnent 00000000\`001d0120`
+
+Observed facts:
+
+- in the controlled repro, thread `~0` was observed stopped in `SleepEx` with return address `growable_ft_repro_x64+0x1376`
+- the disassembly of `growable_ft_repro_x64` shows:
+  - a call to `RtlGrowFunctionTable` at `growable_ft_repro_x64+0x1328`
+  - a later call to `RtlLookupFunctionEntry` at `growable_ft_repro_x64+0x1346`
+  - the sleep-after-grow call at `growable_ft_repro_x64+0x1370`
+- the common dynamic-table list head `ntdll!RtlpDynamicFunctionTable` pointed to `0x00000000001e0880`
+- `dt ntdll!_DYNAMIC_FUNCTION_TABLE 0x00000000001e0880` showed:
+  - `FunctionTable = 0x0000000000533ed0`
+  - `MinimumAddress = 0x1d0000`
+  - `MaximumAddress = 0x1d0300`
+  - `BaseAddress = 0x1d0000`
+  - `Type = 3 (RF_KERNEL_DYNAMIC)`
+  - `EntryCount = 2`
+- `dd 0x0000000000533ed0 L6` and `dt ntdll!_IMAGE_RUNTIME_FUNCTION_ENTRY` showed two entries in that runtime-function table:
+  - entry 0: `BeginAddress = 0x100`, `EndAddress = 0x106`, `UnwindData = 0x200`
+  - entry 1: `BeginAddress = 0x120`, `EndAddress = 0x126`, `UnwindData = 0x200`
+- `.fnent 0x00000000001d0120` resolved the second entry and reported:
+  - `BeginAddress = 0x120`
+  - `EndAddress = 0x126`
+  - `UnwindInfoAddress = 0x200`
+  - unwind info at `0x1d0200`
+
+Minimal conclusion for this step:
+
+- in the controlled repro, the post-grow dynamic-table state had `EntryCount == 2`
+- the second `RUNTIME_FUNCTION` entry (`0x120..0x126`) was present in the table after grow
+- the debugger was able to resolve `ControlPc = 0x1d0120` via `.fnent`, which is consistent with the post-grow `RtlLookupFunctionEntry` path observed in the repro disassembly
+
 ## Attempt to capture a live registration event in this session
 
 Commands used:
@@ -626,6 +674,7 @@ From the current live session, the agent verified that:
 - combined disassembly supports a `RtlAddGrowableFunctionTable -> RtlGrowFunctionTable -> RtlDeleteGrowableFunctionTable` lifecycle for `Type == 3` records
 - on the original `Creative_Cloud` / `libcef` target, no live caller of `RtlGrowFunctionTable` was captured, and no direct `RtlGrowFunctionTable` import was confirmed in the visible import output that was inspected
 - in a later controlled repro, a live caller chain into `RtlGrowFunctionTable` was captured
+- in that controlled repro, post-grow inspection showed `EntryCount == 2`, two `RUNTIME_FUNCTION` entries, and successful resolution of `ControlPc = 0x1d0120` through `.fnent`
 - a live registration event was attempted with breakpoints on the three registration APIs, but no hit was captured in this session
 - a dedicated live-hit attempt on `RtlGrowFunctionTable` also did not capture a hit in this session
 - a later controlled repro did capture a real live hit on `RtlGrowFunctionTable`
