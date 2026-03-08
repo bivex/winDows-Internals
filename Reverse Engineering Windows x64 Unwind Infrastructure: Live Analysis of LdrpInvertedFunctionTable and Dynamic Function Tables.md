@@ -1,0 +1,586 @@
+# Findings: `LdrpInvertedFunctionTable` (agent-verified only)
+
+## Scope
+
+This revision keeps only statements that were verified in the current live WinDbg session through the agent.
+Anything that was broader theory, public API background, or undocumented-but-unverified interpretation was removed.
+
+Target observed by the agent:
+
+- Windows 10 19045 x64
+- `ntdll` symbols loaded
+
+## Symbols confirmed by the agent
+
+Command used:
+
+`x ntdll!*InvertedFunctionTable*`
+
+Observed symbols:
+
+- `ntdll!LdrpInvertedFunctionTable`
+- `ntdll!LdrpInvertedFunctionTableSRWLock`
+- `ntdll!RtlInsertInvertedFunctionTable`
+- `ntdll!RtlRemoveInvertedFunctionTable`
+- `ntdll!RtlpInsertInvertedFunctionTableEntry`
+
+## Structure layouts confirmed by the agent
+
+Command used:
+
+`dt ntdll!_INVERTED_FUNCTION_TABLE`
+
+Observed layout:
+
+- `CurrentSize : Uint4B`
+- `MaximumSize : Uint4B`
+- `Epoch : Uint4B`
+- `Overflow : UChar`
+- `TableEntry : [512] _INVERTED_FUNCTION_TABLE_ENTRY`
+
+Command used:
+
+`dt ntdll!_INVERTED_FUNCTION_TABLE_ENTRY`
+
+Observed layout:
+
+- `FunctionTable : Ptr64 _IMAGE_RUNTIME_FUNCTION_ENTRY`
+- `DynamicTable : Ptr64 _DYNAMIC_FUNCTION_TABLE` at the same offset as `FunctionTable`
+- `ImageBase : Ptr64 Void`
+- `SizeOfImage : Uint4B`
+- `SizeOfTable : Uint4B`
+
+## Live contents of `LdrpInvertedFunctionTable`
+
+Command used:
+
+`dt ntdll!_INVERTED_FUNCTION_TABLE 0x00007ffd18d31500`
+
+Observed values:
+
+- `CurrentSize = 0x96`
+- `MaximumSize = 0x200`
+- `Epoch = 0x30a`
+- `Overflow = 0`
+
+Commands used:
+
+- `dx ((ntdll!_INVERTED_FUNCTION_TABLE*)0x00007ffd18d31500)->TableEntry[0]`
+- `dx ((ntdll!_INVERTED_FUNCTION_TABLE*)0x00007ffd18d31500)->TableEntry[1]`
+- `dx ((ntdll!_INVERTED_FUNCTION_TABLE*)0x00007ffd18d31500)->TableEntry[2]`
+- `lm m ntdll`
+- `lm m Creative_Cloud`
+- `lm m libcef`
+
+Observed entries and matching module ranges:
+
+1. `TableEntry[0]`
+   - `ImageBase = 0x7ffd18bb0000`
+   - `FunctionTable = 0x7ffd18d22000`
+   - `SizeOfImage = 0x1f8000`
+   - `SizeOfTable = 0xe4d8`
+   - `lm m ntdll` shows `ntdll` at `00007ffd\`18bb0000 - 00007ffd\`18da8000`
+2. `TableEntry[1]`
+   - `ImageBase = 0x7ff7c03b0000`
+   - `FunctionTable = 0x7ff7c05d1000`
+   - `SizeOfImage = 0x270000`
+   - `SizeOfTable = 0x12090`
+   - `lm m Creative_Cloud` shows `Creative_Cloud` at `00007ff7\`c03b0000 - 00007ff7\`c0620000`
+3. `TableEntry[2]`
+   - `ImageBase = 0x7ffc93600000`
+   - `FunctionTable = 0x7ffc9e87b000`
+   - `SizeOfImage = 0x0b9e7000`
+   - `SizeOfTable = 0x005cde64`
+   - `lm m libcef` shows `libcef` at `00007ffc\`93600000 - 00007ffc\`9efe7000`
+
+## Insert path confirmed by disassembly
+
+Command used:
+
+`u ntdll!RtlInsertInvertedFunctionTable L30`
+
+Observed call sequence in order:
+
+1. call `ntdll!RtlCaptureImageExceptionValues`
+2. load `ntdll!LdrpInvertedFunctionTableSRWLock`
+3. call `ntdll!RtlAcquireSRWLockExclusive`
+4. call `ntdll!LdrProtectMrdata` with `ecx = 0`
+5. call `ntdll!RtlpInsertInvertedFunctionTableEntry`
+6. call `ntdll!LdrProtectMrdata` with `ecx = 1`
+7. jump to `ntdll!RtlReleaseSRWLockExclusive`
+
+This is directly visible in the disassembly; no extra interpretation is needed.
+
+## Lookup path confirmed by disassembly
+
+### `RtlLookupFunctionEntry`
+
+Command used:
+
+`u ntdll!RtlLookupFunctionEntry L80`
+
+Observed facts:
+
+- the function reads `qword ptr [ntdll!LdrpInvertedFunctionTable+0x18]`
+- it later reads `dword ptr [ntdll!LdrpInvertedFunctionTable+0x20]`
+- if the fast range check fails, it calls `ntdll!RtlpxLookupFunctionTable`
+- if no result is found, execution branches to a call to `ntdll!RtlpLookupDynamicFunctionEntry`
+
+Also visible in this disassembly:
+
+- after a table is selected, the code subtracts image base from `ControlPc`
+- the code then performs a binary-search-style walk over table entries using comparisons against begin/end fields in the selected function table
+
+### `RtlpxLookupFunctionTable`
+
+Command used:
+
+`u ntdll!RtlpxLookupFunctionTable L80`
+
+Observed facts:
+
+- the function acquires `ntdll!LdrpInvertedFunctionTableSRWLock`
+- it reads `dword ptr [ntdll!LdrpInvertedFunctionTable]` as the current count
+- search starts with `r9d = 1`
+- the search base is `ntdll!LdrpInvertedFunctionTable+0x10`
+- comparisons are performed against `ImageBase` and `ImageBase + SizeOfImage`
+- on match, the selected entry is copied out to the caller buffer
+- the lock is then released
+
+On this build, the code therefore treats `TableEntry[0]` specially in `RtlLookupFunctionEntry`, while `RtlpxLookupFunctionTable` searches starting from index `1`.
+
+## Current unwind example confirmed by the agent
+
+Commands used:
+
+- `r rip`
+- `.fnent @rip`
+- `ln @rip`
+
+Observed output:
+
+- `rip = 00007ffd18c51020`
+- nearest symbol: `ntdll!DbgBreakPoint`
+- `.fnent @rip` reports:
+  - `BeginAddress = 00000000\`000a1020`
+  - `EndAddress = 00000000\`000a1022`
+  - `UnwindInfoAddress = 00000000\`0014e0b8`
+  - unwind info: `version 1, flags 0, prolog 0, codes 0`
+
+This confirms that, in the current session, WinDbg can resolve the current instruction pointer to a function entry and unwind metadata.
+
+## What this file does not claim anymore
+
+This file intentionally does **not** claim, unless separately proven in a later session:
+
+- the full architectural purpose of the inverted table beyond what the disassembly directly shows
+- any guarantee that the same layout or fast-path exists on other Windows builds
+- any detailed statement about VEH/SEH policy
+- any debugger-behavior claim under corruption scenarios
+- any statement that depends only on Microsoft documentation rather than the live agent output
+
+## Minimal conclusion supported by the agent
+
+From the current live session, the agent verified that:
+
+- `ntdll` contains a concrete `LdrpInvertedFunctionTable` object and related helper routines
+- the object stores entries containing `ImageBase`, `SizeOfImage`, `FunctionTable`/`DynamicTable`, and `SizeOfTable`
+- the current process has at least 150 populated entries
+- the first observed entries correspond to `ntdll`, `Creative_Cloud`, and `libcef`
+- `RtlInsertInvertedFunctionTable` updates this state while using `LdrpInvertedFunctionTableSRWLock` and `LdrProtectMrdata`
+- `RtlLookupFunctionEntry` reads from this table, uses a special case for entry data located at the start of the object, and falls back to `RtlpxLookupFunctionTable`
+- `RtlpxLookupFunctionTable` performs a range-based search over entries starting at index `1`
+- if that path does not produce a result, `RtlLookupFunctionEntry` can branch to `RtlpLookupDynamicFunctionEntry`
+
+## Dynamic function table symbols confirmed by the agent
+
+Command used:
+
+`x ntdll!*DynamicFunction*`
+
+Observed symbols:
+
+- `ntdll!RtlpDynamicFunctionTable`
+- `ntdll!RtlpDynamicFunctionTableTreeMin`
+- `ntdll!RtlpDynamicFunctionTableTreeMax`
+- `ntdll!RtlpDynamicFunctionTableLock`
+- `ntdll!RtlpLookupDynamicFunctionEntry`
+
+Command used:
+
+`x ntdll!*DynamicCallback*`
+
+Observed symbols:
+
+- `ntdll!RtlpDynamicCallbackTableTreeMin`
+- `ntdll!RtlpDynamicCallbackTableTreeMax`
+
+## Dynamic function table type enum confirmed by the agent
+
+Command used:
+
+`dt ntdll!_FUNCTION_TABLE_TYPE`
+
+Observed values:
+
+- `RF_SORTED = 0`
+- `RF_UNSORTED = 1`
+- `RF_CALLBACK = 2`
+- `RF_KERNEL_DYNAMIC = 3`
+
+## Current global state for dynamic tables on this target
+
+Commands used:
+
+- `dq ntdll!RtlpDynamicCallbackTableTreeMin L1`
+- `dq ntdll!RtlpDynamicCallbackTableTreeMax L1`
+- `dq ntdll!RtlpDynamicFunctionTableTreeMin L1`
+- `dq ntdll!RtlpDynamicFunctionTableTreeMax L1`
+- `dq ntdll!RtlpDynamicFunctionTable L2`
+- `dt ntdll!_LIST_ENTRY 0x00007ffd18d312c0`
+
+Observed values:
+
+- `RtlpDynamicCallbackTableTreeMin = 0`
+- `RtlpDynamicCallbackTableTreeMax = 0`
+- `RtlpDynamicFunctionTableTreeMin = 0`
+- `RtlpDynamicFunctionTableTreeMax = 0`
+- `RtlpDynamicFunctionTable` is a self-linked list head:
+  - `Flink = 0x00007ffd18d312c0`
+  - `Blink = 0x00007ffd18d312c0`
+
+On this target, the dynamic function table list appears empty at the moment these commands were executed.
+
+## `RtlpLookupDynamicFunctionEntry` path confirmed by disassembly
+
+Command used:
+
+`u ntdll!RtlpLookupDynamicFunctionEntry L120`
+
+Observed high-level flow:
+
+1. acquires `RtlpDynamicFunctionTableLock` in shared mode
+2. searches `RtlpDynamicCallbackTableTreeMin`
+3. if not found, searches `RtlpDynamicCallbackTableTreeMax`
+4. if still not found, searches `RtlpDynamicFunctionTableTreeMin`
+5. if still not found, searches `RtlpDynamicFunctionTableTreeMax`
+6. if no candidate is found, releases the shared lock and returns `NULL`
+
+Observed candidate fields read from the selected `_DYNAMIC_FUNCTION_TABLE`:
+
+- `+0x10` -> `FunctionTable`
+- `+0x30` -> `BaseAddress`
+- `+0x50` -> `Type`
+- `+0x54` -> `EntryCount`
+
+### Type-dependent behavior observed in `RtlpLookupDynamicFunctionEntry`
+
+From the `_FUNCTION_TABLE_TYPE` enum and the direct comparisons in disassembly:
+
+- if `Type == 0` (`RF_SORTED`), the function takes a binary-search-style path over the function table
+- if `Type == 3` (`RF_KERNEL_DYNAMIC`), it takes the same binary-search-style path
+- if `Type == 1` (`RF_UNSORTED`), it walks the function table linearly in `0x0c`-byte steps
+- otherwise, it takes the callback path, which matches `Type == 2` (`RF_CALLBACK`)
+
+### Callback path observed in `RtlpLookupDynamicFunctionEntry`
+
+For the callback case, the disassembly shows:
+
+- load callback from `+0x38`
+- load context from `+0x40`
+- release the shared lock before invoking the callback
+- store `BaseAddress` through the output pointer
+- invoke the callback through `ntdll!_guard_dispatch_icall_fptr`
+
+## Registration paths confirmed by disassembly
+
+### `RtlInstallFunctionTableCallback`
+
+Command used:
+
+`u ntdll!RtlInstallFunctionTableCallback L100`
+
+Observed facts:
+
+- it validates that the low two bits of `TableIdentifier` are `3`
+- it allocates a `_DYNAMIC_FUNCTION_TABLE`-sized object plus optional string storage
+- it stores:
+  - `BaseAddress` into `+0x20` and `+0x30`
+  - `BaseAddress + Length` into `+0x28`
+  - callback pointer into `+0x38`
+  - context into `+0x40`
+- it stores `Type = 2` at `+0x50`
+- it inserts the record into:
+  - `RtlpDynamicCallbackTableTreeMin`
+  - `RtlpDynamicCallbackTableTreeMax`
+  - `RtlpDynamicFunctionTable` list
+
+### `RtlAddGrowableFunctionTable`
+
+Command used:
+
+`u ntdll!RtlAddGrowableFunctionTable L100`
+
+Observed facts:
+
+- it allocates a `_DYNAMIC_FUNCTION_TABLE`-sized object
+- it stores `Type = 3` at `+0x50`
+- it inserts the record into:
+  - `RtlpDynamicFunctionTableTreeMin`
+  - `RtlpDynamicFunctionTableTreeMax`
+  - `RtlpDynamicFunctionTable` list
+
+### `RtlAddFunctionTable`
+
+Command used:
+
+`u ntdll!RtlAddFunctionTable L100`
+
+Observed facts:
+
+- it allocates a `_DYNAMIC_FUNCTION_TABLE`-sized object
+- it initializes `Type` at `+0x50` to `0`
+- while scanning the supplied `RUNTIME_FUNCTION` array, it can set `Type` to `1`
+- the scan also computes min and max address bounds, which are later adjusted by `BaseAddress`
+- it inserts the record into:
+  - `RtlpDynamicFunctionTableTreeMin`
+  - `RtlpDynamicFunctionTableTreeMax`
+  - `RtlpDynamicFunctionTable` list
+
+## Cleanup paths confirmed by disassembly
+
+### `RtlDeleteFunctionTable`
+
+Commands used:
+
+- `u ntdll!RtlDeleteFunctionTable L140`
+- `x ntdll!*Delete*FunctionTable*`
+
+Observed facts:
+
+- it calls `LdrProtectMrdata(0)` before touching the dynamic-table state
+- it acquires `RtlpDynamicFunctionTableLock` exclusively
+- it walks the `RtlpDynamicFunctionTable` list and compares the caller-supplied pointer against the field at `+0x10` in each record
+- if no matching record is found, it releases `RtlpDynamicFunctionTableLock`, restores `LdrProtectMrdata(1)`, and returns failure
+- if a matching record is found, it reads `Type` from `+0x50`
+- if `Type == 2`, it removes the record from:
+  - `RtlpDynamicCallbackTableTreeMin`
+  - `RtlpDynamicCallbackTableTreeMax`
+- otherwise, it removes the record from:
+  - `RtlpDynamicFunctionTableTreeMin`
+  - `RtlpDynamicFunctionTableTreeMax`
+- it unlinks the record from the common `RtlpDynamicFunctionTable` doubly linked list
+- it releases `RtlpDynamicFunctionTableLock`
+- it restores `LdrProtectMrdata(1)` after the unlink/removal work
+- if the removed record has `Type == 3`, it calls `RtlDeleteGrowableFunctionTable`
+- otherwise, it frees the record with `RtlFreeHeap`
+
+The disassembly also shows CFG/MRDATA-heap accounting around `LdrpMrdataLock`, `LdrpMrdataHeap`, and `LdrpMrdataHeapUnprotected` before and after the free path.
+
+### `RtlDeleteGrowableFunctionTable`
+
+Command used:
+
+`u ntdll!RtlDeleteGrowableFunctionTable L140`
+
+Observed facts:
+
+- it first checks that `Type == 3` at `+0x50`
+- if the type check fails, it raises status `0xC000000D` via `RtlRaiseStatus`
+- before unlinking the record, it calls `NtSetInformationProcess`
+- if that call fails, it raises the returned status via `RtlRaiseStatus`
+- it calls `LdrProtectMrdata(0)` before editing dynamic-table state
+- it contains the same CFG/MRDATA-heap accounting pattern around `LdrpMrdataLock`, `LdrpMrdataHeap`, and `LdrpMrdataHeapUnprotected`
+- it acquires `RtlpDynamicFunctionTableLock` exclusively
+- it removes the record from:
+  - `RtlpDynamicFunctionTableTreeMin`
+  - `RtlpDynamicFunctionTableTreeMax`
+- it unlinks the record from the common `RtlpDynamicFunctionTable` list
+- it releases `RtlpDynamicFunctionTableLock`
+- it frees the record with `RtlFreeHeap`
+- it restores `LdrProtectMrdata(1)` before returning
+
+### `RtlGetFunctionTableListHead`
+
+Command used:
+
+`u ntdll!RtlGetFunctionTableListHead L20`
+
+Observed fact:
+
+- the function simply returns the address of `RtlpDynamicFunctionTable`
+
+### `RtlGrowFunctionTable`
+
+Commands used:
+
+- `x ntdll!*Grow*FunctionTable*`
+- `u ntdll!RtlGrowFunctionTable L140`
+- `dt ntdll!_DYNAMIC_FUNCTION_TABLE`
+
+Observed facts:
+
+- the symbol `ntdll!RtlGrowFunctionTable` is present on this target
+- `_DYNAMIC_FUNCTION_TABLE.Type` is at `+0x50`
+- `_DYNAMIC_FUNCTION_TABLE.EntryCount` is at `+0x54`
+- the function first checks that `Type == 3`
+- if that type check fails, it raises status `0xC000000D` via `RtlRaiseStatus`
+- it compares the caller-supplied `edx` value against the current `EntryCount`
+- if the caller-supplied value is smaller than the current `EntryCount`, it raises status `0xC000000D` via `RtlRaiseStatus`
+- on the accepted path, it updates `_DYNAMIC_FUNCTION_TABLE.EntryCount`
+- the disassembly shows the same CFG/MRDATA-heap accounting pattern around `LdrpMrdataLock`, `LdrpMrdataHeap`, and `LdrpMrdataHeapUnprotected`
+- in the observed disassembly, no call to `LdrProtectMrdata` was seen
+- in the observed disassembly, no use of `RtlpDynamicFunctionTableLock` was seen
+- in the observed disassembly, no AVL insert/remove calls were seen
+- in the observed disassembly, no references to `RtlpDynamicFunctionTableTreeMin`, `RtlpDynamicFunctionTableTreeMax`, or the common `RtlpDynamicFunctionTable` list were seen
+
+## Growable-function-table lifecycle supported by combined disassembly
+
+Commands used:
+
+- `u ntdll!RtlAddGrowableFunctionTable L120`
+- `u ntdll!RtlGrowFunctionTable L120`
+- `u ntdll!RtlDeleteGrowableFunctionTable L120`
+- `dt ntdll!_DYNAMIC_FUNCTION_TABLE`
+
+Observed facts:
+
+- `RtlAddGrowableFunctionTable` allocates a `_DYNAMIC_FUNCTION_TABLE`-sized record (`0x88` bytes in the observed disassembly)
+- `RtlAddGrowableFunctionTable` writes:
+  - `FunctionTable` at `+0x10`
+  - `EntryCount` at `+0x54`
+  - `MinimumAddress` at `+0x20`
+  - `MaximumAddress` at `+0x28`
+  - `BaseAddress` at `+0x30`
+  - `Type = 3` at `+0x50`
+- `RtlAddGrowableFunctionTable` calls `NtSetInformationProcess` before inserting the record into global dynamic-table state
+- `RtlAddGrowableFunctionTable` calls `RtlpProtectInvertedFunctionTable(0)`, acquires `RtlpDynamicFunctionTableLock`, inserts into:
+  - `RtlpDynamicFunctionTableTreeMin`
+  - `RtlpDynamicFunctionTableTreeMax`
+  - `RtlpDynamicFunctionTable`
+- `RtlAddGrowableFunctionTable` then calls `RtlpProtectInvertedFunctionTable(1)` and writes the resulting record pointer through its first argument (`mov qword ptr [r12], rdi`)
+- `RtlGrowFunctionTable` accepts only `Type == 3` records, rejects decreasing `EntryCount`, and on the accepted path updates only `EntryCount`
+- `RtlDeleteGrowableFunctionTable` accepts only `Type == 3` records, calls `NtSetInformationProcess`, removes the record from both dynamic AVL trees, unlinks it from the common list, and frees it
+
+Minimal lifecycle conclusion for this step:
+
+- the combined disassembly supports a three-step lifecycle for `Type == 3` dynamic records:
+  1. create/register via `RtlAddGrowableFunctionTable`
+  2. grow via `RtlGrowFunctionTable`
+  3. unregister/free via `RtlDeleteGrowableFunctionTable`
+- the same allocated `_DYNAMIC_FUNCTION_TABLE` record is the object created by `RtlAddGrowableFunctionTable`, later mutated by `RtlGrowFunctionTable`, and finally removed/freed by `RtlDeleteGrowableFunctionTable`
+
+## What this session did and did not confirm about callers of `RtlGrowFunctionTable`
+
+Commands used:
+
+- `lm m Creative_Cloud`
+- `lm m libcef`
+- `!dh 00007ff7c03b0000 -i`
+- `!dh 00007ffc93600000 -i`
+- `u ntdll!RtlAddGrowableFunctionTable L120`
+- `u ntdll!RtlGrowFunctionTable L120`
+- `u ntdll!RtlDeleteGrowableFunctionTable L120`
+
+Observed facts:
+
+- `Creative_Cloud` and `libcef` were inspected as loaded modules during this session
+- in the visible import output inspected for `Creative_Cloud`, no direct `RtlGrowFunctionTable` import line was shown
+- in the visible import output inspected for `libcef`, no direct `RtlGrowFunctionTable` import line was shown
+- in the visible import output inspected for `libcef`, direct imports for other runtime-function APIs were shown, including:
+  - `RtlAddFunctionTable`
+  - `RtlDeleteFunctionTable`
+  - `RtlLookupFunctionEntry`
+- the disassembly shows that `RtlAddGrowableFunctionTable` returns the allocated record pointer through its first argument, while both `RtlGrowFunctionTable` and `RtlDeleteGrowableFunctionTable` operate on a record whose `Type` is checked at `+0x50`
+
+Minimal conclusion for the caller question:
+
+- in this session, I did not capture a live caller of `RtlGrowFunctionTable`
+- in the visible import output inspected in this session, I also did not confirm a direct `RtlGrowFunctionTable` import from `Creative_Cloud` or `libcef`
+- the strongest disassembly-supported statement is that a caller would need the growable `_DYNAMIC_FUNCTION_TABLE` record pointer produced by `RtlAddGrowableFunctionTable`, and that pointer is the object later consumed by `RtlGrowFunctionTable`
+
+## Attempt to capture a live hit on `RtlGrowFunctionTable`
+
+Commands used:
+
+- `bp ntdll!RtlGrowFunctionTable`
+- `bl`
+- `g`
+- `.lastevent`
+- `r rip`
+- `kb`
+- `~`
+- `~0s`
+- `kb`
+
+Observed facts:
+
+- a breakpoint on `ntdll!RtlGrowFunctionTable` was present in the session
+- attempting `g` did not produce a captured hit on `RtlGrowFunctionTable`
+- after that attempt, the observed last event remained a first-chance break instruction exception
+- `rip` was observed at `ntdll!DbgBreakPoint`
+- on the current thread at that stop, the observed stack was:
+  - `ntdll!DbgBreakPoint`
+  - `ntdll!DbgUiRemoteBreakin+0x4e`
+  - `KERNEL32!BaseThreadInitThunk+0x14`
+  - `ntdll!RtlUserThreadStart+0x21`
+- thread enumeration (`~`) showed many process threads; the current thread was the remote-break thread (`. 40`)
+- after switching to `~0`, the observed stack was in the application/UI wait path through `win32u`, `USER32`, `libcef`, and `Creative_Cloud`
+
+Minimal conclusion for this step:
+
+- in this specific session, I did not capture a live hit on `RtlGrowFunctionTable`
+- the session evidence is consistent with the debugger remaining in a break-state / remote-break context rather than producing a useful grow-function breakpoint hit
+
+## Attempt to capture a live registration event in this session
+
+Commands used:
+
+- `bp ntdll!RtlAddFunctionTable`
+- `bp ntdll!RtlInstallFunctionTableCallback`
+- `bp ntdll!RtlAddGrowableFunctionTable`
+- `bl`
+- `g`
+- `.lastevent`
+- `r rip`
+- `kb`
+
+Observed facts:
+
+- breakpoints were set on:
+  - `ntdll!RtlAddFunctionTable`
+  - `ntdll!RtlInstallFunctionTableCallback`
+  - `ntdll!RtlAddGrowableFunctionTable`
+- no breakpoint hit on those three registration APIs was captured in this session
+- the observed last event remained a first-chance break instruction exception
+- `rip` was observed at `ntdll!DbgBreakPoint`
+- the observed stack was:
+  - `ntdll!DbgBreakPoint`
+  - `ntdll!DbgUiRemoteBreakin+0x4e`
+  - `KERNEL32!BaseThreadInitThunk+0x14`
+  - `ntdll!RtlUserThreadStart+0x21`
+
+Minimal conclusion for this step:
+
+- in this specific agent session, I did not reproduce a live dynamic function table registration event
+- therefore this document still does not contain an agent-captured non-empty runtime example of `_DYNAMIC_FUNCTION_TABLE`
+
+## Minimal dynamic-path conclusion supported by the agent
+
+From the current live session, the agent verified that:
+
+- dynamic function tables are tracked separately from `LdrpInvertedFunctionTable`
+- `ntdll` maintains a shared lock, a common list head, and four AVL roots for dynamic-table lookup
+- callback-based registrations and non-callback registrations use different AVL roots
+- `RtlpLookupDynamicFunctionEntry` first searches callback trees, then non-callback trees
+- lookup behavior depends on `_FUNCTION_TABLE_TYPE`
+- callback-type entries are invoked only after releasing the shared lock
+- deletion walks the common dynamic-table list, removes matching nodes from the appropriate AVL roots, and unlinks them from the list
+- growable-table cleanup is handled by the dedicated `RtlDeleteGrowableFunctionTable` path
+- `RtlGetFunctionTableListHead` exposes the common list head by returning `RtlpDynamicFunctionTable`
+- `RtlGrowFunctionTable` was observed updating `EntryCount` for `Type == 3` records and rejecting non-growing / wrong-type inputs with `0xC000000D`
+- combined disassembly supports a `RtlAddGrowableFunctionTable -> RtlGrowFunctionTable -> RtlDeleteGrowableFunctionTable` lifecycle for `Type == 3` records
+- in this session, no live caller of `RtlGrowFunctionTable` was captured, and no direct `RtlGrowFunctionTable` import was confirmed in the visible `Creative_Cloud` / `libcef` import output that was inspected
+- a live registration event was attempted with breakpoints on the three registration APIs, but no hit was captured in this session
+- a dedicated live-hit attempt on `RtlGrowFunctionTable` also did not capture a hit in this session
+- on this target, no dynamic function table entries were present at the time of inspection
