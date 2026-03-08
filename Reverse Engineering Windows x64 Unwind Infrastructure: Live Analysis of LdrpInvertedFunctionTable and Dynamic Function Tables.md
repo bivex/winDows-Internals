@@ -664,6 +664,76 @@ Minimal conclusion for this step:
 - the decoded unwind operations match the observed function prolog/epilog for `push rbp; mov rbp, rsp; ...; pop rbp; ret`
 - in this session, `.fnent` was the working debugger path for inspecting unwind on the second entry
 
+## Live `RtlVirtualUnwind` on a synthetic context for the second entry
+
+Commands used:
+
+- `dt _CONTEXT`
+- `.logopen /t C:\augment\windbg-agent\build-x64\Release\virtual_unwind_hit.log`
+- `bp /1 ntdll!RtlVirtualUnwind ...`
+- `g`
+- `|`
+- `.lastevent`
+- `~0s`
+- `kb`
+- `x growable_ft_virtual_unwind_probe_x64!g_vu*`
+- `dq growable_ft_virtual_unwind_probe_x64!g_vu_stage L12`
+- `? poi(growable_ft_virtual_unwind_probe_x64!g_vu_image_base)`
+- `? poi(growable_ft_virtual_unwind_probe_x64!g_vu_control_pc)`
+- `? poi(growable_ft_virtual_unwind_probe_x64!g_vu_function_entry)`
+- `? poi(growable_ft_virtual_unwind_probe_x64!g_vu_pre_rip)`
+- `? poi(growable_ft_virtual_unwind_probe_x64!g_vu_pre_rsp)`
+- `? poi(growable_ft_virtual_unwind_probe_x64!g_vu_pre_rbp)`
+- `? poi(growable_ft_virtual_unwind_probe_x64!g_vu_post_rip)`
+- `? poi(growable_ft_virtual_unwind_probe_x64!g_vu_post_rsp)`
+- `? poi(growable_ft_virtual_unwind_probe_x64!g_vu_post_rbp)`
+- `? poi(growable_ft_virtual_unwind_probe_x64!g_vu_establisher)`
+- `? poi(growable_ft_virtual_unwind_probe_x64!g_vu_handler)`
+- `dt ntdll!_IMAGE_RUNTIME_FUNCTION_ENTRY poi(growable_ft_virtual_unwind_probe_x64!g_vu_function_entry)`
+- `u growable_ft_virtual_unwind_probe_x64+0x14e0 L32`
+
+Observed facts:
+
+- the debugger captured a live breakpoint hit on `ntdll!RtlVirtualUnwind` in the controlled process `growable_ft_virtual_unwind_probe_x64.exe`
+- at the entry breakpoint, the observed register arguments were:
+  - `rcx = 0` (`HandlerType`)
+  - `rdx = 0x190000` (`ImageBase`)
+  - `r8 = 0x190124` (`ControlPc`)
+  - `r9 = 0x52904c` (`FunctionEntry`)
+- `dt ntdll!_IMAGE_RUNTIME_FUNCTION_ENTRY 0x52904c` showed:
+  - `BeginAddress = 0x120`
+  - `EndAddress = 0x126`
+  - `UnwindInfoAddress = 0x200`
+- the breakpoint handler successfully dumped the input `CONTEXT` before unwind:
+  - `Rip = 0x190124`
+  - `Rsp = 0x14fe90`
+  - `Rbp = 0x14fe90`
+- after the controlled process continued, exported globals in `growable_ft_virtual_unwind_probe_x64.exe` showed:
+  - `g_vu_stage = 2`
+  - `g_vu_image_base = 0x190000`
+  - `g_vu_control_pc = 0x190124`
+  - `g_vu_function_entry = 0x52904c`
+  - `g_vu_pre_rip = 0x190124`
+  - `g_vu_pre_rsp = 0x14fe90`
+  - `g_vu_pre_rbp = 0x14fe90`
+  - `g_vu_post_rip = 0x1902f0`
+  - `g_vu_post_rsp = 0x14fea0`
+  - `g_vu_post_rbp = 0x1902e0`
+  - `g_vu_establisher = 0x14fe90`
+  - `g_vu_handler = 0`
+- at the time of post-unwind inspection, thread `~0` was stopped in `NtDelayExecution` / `SleepEx`
+- the disassembly around `growable_ft_virtual_unwind_probe_x64+0x14e0` showed the post-unwind path leading to the later sleep call
+
+Minimal conclusion for this step:
+
+- the agent verified a live call to `RtlVirtualUnwind` for the second runtime-function entry (`0x120..0x126`)
+- for the synthetic context with `Rip = 0x190124`, `Rsp = 0x14fe90`, and `Rbp = 0x14fe90`, the observed post-unwind state was:
+  - `Rip = 0x1902f0`
+  - `Rsp = 0x14fea0`
+  - `Rbp = 0x1902e0`
+- `EstablisherFrame` remained `0x14fe90`, and the returned exception handler pointer was `0`
+- this is consistent with unwinding the verified second-entry prolog/epilog and restoring a saved frame pointer plus synthetic return address from the synthetic stack
+
 ## Attempt to capture a live registration event in this session
 
 Commands used:
@@ -716,6 +786,7 @@ From the current live session, the agent verified that:
 - in a later controlled repro, a live caller chain into `RtlGrowFunctionTable` was captured
 - in that controlled repro, post-grow inspection showed `EntryCount == 2`, two `RUNTIME_FUNCTION` entries, and successful resolution of `ControlPc = 0x1d0120` through `.fnent`
 - for the second entry `0x1d0120`, the agent also matched the decoded unwind metadata to the actual stub bytes and prolog/epilog
+- in a later controlled probe, the agent also verified a live `RtlVirtualUnwind` call for the second entry and observed the post-unwind `CONTEXT` state
 - a live registration event was attempted with breakpoints on the three registration APIs, but no hit was captured in this session
 - a dedicated live-hit attempt on `RtlGrowFunctionTable` also did not capture a hit in this session
 - a later controlled repro did capture a real live hit on `RtlGrowFunctionTable`
