@@ -492,12 +492,19 @@ Observed facts:
   - `RtlDeleteFunctionTable`
   - `RtlLookupFunctionEntry`
 - the disassembly shows that `RtlAddGrowableFunctionTable` returns the allocated record pointer through its first argument, while both `RtlGrowFunctionTable` and `RtlDeleteGrowableFunctionTable` operate on a record whose `Type` is checked at `+0x50`
+- in a later controlled repro, a live stack at the `RtlGrowFunctionTable` breakpoint showed:
+  - `ntdll!RtlGrowFunctionTable`
+  - `growable_ft_repro_x64+0x132c`
+  - `growable_ft_repro_x64+0x1644`
+  - `KERNEL32!BaseThreadInitThunk+0x14`
+  - `ntdll!RtlUserThreadStart+0x21`
 
 Minimal conclusion for the caller question:
 
-- in this session, I did not capture a live caller of `RtlGrowFunctionTable`
+- on the original `Creative_Cloud` / `libcef` target, I did not capture a live caller of `RtlGrowFunctionTable`
 - in the visible import output inspected in this session, I also did not confirm a direct `RtlGrowFunctionTable` import from `Creative_Cloud` or `libcef`
 - the strongest disassembly-supported statement is that a caller would need the growable `_DYNAMIC_FUNCTION_TABLE` record pointer produced by `RtlAddGrowableFunctionTable`, and that pointer is the object later consumed by `RtlGrowFunctionTable`
+- in the later controlled repro, I did capture a live caller chain leading into `RtlGrowFunctionTable`
 
 ## Attempt to capture a live hit on `RtlGrowFunctionTable`
 
@@ -531,6 +538,43 @@ Minimal conclusion for this step:
 
 - in this specific session, I did not capture a live hit on `RtlGrowFunctionTable`
 - the session evidence is consistent with the debugger remaining in a break-state / remote-break context rather than producing a useful grow-function breakpoint hit
+
+## Live hit on `RtlGrowFunctionTable` in a controlled repro
+
+Commands used:
+
+- `sxd ibp`
+- `sxd iml`
+- `.logopen /t C:\augment\windbg-agent\build-x64\Release\grow_hit.log`
+- `bp ntdll!RtlGrowFunctionTable ".echo RTLGROW_HIT;.echo --REGS--;r rcx;r rdx;.echo --TABLE--;dt ntdll!_DYNAMIC_FUNCTION_TABLE @rcx;.echo --STACK--;kb;gc"`
+- `bl`
+- `g`
+
+Observed facts:
+
+- a live breakpoint hit on `ntdll!RtlGrowFunctionTable` was captured in the controlled process `growable_ft_repro_x64.exe`
+- at the captured entry to `RtlGrowFunctionTable`:
+  - `rcx = 0x00000000001a08c0`
+  - `rdx = 2`
+- `dt ntdll!_DYNAMIC_FUNCTION_TABLE @rcx` at that hit showed:
+  - `Type = 3 (RF_KERNEL_DYNAMIC)`
+  - `EntryCount = 1`
+  - `FunctionTable = 0x00000000005691c0`
+  - `MinimumAddress = 0x190000`
+  - `MaximumAddress = 0x190300`
+  - `BaseAddress = 0x190000`
+- the live stack at the hit was:
+  - `ntdll!RtlGrowFunctionTable`
+  - `growable_ft_repro_x64+0x132c`
+  - `growable_ft_repro_x64+0x1644`
+  - `KERNEL32!BaseThreadInitThunk+0x14`
+  - `ntdll!RtlUserThreadStart+0x21`
+- the debugger log containing this hit was written to `grow_hit_0fa0_2026-03-08_03-47-13-903.log`
+
+Minimal conclusion for this step:
+
+- a real live hit on `RtlGrowFunctionTable` was reproduced and captured by the agent in a controlled process
+- at function entry, the observed record was a `Type == 3` `_DYNAMIC_FUNCTION_TABLE` with `EntryCount == 1`, and the caller requested growth to `2`
 
 ## Attempt to capture a live registration event in this session
 
@@ -580,7 +624,9 @@ From the current live session, the agent verified that:
 - `RtlGetFunctionTableListHead` exposes the common list head by returning `RtlpDynamicFunctionTable`
 - `RtlGrowFunctionTable` was observed updating `EntryCount` for `Type == 3` records and rejecting non-growing / wrong-type inputs with `0xC000000D`
 - combined disassembly supports a `RtlAddGrowableFunctionTable -> RtlGrowFunctionTable -> RtlDeleteGrowableFunctionTable` lifecycle for `Type == 3` records
-- in this session, no live caller of `RtlGrowFunctionTable` was captured, and no direct `RtlGrowFunctionTable` import was confirmed in the visible `Creative_Cloud` / `libcef` import output that was inspected
+- on the original `Creative_Cloud` / `libcef` target, no live caller of `RtlGrowFunctionTable` was captured, and no direct `RtlGrowFunctionTable` import was confirmed in the visible import output that was inspected
+- in a later controlled repro, a live caller chain into `RtlGrowFunctionTable` was captured
 - a live registration event was attempted with breakpoints on the three registration APIs, but no hit was captured in this session
 - a dedicated live-hit attempt on `RtlGrowFunctionTable` also did not capture a hit in this session
+- a later controlled repro did capture a real live hit on `RtlGrowFunctionTable`
 - on this target, no dynamic function table entries were present at the time of inspection
