@@ -624,6 +624,46 @@ Minimal conclusion for this step:
 - the second `RUNTIME_FUNCTION` entry (`0x120..0x126`) was present in the table after grow
 - the debugger was able to resolve `ControlPc = 0x1d0120` via `.fnent`, which is consistent with the post-grow `RtlLookupFunctionEntry` path observed in the repro disassembly
 
+## Unwind of the second entry (`0x1d0120`) in the controlled repro
+
+Commands used:
+
+- `|1s`
+- `~0s`
+- `u 0x00000000001d0120 L8`
+- `db 0x00000000001d0200 L8`
+- `.fnent 0x00000000001d0120`
+- `dt ntdll!_UNWIND_INFO 0x00000000001d0200`
+- `!unwind 0x00000000001d0120`
+
+Observed facts:
+
+- the bytes at `0x1d0120` were:
+  - `55` (`push rbp`)
+  - `48 8b ec` (`mov rbp, rsp`)
+  - `5d` (`pop rbp`)
+  - `c3` (`ret`)
+- the raw unwind-info bytes at `0x1d0200` were:
+  - `01 04 02 05 04 03 01 50`
+- `.fnent 0x1d0120` resolved the second runtime-function entry and decoded the unwind info as:
+  - `BeginAddress = 0x120`
+  - `EndAddress = 0x126`
+  - `UnwindInfoAddress = 0x200`
+  - `version 1`
+  - `prolog 4`
+  - `codes 2`
+  - `frame reg 5 (rbp)`
+  - unwind code 0: `UWOP_SET_FPREG` at offset `4`
+  - unwind code 1: `UWOP_PUSH_NONVOL reg: rbp` at offset `1`
+- `dt ntdll!_UNWIND_INFO 0x1d0200` did not work in this session because the symbol `ntdll!_UNWIND_INFO` was not found
+- `!unwind 0x1d0120` was not available in this session (`No export unwind found`)
+
+Minimal conclusion for this step:
+
+- for the second entry at `0x1d0120`, the agent verified both the function bytes and the decoded unwind metadata
+- the decoded unwind operations match the observed function prolog/epilog for `push rbp; mov rbp, rsp; ...; pop rbp; ret`
+- in this session, `.fnent` was the working debugger path for inspecting unwind on the second entry
+
 ## Attempt to capture a live registration event in this session
 
 Commands used:
@@ -675,6 +715,7 @@ From the current live session, the agent verified that:
 - on the original `Creative_Cloud` / `libcef` target, no live caller of `RtlGrowFunctionTable` was captured, and no direct `RtlGrowFunctionTable` import was confirmed in the visible import output that was inspected
 - in a later controlled repro, a live caller chain into `RtlGrowFunctionTable` was captured
 - in that controlled repro, post-grow inspection showed `EntryCount == 2`, two `RUNTIME_FUNCTION` entries, and successful resolution of `ControlPc = 0x1d0120` through `.fnent`
+- for the second entry `0x1d0120`, the agent also matched the decoded unwind metadata to the actual stub bytes and prolog/epilog
 - a live registration event was attempted with breakpoints on the three registration APIs, but no hit was captured in this session
 - a dedicated live-hit attempt on `RtlGrowFunctionTable` also did not capture a hit in this session
 - a later controlled repro did capture a real live hit on `RtlGrowFunctionTable`
