@@ -15,17 +15,6 @@ Add to your MCP client (e.g., Claude Desktop):
   }
 }
 ```
-```
-EXAMPLE CURL COMMANDS:
-  # Initialize session (inspect Mcp-Session-Id response header)
-  curl -i -X POST http://127.0.0.1:37780/mcp \
-    -H "Content-Type: application/json" \
-    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}'
-
-  # List tools using the returned Mcp-Session-Id
-  curl -X POST http://1
-
-```
 
 ....................
 
