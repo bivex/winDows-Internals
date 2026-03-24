@@ -42,3 +42,19 @@ run codex and See
     • Resources: (none)
     • Resource templates: (none)
 ```
+
+Success criteria
+
+```
+• Connected. The WinDbg MCP is active and responding.
+
+  Current target is a live remote kernel debug session:
+
+  - Windows 10 kernel build 26100.1 on ARM64
+  - Transport: Remote KD over COM1
+  - Debugger: WinDbg 10.0.29507.1001
+
+  The dbg_ask helper failed to start its side session, but direct debugger commands work, so I can still drive WinDbg
+  through MCP. If you want, I can run something specific next, for example !analyze -v, kb, lm, or inspect a process/
+  thread.
+````
