@@ -6,6 +6,7 @@ Target: ntkrnlmp.exe (PID 0)
 
 MCP CLIENT CONFIGURATION:
 Add to your MCP client (e.g., Claude Desktop):
+```
 {
   "mcpServers": {
     "windbg-agent": {
@@ -13,7 +14,8 @@ Add to your MCP client (e.g., Claude Desktop):
     }
   }
 }
-
+```
+```
 EXAMPLE CURL COMMANDS:
   # Initialize session (inspect Mcp-Session-Id response header)
   curl -i -X POST http://127.0.0.1:37780/mcp \
@@ -22,3 +24,32 @@ EXAMPLE CURL COMMANDS:
 
   # List tools using the returned Mcp-Session-Id
   curl -X POST http://1
+
+```
+
+....................
+
+
+add Global: ~/.codex/config.toml lines:
+
+```
+[mcp_servers.windbg-agent]
+url = "http://127.0.0.1:37780/mcp"
+enabled = true
+```
+
+run codex and See 
+
+```
+/mcp
+
+🔌  MCP Tools
+
+  • windbg-agent
+    • Status: enabled
+    • Auth: Unsupported
+    • URL: http://127.0.0.1:37780/mcp
+    • Tools: (none)
+    • Resources: (none)
+    • Resource templates: (none)
+```
