@@ -82,6 +82,8 @@ Both VMs have `EmulatedType=3` (Unix socket mode) configured in `config.pvs`:
 /Volumes/External/Code/double_parallels_windbg/START_DEBUG_SESSION.sh
 ```
 
+For a detailed from-scratch checklist, see [ColdStart.md](/Volumes/External/Code/double_parallels_windbg/ColdStart.md).
+
 ### Option B — manual steps
 
 ```bash
@@ -98,7 +100,7 @@ ls -la /tmp/kd.sock /tmp/debugger.sock
 sudo socat UNIX-CLIENT:/tmp/kd.sock UNIX-CLIENT:/tmp/debugger.sock &
 
 # 5. On Debugger VM — open WinDbg as Administrator
-windbg -k com:port=\\.\COM1,baud=115200,reconnect
+"C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\windbg.exe" -k com:port=com1,baud=115200,reconnect
 
 # 6. Reboot Target VM
 prlctl exec "Windows 11 Pro (Target)" cmd /c "shutdown /r /t 0"
@@ -172,4 +174,6 @@ g
 | `socat: Permission denied` | Run socat with `sudo` |
 | WinDbg stuck at `Waiting to reconnect...` | Start WinDbg BEFORE rebooting Target |
 | socat dies immediately | Both sockets must exist before running socat |
+| `Win32 error 0n87` / `The parameter is incorrect` | Use `com:port=com1,baud=115200,reconnect`, not `\\.\COM1` |
+| `Access is denied` opening COM1 | Launch WinDbg as Administrator |
 | WinDbg connected but no symbols | Run `.symfix` then `.reload` |
