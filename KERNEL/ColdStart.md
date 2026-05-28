@@ -136,6 +136,26 @@ This was verified to connect successfully on this setup.
 - If `WinDbg` never reconnects, make sure the relay was started before rebooting the Target VM.
 - If `socat` exits immediately, one of the socket files is missing.
 
+### Rebooting the Target VM breaks socat
+
+When the Target VM reboots, Parallels **deletes and recreates** `/tmp/kd.sock`.
+The running `socat` process holds a file descriptor to the old (now deleted) socket and silently stops relaying data.
+
+**Rule:** every time you reboot the Target VM, restart the socat relay first.
+
+```bash
+# 1. Kill old relay
+sudo pkill -f "socat.*kd.sock"
+
+# 2. Start fresh relay
+sudo /opt/homebrew/bin/socat UNIX-CLIENT:/tmp/kd.sock UNIX-CLIENT:/tmp/debugger.sock &
+
+# 3. Now reboot Target
+prlctl exec "Windows 11 Pro (Target)" --current-user cmd /c "shutdown /r /t 0"
+```
+
+If WinDbg is already open on the Debugger VM it will say `Waiting to reconnect...` — after step 3 it should pick up the new connection automatically.
+
 ## Useful Host Commands
 
 Check VM state:
