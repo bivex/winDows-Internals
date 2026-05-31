@@ -9,7 +9,7 @@
 macOS (хост)                    Debugger VM                    Target VM
 ┌─────────────┐    HTTP/MCP    ┌──────────────┐   serial    ┌──────────────┐
 │ Claude Code  │──────────────>│  WinDbg      │────────────>│ Windows 11   │
-│ curl, etc    │  10.66.57.105 │  + windbg    │   COM1      │ kernel debug │
+│ curl, etc    │  10.211.55.5 │  + windbg    │   COM1      │ kernel debug │
 │              │   :44444      │    _agent.dll│   115200    │              │
 └─────────────┘               └──────────────┘             └──────────────┘
 ```
@@ -45,7 +45,7 @@ MCP server is running in background. Use '!agent mcp stop' to stop it.
 
 ```bash
 # Пинг MCP сервера
-curl -s -X POST http://10.66.57.105:44444/mcp \
+curl -s -X POST http://10.211.55.5:44444/mcp \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}'
 ```
@@ -60,13 +60,13 @@ curl -s -X POST http://10.66.57.105:44444/mcp \
 
 ```bash
 # Получить Session ID
-SESSION_ID=$(curl -s -i -X POST http://10.66.57.105:44444/mcp \
+SESSION_ID=$(curl -s -i -X POST http://10.211.55.5:44444/mcp \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}' \
   | grep -i 'mcp-session-id' | awk '{print $2}' | tr -d '\r')
 
 # Выполнить команду ядра
-curl -s -X POST http://10.66.57.105:44444/mcp \
+curl -s -X POST http://10.211.55.5:44444/mcp \
   -H "Content-Type: application/json" \
   -H "Mcp-Session-Id: $SESSION_ID" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"dbg_exec","arguments":{"command":"version"}}}'
@@ -110,8 +110,8 @@ kd> !agent mcp stop
 
 | Компонент | IP | Порт |
 |---|---|---|
-| macOS хост | `10.66.57.104` | — |
-| Debugger VM (bridge) | `10.66.57.105` | `44444` |
+| macOS хост | `10.211.55.2` | — |
+| Debugger VM (shared) | `10.211.55.5` | `44444` |
 | Target VM | через serial | — |
 
 ## Gotchas
