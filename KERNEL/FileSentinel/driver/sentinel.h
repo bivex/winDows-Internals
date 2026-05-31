@@ -9,7 +9,7 @@
 // Communication port name
 // ---------------------------------------------------------------------------
 #define SENTINEL_PORT_NAME  L"\\FileSentinelPort"
-#define SENTINEL_PORT_USER  L"\\FileSentinelPort"  // usermode sees it as-is
+#define SENTINEL_PORT_USER  L"\\\\.\\FileSentinelPort"
 
 // ---------------------------------------------------------------------------
 // Altitude — above FSFilter Anti-Virus, below Defender
@@ -40,25 +40,21 @@ typedef enum _SENTINEL_VERDICT {
 #define SENTINEL_MAX_PATH  520  // UNICODE chars (1040 bytes)
 
 // ---------------------------------------------------------------------------
-// Kernel -> Usermode message
+// Kernel -> Usermode message (no Filter Manager headers — use ReadFile/WriteFile)
 // ---------------------------------------------------------------------------
 typedef struct _SENTINEL_MESSAGE {
-    // Filter manager header (must be first)
-    FILTER_MESSAGE_HEADER Header;
-
     SENTINEL_MSG_TYPE  Type;
-    ULONG              ProcessId;
-    ULONG              ThreadId;
-    ACCESS_MASK        DesiredAccess;
-    ULONG              CreateDisposition;
-    WCHAR              FilePath[SENTINEL_MAX_PATH];
+    unsigned long      ProcessId;
+    unsigned long      ThreadId;
+    unsigned long      DesiredAccess;
+    unsigned long      CreateDisposition;
+    wchar_t            FilePath[SENTINEL_MAX_PATH];
 } SENTINEL_MESSAGE, *PSENTINEL_MESSAGE;
 
 // ---------------------------------------------------------------------------
 // Usermode -> Kernel reply
 // ---------------------------------------------------------------------------
 typedef struct _SENTINEL_REPLY {
-    FILTER_REPLY_HEADER Header;
     SENTINEL_VERDICT    Verdict;
 } SENTINEL_REPLY, *PSENTINEL_REPLY;
 

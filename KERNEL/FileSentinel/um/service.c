@@ -1,37 +1,33 @@
 //
-// FileSentinel usermode service
-// Connects to minifilter driver, receives file operation events, applies rules
+// FileSentinel usermode service — standalone (no fltuser.h required)
+// Connects to minifilter via CreateFile on the filter port device
 //
-// Build:  cl service.c /Fe:sentinel_svc.exe
-// Run:    sentinel_svc.exe
+// Build: cl service.c /Fe:sentinel_svc.exe
 //
 
 #include <windows.h>
-#include <fltuser.h>    // Filter Manager usermode API
 #include <stdio.h>
-
-#pragma comment(lib, "fltlib.lib")
+#include <string.h>
 
 #include "../driver/sentinel.h"
 
 // ---------------------------------------------------------------------------
-// Simple rule: block writes to paths containing these substrings
+// Blocked path rules
 // ---------------------------------------------------------------------------
 static const WCHAR *g_BlockedPaths[] = {
     L"\\Blocked\\",
     L"\\ReadOnly\\",
-    // Add more rules here
 };
-static ULONG g_BlockedPathCount = sizeof(g_BlockedPaths) / sizeof(g_BlockedPaths[0]);
+#define BLOCKED_COUNT (sizeof(g_BlockedPaths) / sizeof(g_BlockedPaths[0]))
 
 // ---------------------------------------------------------------------------
-// Rule engine: check if file path should be blocked
+// Rule engine
 // ---------------------------------------------------------------------------
 static SENTINEL_VERDICT EvaluateRule(PSENTINEL_MESSAGE msg)
 {
-    for (ULONG i = 0; i < g_BlockedPathCount; i++) {
+    for (DWORD i = 0; i < BLOCKED_COUNT; i++) {
         if (wcsstr(msg->FilePath, g_BlockedPaths[i])) {
-            wprintf(L"[BLOCK] PID=%lu %s %ls\n",
+            wprintf(L"[BLOCK] PID=%lu %hs %ls\n",
                     msg->ProcessId,
                     msg->Type == SentinelMsg_FileCreate  ? "CREATE" :
                     msg->Type == SentinelMsg_FileWrite   ? "WRITE"  :
@@ -42,9 +38,8 @@ static SENTINEL_VERDICT EvaluateRule(PSENTINEL_MESSAGE msg)
         }
     }
 
-    // Log allowed operations (optional, noisy)
     if (msg->Type == SentinelMsg_FileCreate || msg->Type == SentinelMsg_FileDelete) {
-        wprintf(L"[ALLOW] PID=%lu %s %ls\n",
+        wprintf(L"[ALLOW] PID=%lu %hs %ls\n",
                 msg->ProcessId,
                 msg->Type == SentinelMsg_FileCreate  ? "CREATE" :
                 msg->Type == SentinelMsg_FileDelete  ? "DELETE" :
@@ -56,69 +51,76 @@ static SENTINEL_VERDICT EvaluateRule(PSENTINEL_MESSAGE msg)
 }
 
 // ===========================================================================
-// Main loop
+// Main — connect to driver and process events
 // ===========================================================================
 int __cdecl wmain(int argc, wchar_t *argv[])
 {
-    HANDLE hPort = NULL;
+    HANDLE hPort;
     HRESULT hr;
-    DWORD bytesReturned;
 
     UNREFERENCED_PARAMETER(argc);
     UNREFERENCED_PARAMETER(argv);
 
     wprintf(L"FileSentinel service starting...\n");
 
-    // Connect to the minifilter driver
-    hr = FilterConnectCommunicationPort(
-            SENTINEL_PORT_USER,
-            0,            // options
-            NULL,         // context
-            0,            // contextSize
-            NULL,         // security
-            &hPort);
+    //
+    // Connect to the minifilter communication port.
+    // Filter Manager creates a device for each port at \Device\FileSentinelPort
+    // Usermode opens it via \\.\FileSentinelPort
+    //
+    hPort = CreateFileW(
+        L"\\\\.\\FileSentinelPort",
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        NULL,
+        OPEN_EXISTING,
+        0,
+        NULL);
 
-    if (FAILED(hr)) {
-        wprintf(L"ERROR: cannot connect to driver (hr=0x%08X). Is driver loaded?\n", hr);
+    if (hPort == INVALID_HANDLE_VALUE) {
+        wprintf(L"ERROR: cannot connect to driver (err=%lu). Is driver loaded?\n",
+                GetLastError());
         return 1;
     }
 
     wprintf(L"Connected to FileSentinel driver.\n");
     wprintf(L"Monitoring file operations. Blocked paths:\n");
-    for (ULONG i = 0; i < g_BlockedPathCount; i++) {
+    for (DWORD i = 0; i < BLOCKED_COUNT; i++) {
         wprintf(L"  %ls\n", g_BlockedPaths[i]);
     }
     wprintf(L"\n");
 
-    // Main message loop
+    // Main loop — read messages from driver, send verdicts back
     for (;;) {
         SENTINEL_MESSAGE msg = { 0 };
-        SENTINEL_REPLY reply = { 0 };
+        DWORD bytesReturned;
 
-        // Blocking receive — driver sends operation info
-        hr = FilterGetMessage(hPort, &msg.Header, sizeof(msg), &bytesReturned);
-        if (FAILED(hr)) {
-            if (hr == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)) {
+        // Read operation info from driver
+        BOOL ok = ReadFile(hPort, &msg, sizeof(msg), &bytesReturned, NULL);
+        if (!ok) {
+            DWORD err = GetLastError();
+            if (err == ERROR_INVALID_HANDLE || err == ERROR_BROKEN_PIPE) {
                 wprintf(L"Driver disconnected.\n");
                 break;
             }
-            wprintf(L"FilterGetMessage error: 0x%08X\n", hr);
+            wprintf(L"ReadFile error: %lu\n", err);
             continue;
         }
 
         // Evaluate rules
-        reply.Verdict = EvaluateRule(&msg);
+        SENTINEL_VERDICT verdict = EvaluateRule(&msg);
 
-        // Send verdict back to driver
-        hr = FilterReplyMessage(hPort, &reply.Header, sizeof(reply));
-        if (FAILED(hr)) {
-            wprintf(L"FilterReplyMessage error: 0x%08X\n", hr);
+        // Send verdict back
+        SENTINEL_REPLY reply = { 0 };
+        reply.Verdict = verdict;
+
+        ok = WriteFile(hPort, &reply, sizeof(reply), &bytesReturned, NULL);
+        if (!ok) {
+            wprintf(L"WriteFile error: %lu\n", GetLastError());
         }
     }
 
-    if (hPort)
-        CloseHandle(hPort);
-
+    CloseHandle(hPort);
     wprintf(L"FileSentinel service stopped.\n");
     return 0;
 }
