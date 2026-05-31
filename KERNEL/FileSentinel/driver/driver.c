@@ -8,20 +8,31 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT, PUNICODE_STRING);
 NTSTATUS DriverUnload(FLT_FILTER_UNLOAD_FLAGS);
 NTSTATUS InstanceSetup(PCFLT_RELATED_OBJECTS, FLT_INSTANCE_SETUP_FLAGS,
                        ULONG, FLT_INSTANCE_SETUP_FLAGS);
-NTSTATUS ConnectNotify(PFLT_PORT, PVOID);
-void     DisconnectNotify(PFLT_PORT, PVOID);
-NTSTATUS MessageNotify(PFLT_PORT, PVOID, ULONG, PVOID *, PULONG);
-
 FLT_PREOP_CALLBACK_STATUS PreCreate(PFLT_CALLBACK_DATA, PCFLT_RELATED_OBJECTS, PVOID *);
 FLT_PREOP_CALLBACK_STATUS PreWrite(PFLT_CALLBACK_DATA, PCFLT_RELATED_OBJECTS, PVOID *);
 FLT_PREOP_CALLBACK_STATUS PreSetInfo(PFLT_CALLBACK_DATA, PCFLT_RELATED_OBJECTS, PVOID *);
 
+NTSTATUS DispatchCreate(PDEVICE_OBJECT, PIRP);
+NTSTATUS DispatchClose(PDEVICE_OBJECT, PIRP);
+NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT, PIRP);
+
 // ---------------------------------------------------------------------------
 // Globals
 // ---------------------------------------------------------------------------
-PFLT_FILTER  g_Filter  = NULL;
-PFLT_PORT    g_ServerPort = NULL;
-PFLT_PORT    g_ClientPort = NULL;
+PFLT_FILTER   g_Filter       = NULL;
+PDEVICE_OBJECT g_DeviceObject = NULL;
+UNICODE_STRING g_SymLinkName  = { 0 };
+
+// Pending event queue (simple single-slot for now)
+typedef struct _PENDING_EVENT {
+    SENTINEL_MESSAGE Message;
+    BOOLEAN          Valid;
+    KEVENT           Completed;
+    SENTINEL_VERDICT Verdict;
+} PENDING_EVENT;
+
+PENDING_EVENT g_PendingEvent = { 0 };
+KMUTEX        g_EventLock    = { 0 };
 
 // ---------------------------------------------------------------------------
 // Operation registration
@@ -48,12 +59,7 @@ const FLT_REGISTRATION FilterReg = {
     Callbacks,
     DriverUnload,
     InstanceSetup,
-    NULL,  // InstanceQueryTeardown
-    NULL,  // InstanceTeardownStart
-    NULL,  // InstanceTeardownComplete
-    NULL,  // GenerateFileName
-    NULL,  // NormalizeNameComponent
-    NULL,  // NormalizeContextCleanup
+    NULL, NULL, NULL, NULL, NULL, NULL,
     SENTINEL_ALTITUDE,
 };
 
@@ -65,48 +71,58 @@ NTSTATUS DriverEntry(
     PUNICODE_STRING RegistryPath)
 {
     NTSTATUS status;
-    UNICODE_STRING portName;
+    UNICODE_STRING devName;
     PSECURITY_DESCRIPTOR sd;
     OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING portName;
 
     UNREFERENCED_PARAMETER(RegistryPath);
 
-    // Register the filter
-    status = FltRegisterFilter(DriverObject, &FilterReg, &g_Filter);
+    // Initialize synchronization
+    KeInitializeMutex(&g_EventLock, 0);
+    g_PendingEvent.Valid = FALSE;
+
+    // Create control device object
+    RtlInitUnicodeString(&devName, SENTINEL_DEVICE_NAME);
+    status = IoCreateDevice(DriverObject, 0, &devName,
+                            FILE_DEVICE_UNKNOWN, 0, FALSE, &g_DeviceObject);
     if (!NT_SUCCESS(status))
         return status;
 
-    // Create security descriptor: allow Everyone to connect
-    sd = NULL;
-    status = FltBuildDefaultSecurityDescriptor(&sd, FLT_PORT_ALL_ACCESS);
+    g_DeviceObject->Flags |= DO_BUFFERED_IO;
+    g_DeviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
+
+    // Create symbolic link for usermode access
+    RtlInitUnicodeString(&g_SymLinkName, SENTINEL_SYMLINK_NAME);
+    status = IoCreateSymbolicLink(&g_SymLinkName, &devName);
+    if (!NT_SUCCESS(status)) {
+        IoDeleteDevice(g_DeviceObject);
+        return status;
+    }
+
+    // Set up IRP dispatch routines for the control device
+    DriverObject->MajorFunction[IRP_MJ_CREATE]         = DispatchCreate;
+    DriverObject->MajorFunction[IRP_MJ_CLOSE]           = DispatchClose;
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL]  = DispatchDeviceControl;
+
+    // Register the minifilter
+    status = FltRegisterFilter(DriverObject, &FilterReg, &g_Filter);
     if (!NT_SUCCESS(status))
-        goto fail;
-
-    RtlInitUnicodeString(&portName, SENTINEL_PORT_NAME);
-    InitializeObjectAttributes(&oa, &portName, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
-                               NULL, sd);
-
-    // Create communication port
-    status = FltCreateCommunicationPort(g_Filter, &g_ServerPort, &oa,
-                                        NULL, ConnectNotify, DisconnectNotify,
-                                        MessageNotify, 1);
-    FltFreeSecurityDescriptor(sd);
-
-    if (!NT_SUCCESS(status))
-        goto fail;
+        goto fail_sym;
 
     // Start filtering
     status = FltStartFiltering(g_Filter);
     if (!NT_SUCCESS(status))
-        goto fail_port;
+        goto fail_filter;
 
     DbgPrint("FileSentinel: loaded, altitude=%ws\n", SENTINEL_ALTITUDE);
     return STATUS_SUCCESS;
 
-fail_port:
-    FltCloseCommunicationPort(g_ServerPort);
-fail:
+fail_filter:
     FltUnregisterFilter(g_Filter);
+fail_sym:
+    IoDeleteSymbolicLink(&g_SymLinkName);
+    IoDeleteDevice(g_DeviceObject);
     return status;
 }
 
@@ -117,12 +133,12 @@ NTSTATUS DriverUnload(FLT_FILTER_UNLOAD_FLAGS Flags)
 {
     UNREFERENCED_PARAMETER(Flags);
 
-    if (g_ClientPort)
-        FltCloseCommunicationPort(g_ClientPort);
-    if (g_ServerPort)
-        FltCloseCommunicationPort(g_ServerPort);
     if (g_Filter)
         FltUnregisterFilter(g_Filter);
+    if (g_SymLinkName.Buffer)
+        IoDeleteSymbolicLink(&g_SymLinkName);
+    if (g_DeviceObject)
+        IoDeleteDevice(g_DeviceObject);
 
     DbgPrint("FileSentinel: unloaded\n");
     return STATUS_SUCCESS;
@@ -145,48 +161,125 @@ NTSTATUS InstanceSetup(
 }
 
 // ===========================================================================
-// Communication port callbacks
+// IRP Dispatch: Create / Close
 // ===========================================================================
-NTSTATUS ConnectNotify(PFLT_PORT Port, PVOID PortContext)
+NTSTATUS DispatchCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
-    UNREFERENCED_PARAMETER(PortContext);
-
-    // Only allow one client at a time
-    if (g_ClientPort)
-        return STATUS_CONNECTION_REFUSED;
-
-    g_ClientPort = Port;
+    UNREFERENCED_PARAMETER(DeviceObject);
     DbgPrint("FileSentinel: usermode client connected\n");
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
     return STATUS_SUCCESS;
 }
 
-void DisconnectNotify(PFLT_PORT Port, PVOID PortContext)
+NTSTATUS DispatchClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
-    UNREFERENCED_PARAMETER(PortContext);
-
-    if (g_ClientPort == Port) {
-        g_ClientPort = NULL;
-        FltCloseCommunicationPort(Port);
-    }
+    UNREFERENCED_PARAMETER(DeviceObject);
     DbgPrint("FileSentinel: usermode client disconnected\n");
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
 }
 
-NTSTATUS MessageNotify(
-    PFLT_PORT  Port,
-    PVOID      Buffer,
-    ULONG      BufferSize,
-    PVOID     *ReplyBuffer,
-    PULONG     ReplyLength)
+// ===========================================================================
+// IRP Dispatch: DeviceControl
+// ===========================================================================
+NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
-    UNREFERENCED_PARAMETER(Port);
-    UNREFERENCED_PARAMETER(Buffer);
-    UNREFERENCED_PARAMETER(BufferSize);
+    UNREFERENCED_PARAMETER(DeviceObject);
 
-    // Usermode sends config/rules here. For now, simple ping.
-    static SENTINEL_REPLY reply = { 0 };
-    reply.Verdict = SentinelVerdict_Allow;
+    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
+    ULONG code = irpSp->Parameters.DeviceIoControl.IoControlCode;
+    NTSTATUS status = STATUS_SUCCESS;
+    PVOID buffer = Irp->AssociatedIrp.SystemBuffer;
+    ULONG inLen  = irpSp->Parameters.DeviceIoControl.InputBufferLength;
+    ULONG outLen = irpSp->Parameters.DeviceIoControl.OutputBufferLength;
+    ULONG retLen = 0;
 
-    *ReplyBuffer = &reply;
-    *ReplyLength = sizeof(reply);
+    switch (code) {
+    case IOCTL_SENTINEL_GET_EVENT:
+        // Usermode polls for pending event
+        if (outLen < sizeof(SENTINEL_MESSAGE)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        KeWaitForMutexObject(&g_EventLock, Executive, KernelMode, FALSE, NULL);
+        if (g_PendingEvent.Valid) {
+            RtlCopyMemory(buffer, &g_PendingEvent.Message, sizeof(SENTINEL_MESSAGE));
+            retLen = sizeof(SENTINEL_MESSAGE);
+        } else {
+            status = STATUS_NO_MORE_ENTRIES;
+        }
+        KeReleaseMutex(&g_EventLock, FALSE);
+        break;
+
+    case IOCTL_SENTINEL_REPLY_EVENT:
+        // Usermode sends verdict
+        if (inLen < sizeof(SENTINEL_REPLY)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        KeWaitForMutexObject(&g_EventLock, Executive, KernelMode, FALSE, NULL);
+        if (g_PendingEvent.Valid) {
+            PSENTINEL_REPLY reply = (PSENTINEL_REPLY)buffer;
+            g_PendingEvent.Verdict = reply->Verdict;
+            g_PendingEvent.Valid = FALSE;
+            KeSetEvent(&g_PendingEvent.Completed, IO_NO_INCREMENT, FALSE);
+        }
+        KeReleaseMutex(&g_EventLock, FALSE);
+        break;
+
+    default:
+        status = STATUS_INVALID_DEVICE_REQUEST;
+        break;
+    }
+
+    Irp->IoStatus.Status = status;
+    Irp->IoStatus.Information = retLen;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return status;
+}
+
+// ===========================================================================
+// Helper: queue event and wait for usermode verdict (called from callbacks.c)
+// ===========================================================================
+NTSTATUS SentinelQueueEvent(PSENTINEL_MESSAGE Msg, SENTINEL_VERDICT *Verdict)
+{
+    KeWaitForMutexObject(&g_EventLock, Executive, KernelMode, FALSE, NULL);
+
+    if (g_PendingEvent.Valid) {
+        // Already a pending event — allow this one (don't block)
+        KeReleaseMutex(&g_EventLock, FALSE);
+        *Verdict = SentinelVerdict_Allow;
+        return STATUS_SUCCESS;
+    }
+
+    KeInitializeEvent(&g_PendingEvent.Completed, NotificationEvent, FALSE);
+    RtlCopyMemory(&g_PendingEvent.Message, Msg, sizeof(SENTINEL_MESSAGE));
+    g_PendingEvent.Valid = TRUE;
+    g_PendingEvent.Verdict = SentinelVerdict_Allow;
+
+    KeReleaseMutex(&g_EventLock, FALSE);
+
+    // Wait for usermode to reply (timeout 5 seconds)
+    LARGE_INTEGER timeout;
+    timeout.QuadPart = -50000000LL; // 5 seconds in 100ns units
+    NTSTATUS status = KeWaitForSingleObject(&g_PendingEvent.Completed, Executive,
+                                            KernelMode, FALSE, &timeout);
+
+    if (status == STATUS_TIMEOUT) {
+        // Timed out — cancel the event
+        KeWaitForMutexObject(&g_EventLock, Executive, KernelMode, FALSE, NULL);
+        g_PendingEvent.Valid = FALSE;
+        KeReleaseMutex(&g_EventLock, FALSE);
+        *Verdict = SentinelVerdict_Allow;
+        return STATUS_TIMEOUT;
+    }
+
+    KeWaitForMutexObject(&g_EventLock, Executive, KernelMode, FALSE, NULL);
+    *Verdict = g_PendingEvent.Verdict;
+    KeReleaseMutex(&g_EventLock, FALSE);
     return STATUS_SUCCESS;
 }
