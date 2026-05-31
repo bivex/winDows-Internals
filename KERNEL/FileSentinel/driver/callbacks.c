@@ -1,9 +1,8 @@
 #include <fltKernel.h>
 #include "sentinel.h"
 
-// Globals defined in driver.c
-extern PFLT_FILTER g_Filter;
-extern PFLT_PORT   g_ClientPort;
+// Forward declaration from driver.c
+NTSTATUS SentinelQueueEvent(PSENTINEL_MESSAGE Msg, SENTINEL_VERDICT *Verdict);
 
 // ---------------------------------------------------------------------------
 // Helper: send operation to usermode and wait for verdict
@@ -14,19 +13,12 @@ static SENTINEL_VERDICT QueryUsermode(
     PCFLT_RELATED_OBJECTS FltObjects)
 {
     SENTINEL_MESSAGE msg = { 0 };
-    SENTINEL_REPLY reply = { 0 };
-    ULONG replyLen = sizeof(reply);
-    NTSTATUS status;
+    SENTINEL_VERDICT verdict = SentinelVerdict_Allow;
 
-    if (!g_ClientPort)
-        return SentinelVerdict_Allow;  // no usermode client — passthrough
+    msg.Type      = Type;
+    msg.ProcessId = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
+    msg.ThreadId  = (ULONG)(ULONG_PTR)PsGetCurrentThreadId();
 
-    // Fill message
-    msg.Type            = Type;
-    msg.ProcessId       = (ULONG)PsGetCurrentProcessId();
-    msg.ThreadId        = (ULONG)PsGetCurrentThreadId();
-
-    // Get full path
     if (FltObjects && FltObjects->FileObject && FltObjects->FileObject->FileName.Buffer) {
         ULONG len = FltObjects->FileObject->FileName.Length / sizeof(WCHAR);
         if (len >= SENTINEL_MAX_PATH)
@@ -37,14 +29,8 @@ static SENTINEL_VERDICT QueryUsermode(
         msg.FilePath[len] = L'\0';
     }
 
-    // Send synchronously — blocks until usermode replies
-    status = FltSendMessage(g_Filter, &g_ClientPort,
-                            &msg, sizeof(msg),
-                            &reply, &replyLen, NULL);
-    if (!NT_SUCCESS(status))
-        return SentinelVerdict_Allow;  // timeout/error — passthrough
-
-    return reply.Verdict;
+    SentinelQueueEvent(&msg, &verdict);
+    return verdict;
 }
 
 // ===========================================================================
@@ -57,7 +43,6 @@ FLT_PREOP_CALLBACK_STATUS PreCreate(
 {
     UNREFERENCED_PARAMETER(CompletionContext);
 
-    // Only interested in writes / creates
     ACCESS_MASK access = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
     ULONG options = Data->Iopb->Parameters.Create.Options;
     ULONG disposition = (options >> 24) & 0xFF;
@@ -74,7 +59,7 @@ FLT_PREOP_CALLBACK_STATUS PreCreate(
     if (v == SentinelVerdict_Deny) {
         Data->IoStatus.Status = STATUS_ACCESS_DENIED;
         Data->IoStatus.Information = 0;
-        return FLT_PREOP_COMPLETE;  // BLOCKED
+        return FLT_PREOP_COMPLETE;
     }
 
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -94,7 +79,7 @@ FLT_PREOP_CALLBACK_STATUS PreWrite(
 
     if (v == SentinelVerdict_Deny) {
         Data->IoStatus.Status = STATUS_ACCESS_DENIED;
-        return FLT_PREOP_COMPLETE;  // BLOCKED
+        return FLT_PREOP_COMPLETE;
     }
 
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -110,7 +95,8 @@ FLT_PREOP_CALLBACK_STATUS PreSetInfo(
 {
     UNREFERENCED_PARAMETER(CompletionContext);
 
-    FILE_INFORMATION_CLASS infoClass = Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
+    FILE_INFORMATION_CLASS infoClass =
+        Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
 
     if (infoClass == FileDispositionInformation ||
         infoClass == FileDispositionInformationEx) {

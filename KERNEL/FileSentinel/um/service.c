@@ -1,8 +1,5 @@
 //
-// FileSentinel usermode service — standalone (no fltuser.h required)
-// Connects to minifilter via CreateFile on the filter port device
-//
-// Build: cl service.c /Fe:sentinel_svc.exe
+// FileSentinel usermode service — connects via CDO device (no fltuser.h needed)
 //
 
 #include <windows.h>
@@ -51,25 +48,20 @@ static SENTINEL_VERDICT EvaluateRule(PSENTINEL_MESSAGE msg)
 }
 
 // ===========================================================================
-// Main — connect to driver and process events
+// Main
 // ===========================================================================
 int __cdecl wmain(int argc, wchar_t *argv[])
 {
-    HANDLE hPort;
-    HRESULT hr;
+    HANDLE hDevice;
+    DWORD bytesReturned;
 
     UNREFERENCED_PARAMETER(argc);
     UNREFERENCED_PARAMETER(argv);
 
     wprintf(L"FileSentinel service starting...\n");
 
-    //
-    // Connect to the minifilter communication port.
-    // Filter Manager creates a device for each port at \Device\FileSentinelPort
-    // Usermode opens it via \\.\FileSentinelPort
-    //
-    hPort = CreateFileW(
-        L"\\\\.\\FileSentinelPort",
+    hDevice = CreateFileW(
+        SENTINEL_USER_PATH,
         GENERIC_READ | GENERIC_WRITE,
         0,
         NULL,
@@ -77,7 +69,7 @@ int __cdecl wmain(int argc, wchar_t *argv[])
         0,
         NULL);
 
-    if (hPort == INVALID_HANDLE_VALUE) {
+    if (hDevice == INVALID_HANDLE_VALUE) {
         wprintf(L"ERROR: cannot connect to driver (err=%lu). Is driver loaded?\n",
                 GetLastError());
         return 1;
@@ -90,37 +82,52 @@ int __cdecl wmain(int argc, wchar_t *argv[])
     }
     wprintf(L"\n");
 
-    // Main loop — read messages from driver, send verdicts back
     for (;;) {
         SENTINEL_MESSAGE msg = { 0 };
-        DWORD bytesReturned;
 
-        // Read operation info from driver
-        BOOL ok = ReadFile(hPort, &msg, sizeof(msg), &bytesReturned, NULL);
+        // Poll for next event
+        BOOL ok = DeviceIoControl(
+            hDevice,
+            IOCTL_SENTINEL_GET_EVENT,
+            NULL, 0,
+            &msg, sizeof(msg),
+            &bytesReturned,
+            NULL);
+
         if (!ok) {
             DWORD err = GetLastError();
+            if (err == ERROR_NO_MORE_ITEMS || err == ERROR_NOT_FOUND) {
+                Sleep(50);  // No event pending, wait and retry
+                continue;
+            }
             if (err == ERROR_INVALID_HANDLE || err == ERROR_BROKEN_PIPE) {
                 wprintf(L"Driver disconnected.\n");
                 break;
             }
-            wprintf(L"ReadFile error: %lu\n", err);
+            wprintf(L"GET_EVENT error: %lu\n", err);
+            Sleep(100);
             continue;
         }
 
-        // Evaluate rules
+        // Evaluate and send verdict
         SENTINEL_VERDICT verdict = EvaluateRule(&msg);
-
-        // Send verdict back
         SENTINEL_REPLY reply = { 0 };
         reply.Verdict = verdict;
 
-        ok = WriteFile(hPort, &reply, sizeof(reply), &bytesReturned, NULL);
+        ok = DeviceIoControl(
+            hDevice,
+            IOCTL_SENTINEL_REPLY_EVENT,
+            &reply, sizeof(reply),
+            NULL, 0,
+            &bytesReturned,
+            NULL);
+
         if (!ok) {
-            wprintf(L"WriteFile error: %lu\n", GetLastError());
+            wprintf(L"REPLY_EVENT error: %lu\n", GetLastError());
         }
     }
 
-    CloseHandle(hPort);
+    CloseHandle(hDevice);
     wprintf(L"FileSentinel service stopped.\n");
     return 0;
 }
