@@ -184,8 +184,6 @@ NTSTATUS MessageNotify(
 
     // Usermode sends config/rules here. For now, simple ping.
     static SENTINEL_REPLY reply = { 0 };
-    reply.Header.Status = 0;
-    reply.Header.MessageId = 0;
     reply.Verdict = SentinelVerdict_Allow;
 
     *ReplyBuffer = &reply;

@@ -1,6 +1,10 @@
 #include <fltKernel.h>
 #include "sentinel.h"
 
+// Globals defined in driver.c
+extern PFLT_FILTER g_Filter;
+extern PFLT_PORT   g_ClientPort;
+
 // ---------------------------------------------------------------------------
 // Helper: send operation to usermode and wait for verdict
 // ---------------------------------------------------------------------------
