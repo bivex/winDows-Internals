@@ -1,0 +1,89 @@
+;;
+;; FileSentinel minifilter driver — INF installation file
+;;
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = "ActivityMonitor"           ; FSFilter Activity Monitor
+ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8cfe75c9fc2}
+Provider    = %ProviderString%
+DriverVer   = 01/01/2026,1.0.0.0
+CatalogFile = sentinel.cat
+
+[DestinationDirs]
+DefaultDestDir          = 12      ;%windir%\system32\drivers
+FileSentinel.DriverFiles = 12
+
+;;
+;; Default install sections
+;;
+[DefaultInstall.NTamd64]
+OptionDesc  = %ServiceDescription%
+CopyFiles   = FileSentinel.DriverFiles
+
+[DefaultInstall.NTarm64]
+OptionDesc  = %ServiceDescription%
+CopyFiles   = FileSentinel.DriverFiles
+
+[DefaultUninstall.NTamd64]
+LegacyUninstall = 1
+DelFiles   = FileSentinel.DriverFiles
+
+[DefaultUninstall.NTarm64]
+LegacyUninstall = 1
+DelFiles   = FileSentinel.DriverFiles
+
+[FileSentinel.DriverFiles]
+sentinel.sys
+
+;;
+;; Default install sections — Services
+;;
+[DefaultInstall.NTamd64.Services]
+AddService  = %ServiceName%,,FileSentinel.Service
+
+[DefaultInstall.NTarm64.Services]
+AddService  = %ServiceName%,,FileSentinel.Service
+
+;;
+;; Default uninstall sections — Services
+;;
+[DefaultUninstall.NTamd64.Services]
+DelService = %ServiceName%,0x200
+
+[DefaultUninstall.NTarm64.Services]
+DelService = %ServiceName%,0x200
+
+;;
+;; Service section
+;;
+[FileSentinel.Service]
+DisplayName    = %ServiceName%
+Description    = %ServiceDescription%
+ServiceBinary  = %12%\sentinel.sys
+ServiceType    = 2               ; SERVICE_FILE_SYSTEM_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+LoadOrderGroup = "FSFilter Activity Monitor"
+AddReg         = FileSentinel.AddRegistry
+
+;;
+;; Registry — add supported altitudes
+;;
+[FileSentinel.AddRegistry]
+HKR,,"SupportedFeatures",0x00010001,0x3
+HKR,"Instances","DefaultInstance",0x00000000,%DefaultInstance%
+HKR,"Instances\"%Instance1.Name%,"Altitude",0x00000000,%Instance1.Altitude%
+HKR,"Instances\"%Instance1.Name%,"Flags",0x00010001,%Instance1.Flags%
+
+;;
+;; Strings
+;;
+[Strings]
+ProviderString        = "FileSentinel"
+ServiceDescription    = "FileSentinel File Monitor/Blocker"
+ServiceName           = "sentinel"
+DefaultInstance       = "sentinel Instance"
+Instance1.Name        = "sentinel Instance"
+Instance1.Altitude    = "327000"
+Instance1.Flags       = 0x0
