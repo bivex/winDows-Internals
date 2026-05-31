@@ -6,10 +6,11 @@
 //
 
 // ---------------------------------------------------------------------------
-// Communication port name
+// Device name and symlink
 // ---------------------------------------------------------------------------
-#define SENTINEL_PORT_NAME  L"\\FileSentinelPort"
-#define SENTINEL_PORT_USER  L"\\\\.\\FileSentinelPort"
+#define SENTINEL_DEVICE_NAME   L"\\Device\\FileSentinel"
+#define SENTINEL_SYMLINK_NAME  L"\\??\\FileSentinel"
+#define SENTINEL_USER_PATH     L"\\\\.\\FileSentinel"
 
 // ---------------------------------------------------------------------------
 // Altitude — above FSFilter Anti-Virus, below Defender
@@ -17,13 +18,24 @@
 #define SENTINEL_ALTITUDE   L"327000"
 
 // ---------------------------------------------------------------------------
+// IOCTL codes
+// ---------------------------------------------------------------------------
+#define FILE_DEVICE_SENTINEL  0x8000
+
+#define IOCTL_SENTINEL_GET_EVENT \
+    CTL_CODE(FILE_DEVICE_SENTINEL, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define IOCTL_SENTINEL_REPLY_EVENT \
+    CTL_CODE(FILE_DEVICE_SENTINEL, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// ---------------------------------------------------------------------------
 // Message types (kernel -> usermode)
 // ---------------------------------------------------------------------------
 typedef enum _SENTINEL_MSG_TYPE {
-    SentinelMsg_FileCreate   = 1,   // IRP_MJ_CREATE
-    SentinelMsg_FileWrite    = 2,   // IRP_MJ_WRITE
-    SentinelMsg_FileDelete   = 3,   // IRP_MJ_SET_INFORMATION (FileDispositionInfo)
-    SentinelMsg_FileRename   = 4,   // IRP_MJ_SET_INFORMATION (FileRenameInfo)
+    SentinelMsg_FileCreate   = 1,
+    SentinelMsg_FileWrite    = 2,
+    SentinelMsg_FileDelete   = 3,
+    SentinelMsg_FileRename   = 4,
 } SENTINEL_MSG_TYPE;
 
 // ---------------------------------------------------------------------------
@@ -37,10 +49,10 @@ typedef enum _SENTINEL_VERDICT {
 // ---------------------------------------------------------------------------
 // Max path length for messages
 // ---------------------------------------------------------------------------
-#define SENTINEL_MAX_PATH  520  // UNICODE chars (1040 bytes)
+#define SENTINEL_MAX_PATH  520
 
 // ---------------------------------------------------------------------------
-// Kernel -> Usermode message (no Filter Manager headers — use ReadFile/WriteFile)
+// Kernel -> Usermode event
 // ---------------------------------------------------------------------------
 typedef struct _SENTINEL_MESSAGE {
     SENTINEL_MSG_TYPE  Type;
@@ -59,6 +71,6 @@ typedef struct _SENTINEL_REPLY {
 } SENTINEL_REPLY, *PSENTINEL_REPLY;
 
 // ---------------------------------------------------------------------------
-// Max pending operations (backpressure)
+// Max pending operations
 // ---------------------------------------------------------------------------
 #define SENTINEL_MAX_PENDING  256
