@@ -48,20 +48,25 @@ Both should show `running`.
 pkill -f socat 2>/dev/null
 ```
 
-### 3.2 Start socat bridge
+### 3.2 Bridge target serial socket to debugger serial socket
+
+Parallels creates UNIX sockets for serial ports:
+- Target VM: `/tmp/target.sock` (mode=server)
+- Debugger VM: `/tmp/debugger.sock` (mode=server)
+
+Sockets are owned by root, so socat needs sudo:
 
 ```bash
-socat -d -d UNIX-LISTEN:/tmp/com1.sock,fork TCP:10.211.55.5:4445 &
-socat -d -d TCP-LISTEN:4445,reuseaddr UNIX-CONNECT:/tmp/com1.sock &
+echo '9090' | sudo -S socat -d -d UNIX-CONNECT:/tmp/target.sock UNIX-CONNECT:/tmp/debugger.sock &
 ```
 
 ### 3.3 Verify
 
 ```bash
-ps aux | grep socat
+ps aux | grep socat | grep -v grep
 ```
 
-Should show 2 socat processes.
+Should show socat running as root.
 
 ---
 
@@ -80,11 +85,15 @@ prlctl exec "Windows 11 Pro (Debugger)" \
 ### 4.2 Ensure iphlpsvc is running (required for portproxy)
 
 ```bash
-prlctl exec "Windows 11 Pro (Debugger)" net start iphlpsvc
+prlctl exec "Windows 11 Pro (Debugger)" cmd /c "sc query iphlpsvc | findstr STATE"
+# If STOPPED:
+prlctl exec "Windows 11 Pro (Debugger)" cmd /c "net start iphlpsvc"
 ```
 
 > **CRITICAL:** `iphlpsvc` (IP Helper) is required for `netsh interface portproxy` to work.
+> **iphlpsvc does NOT auto-start after reboot.** You MUST start it manually every time.
 > If MCP was working before and suddenly stopped — check this service FIRST.
+> Even if portproxy rule exists (`netsh interface portproxy show all`), it does NOTHING without iphlpsvc.
 
 ### 4.3 Verify MCP agent responds
 
