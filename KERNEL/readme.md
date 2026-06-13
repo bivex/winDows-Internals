@@ -140,18 +140,47 @@ See [windbg_agent.md](windbg_agent.md) for full setup.
 
 ### Quick start
 
+In WinDbg (elevated) on Debugger VM:
+
 ```
 kd> !load C:\Tools\windbg-agent\windbg_agent.dll
-kd> !agent mcp 0.0.0.0 44444
+kd> !agent mcp 127.0.0.1 44444
 ```
 
-If port 44444 is already bound (stale process), kill it first in an elevated cmd on Debugger VM:
+`windbg_agent` can only bind loopback — use portproxy to forward external traffic in.
+
+### One-time portproxy setup (Debugger VM, elevated cmd)
+
+Run once — survives reboots via IP Helper service:
+
+```cmd
+net start iphlpsvc
+
+netsh advfirewall firewall add rule name=MCP dir=in action=allow protocol=TCP localport=44444
+
+netsh interface portproxy add v4tov4 listenport=44444 listenaddress=0.0.0.0 connectport=44444 connectaddress=127.0.0.1
+```
+
+Verify portproxy is active:
+
+```cmd
+netsh interface portproxy show all
+```
+
+Expected:
+
+```
+Listen on ipv4:             Connect to ipv4:
+Address         Port        Address         Port
+--------------- ----------  --------------- ----------
+0.0.0.0         44444       127.0.0.1       44444
+```
+
+If port 44444 is already bound by a stale process, kill it first:
 
 ```cmd
 for /f "tokens=5" %a in ('netstat -ano ^| findstr :44444') do taskkill /F /PID %a
 ```
-
-Then retry `!agent mcp 0.0.0.0 44444`.
 
 ### Verify from macOS host
 
