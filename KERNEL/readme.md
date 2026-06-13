@@ -36,8 +36,8 @@ No workaround exists without changing the hypervisor.
 │  │                  │           │                  │       │
 │  │  kdcom (kdcom.dll│           │  WinDbg          │       │
 │  │  grabs COM1)     │           │  -k com:COM1     │       │
-│  │       │          │           │       │          │       │
-│  │  ARM PL011 UART  │           │  ARM PL011 UART  │       │
+│  │       │          │           │  + windbg_agent  │       │
+│  │  ARM PL011 UART  │           │  :44444 (MCP)    │       │
 │  │       │          │           │       │          │       │
 │  └───────┼──────────┘           └───────┼──────────┘       │
 │          │                              │                   │
@@ -79,10 +79,22 @@ Both VMs have `EmulatedType=3` (Unix socket mode) configured in `config.pvs`:
 ### Option A — script (recommended)
 
 ```bash
-/Volumes/External/Code/double_parallels_windbg/START_DEBUG_SESSION.sh
+bash /Volumes/External/Code/winDows-Internals/KERNEL/START_DEBUG_SESSION.sh
 ```
 
-For a detailed from-scratch checklist, see [ColdStart.md](/Volumes/External/Code/double_parallels_windbg/ColdStart.md).
+Run as normal user (NOT sudo) — `prlctl` is per-user. The script asks for sudo only for socat.
+
+Script sequence:
+1. Configures serial ports (idempotent)
+2. Kills stale socat, removes old sockets
+3. Starts both VMs
+4. Waits for both Unix sockets
+5. Starts socat relay
+6. Launches WinDbg on Debugger VM via `prlctl exec`
+7. Restarts socat (Parallels recreates the socket on reboot)
+8. Reboots Target VM — WinDbg catches boot break automatically
+
+For a detailed from-scratch checklist, see [ColdStart.md](ColdStart.md).
 
 ### Option B — manual steps
 
@@ -120,15 +132,51 @@ fffff800`6be013c8 d43e0000 brk   #0xF000
 
 ---
 
+## WinDbg Agent MCP
+
+`windbg_agent.dll` exposes a Streamable HTTP MCP server inside WinDbg, allowing commands from the macOS host.
+
+See [windbg_agent.md](windbg_agent.md) for full setup.
+
+### Quick start
+
+```
+kd> !load C:\Tools\windbg-agent\windbg_agent.dll
+kd> !agent mcp 0.0.0.0 44444
+```
+
+If port 44444 is already bound (stale process), kill it first in an elevated cmd on Debugger VM:
+
+```cmd
+for /f "tokens=5" %a in ('netstat -ano ^| findstr :44444') do taskkill /F /PID %a
+```
+
+Then retry `!agent mcp 0.0.0.0 44444`.
+
+### Verify from macOS host
+
+```bash
+curl -s -X POST http://10.211.55.5:44444/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}'
+```
+
+---
+
 ## Reconnecting After VM Reboot
 
-If Target reboots during a session, WinDbg automatically reconnects — no need to restart socat or WinDbg. The relay stays alive.
+Parallels **deletes and recreates** `/tmp/kd.sock` on every Target reboot.
+The running socat holds a dead fd to the old socket and silently stops relaying.
 
-To manually break into the debugger:
+**Rule:** always restart socat before rebooting Target.
 
+```bash
+sudo pkill -f "socat.*kd.sock"
+sudo /opt/homebrew/bin/socat UNIX-CONNECT:/tmp/kd.sock UNIX-CONNECT:/tmp/debugger.sock &
+prlctl exec "Windows 11 Pro (Target)" --current-user cmd /c "shutdown /r /t 0"
 ```
-Ctrl+Break  (in WinDbg)
-```
+
+WinDbg will reconnect automatically — no restart needed.
 
 ---
 
@@ -152,11 +200,14 @@ bp nt!PspInsertProcess
 
 # Continue execution
 g
+
+# Force break into target
+Ctrl+Break
 ```
 
 ---
 
-## Network Info (for reference)
+## Network Info
 
 | | Shared Network (NIC0) | Bridged (NIC1) |
 |---|---|---|
@@ -170,10 +221,12 @@ g
 
 | Symptom | Fix |
 |---|---|
-| `/tmp/kd.sock` not created | Target serial config missing — check `config.pvs` |
+| `/tmp/kd.sock` not created | Target serial config missing — run step 0 of the script |
 | `socat: Permission denied` | Run socat with `sudo` |
 | WinDbg stuck at `Waiting to reconnect...` | Start WinDbg BEFORE rebooting Target |
 | socat dies immediately | Both sockets must exist before running socat |
 | `Win32 error 0n87` / `The parameter is incorrect` | Use `com:port=com1,baud=115200,reconnect`, not `\\.\COM1` |
 | `Access is denied` opening COM1 | Launch WinDbg as Administrator |
 | WinDbg connected but no symbols | Run `.symfix` then `.reload` |
+| `!agent mcp` returns `start() returned false` | Port already bound — kill the PID with `taskkill /F /PID <pid>` |
+| MCP curl times out from host | WinDbg was bound to `127.0.0.1` — use `!agent mcp 0.0.0.0 44444` |
