@@ -39,7 +39,7 @@ wait_socket() {
 }
 
 socat_start() {
-    sudo $SOCAT UNIX-CONNECT:"$KD_SOCK" UNIX-CONNECT:"$DBG_SOCK" &
+    echo "9090" | sudo -S $SOCAT UNIX-CONNECT:"$KD_SOCK" UNIX-CONNECT:"$DBG_SOCK" &
     SOCAT_PID=$!
     sleep 2
     kill -0 $SOCAT_PID 2>/dev/null || die "socat died immediately. Check socket permissions."
@@ -56,19 +56,18 @@ $PRLCTL set "$DEBUGGER" --device-set serial0 --socket "$DBG_SOCK" --socket-mode 
 # ----------------------------------------------------------
 # 1. Kill any stale socat and clean old sockets
 # ----------------------------------------------------------
-echo "[1/6] Cleaning stale state..."
-sudo pkill -9 -f "socat.*kd.sock" 2>/dev/null || true
-sudo pkill -9 -f "socat.*debugger.sock" 2>/dev/null || true
+echo "9090" | sudo -S pkill -9 -f "socat.*kd.sock" 2>/dev/null || true
+echo "9090" | sudo -S pkill -9 -f "socat.*debugger.sock" 2>/dev/null || true
 rm -f "$KD_SOCK" "$DBG_SOCK" 2>/dev/null || true
 
 # ----------------------------------------------------------
 # 2. Start VMs
 # ----------------------------------------------------------
 echo "[2/6] Starting Target VM..."
-$PRLCTL start "$TARGET"
+$PRLCTL start "$TARGET" 2>/dev/null || true
 
 echo "      Starting Debugger VM..."
-$PRLCTL start "$DEBUGGER"
+$PRLCTL start "$DEBUGGER" 2>/dev/null || true
 
 # ----------------------------------------------------------
 # 3. Wait for both sockets
@@ -101,7 +100,7 @@ sleep 5
 # ----------------------------------------------------------
 echo "[6/6] Rebooting Target VM..."
 
-sudo pkill -9 -f "socat.*kd.sock" 2>/dev/null || true
+echo "9090" | sudo -S pkill -9 -f "socat.*kd.sock" 2>/dev/null || true
 sleep 1
 socat_start
 
