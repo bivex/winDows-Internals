@@ -33,10 +33,12 @@ net start iphlpsvc
 
 netsh advfirewall firewall add rule name=MCP dir=in action=allow protocol=TCP localport=44444
 
-netsh interface portproxy add v4tov4 listenport=44444 listenaddress=0.0.0.0 connectport=44444 connectaddress=127.0.0.1
+netsh interface portproxy add v4tov4 listenport=44444 listenaddress=0.0.0.0 connectport=44445 connectaddress=127.0.0.1
 
-netsh interface portproxy add v6tov4 listenport=44444 listenaddress=:: connectport=44444 connectaddress=127.0.0.1
+netsh interface portproxy add v6tov4 listenport=44444 listenaddress=:: connectport=44445 connectaddress=127.0.0.1
 ```
+
+Примеч.: portproxy должен слушать на порту 44444 и перенаправлять на внутренний порт `44445`, так как иначе `iphlpsvc` блокирует локальный порт.
 
 Второй proxy нужен потому что Parallels Shared Network блокирует IPv4 между хостом и VM — IPv6 работает, IPv4 нет.
 
@@ -52,12 +54,12 @@ netsh interface portproxy show all
 Listen on ipv4:             Connect to ipv4:
 Address         Port        Address         Port
 --------------- ----------  --------------- ----------
-0.0.0.0         44444       127.0.0.1       44444
+0.0.0.0         44444       127.0.0.1       44445
 
 Listen on ipv6:             Connect to ipv4:
 Address         Port        Address         Port
 --------------- ----------  --------------- ----------
-*               44444       127.0.0.1       44444
+*               44444       127.0.0.1       44445
 ```
 
 ## Шаг 2. Запустить MCP сервер в WinDbg
@@ -66,7 +68,7 @@ Address         Port        Address         Port
 
 ```
 kd> !load C:\Tools\windbg-agent\windbg_agent.dll
-kd> !agent mcp 127.0.0.1 44444
+kd> !agent mcp 127.0.0.1 44445
 ```
 
 Если порт занят стale-процессом:
