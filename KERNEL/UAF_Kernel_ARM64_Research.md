@@ -521,3 +521,52 @@ dt nt!_MMVAD 0xffffce0d`ff0e2e90 Core.u.VadFlags
 * **Защита DEP/NX на уровне ядра (`_MMVAD`):** Мы изучили дерево виртуальной памяти процесса (`VadRoot` в `_EPROCESS`). Память кучи имеет флаги `PAGE_READWRITE` (`0x04`) и `PrivateMemory = 1`. Это доказывает, что в памяти кучи отключено право исполнения кода (`PAGE_EXECUTE`). Прямой шелл-код в куче заблокируется аппаратно.
 * **Cross-ISA эффект (ARM64 vs x64):** Менеджер кучи ядра пишет байты метаданных в формате ARM64. Например, байты `00 02 1f d6` в куче — это нативная инструкция ARM64 **`BR X8`** (прыжок по регистру, готовый JOP-гаджет). Но при отладке в контексте x64 они расшифровываются как случайные инструкции `add [rdx], al`. Это создает несовпадение семантики байтов между архитектурами.
 
+---
+
+## 12. Jump-Oriented Programming (JOP) Mechanics & Mitigation Inspection (A/B/C)
+
+### Empirical Mitigation Scan Results (Windows 11 ARM64 Native)
+
+Run directly on Target VM via `check_mitigations_arm64.exe`:
+
+```text
+====================================================
+  Windows 11 ARM64 Mitigation Status Inspector
+====================================================
+
+[+] Binary Architecture : Native ARM64 (AArch64)
+
+[C] Control Flow Guard (CFG):
+    - CFG Enabled            : NO
+    - Export Suppression     : NO
+    - Strict Mode            : NO
+
+[B] Branch Target Identification (BTI / CET) : Not Active / Legacy Mode
+
+[A] Pointer Authentication (PAC) & Hardware Security:
+    - PAC Compiler Support   : Disabled in Compiler Flags
+    - ARM64 Atomic Ops (v8.1): SUPPORTED
+
+[+] DEP / NX Status:
+    - DEP Enabled            : YES
+    - Permanent              : YES
+
+[+] ASLR Status:
+    - High Entropy ASLR      : YES
+    - Force Relocate Images  : NO
+```
+
+---
+
+### Security Protection Analysis (A / B / C)
+
+1. **[A] PAC (Pointer Authentication Code):**  
+   ARM64 hardware supports atomic and security features (`PF_ARM_V81_ATOMIC_INSTRUCTIONS_AVAILABLE`), but standard user-mode binaries without `/guard:signret` or compiler PAC flags lack signed return pointers, allowing dangling pointer redirection in user-space.
+
+2. **[B] BTI (Branch Target Identification):**  
+   In `Legacy Mode`. Without BTI instruction markers (`BTI C` / `BTI J`), indirect branches (`BR Xn` / `BLR Xn`) can land on arbitrary 4-byte boundary alignment within executable pages.
+
+3. **[C] CFG (Control Flow Guard):**  
+   Disabled (`NO`) for standard uninstrumented binaries. Without CFG bitmap validation (`nt!LdrpValidateUserCallTarget`), function pointer overwrites are not trapped prior to branch execution.
+
+
