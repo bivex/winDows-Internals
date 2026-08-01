@@ -695,7 +695,7 @@ flowchart TD
         D --> E["3. Re-Allocation: malloc(spray)"]
         E --> F["Allocator reuses same chunk: 0x00000210f537c36c<br/>spray->action overwrites offset +0x28"]
         F --> G["4. Use-After-Free: obj->action() Called"]
-    </div>
+    end
 
     subgraph Mitigations["2. Mitigation Inspection & Hardware Traps"]
         G --> H{"Target Memory Location?"}
