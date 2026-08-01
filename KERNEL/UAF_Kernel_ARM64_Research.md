@@ -93,11 +93,11 @@ nt!ObDereferenceObject+0x128:              ; Double-Free / Reference Underflow H
 ## 5. Empirical Protection Mechanics Verified in Kernel
 
 1. **PAC Stack & LR Integrity (`pacibsp` / `autibsp`):**  
-   Function entry uses `pacibsp` and exit uses `autibsp`. Any attempt to tamper with return addresses or function pointers during reference manipulation results in an instant hardware trap.
+   Function entry uses `pacibsp` and exit uses `autibsp` to sign and authenticate return addresses (`LR` / `X30`) on the stack. Note: PAC protects authenticated return addresses; heap-resident function pointers are only protected if the binary and ABI are explicitly compiled to sign and authenticate those specific pointers.
 2. **Atomic Interlocked Operations (`ldaddl`):**  
-   `PointerCount` updates use hardware atomic `ldaddl` instructions on ARM64, eliminating multithreaded race condition vulnerabilities during object destruction.
+   `PointerCount` updates use hardware atomic `ldaddl` instructions on ARM64. This eliminates data races *on the reference count variable itself*, though logical lifetime bugs or missing high-level locks can still lead to UAFs.
 3. **Double-Free / Underflow Detection (`tbnz x20, #0x3F`):**  
-   If `PointerCount` drops below zero (indicating a double-free or invalid dereference), the kernel executes `tbnz x20, #0x3F` and triggers `KeBugCheckEx(0x18: REFERENCE_BY_POINTER)`, crashing the OS safely before attacker code can execute.
+   The kernel tests for an invalid or underflowed reference count state (`tbnz x20, #0x3F`) before invoking `KeBugCheckEx(0x18: REFERENCE_BY_POINTER)`, halting the OS safely before the invalid path proceeds.
 
 ---
 
@@ -331,19 +331,21 @@ ExceptionAddress: 00007ff6c4ac1137 (uaf_poc_raw!main+0xf7)
 
 ### Анализ краша
 
-**1. "Only x86 user-mode context is available"**
+**1. "Only x86 user-mode context is available" & Synthetic Debugger Frame**
 
-Бинарь скомпилирован как x64 (не native ARM64). На Windows 11 ARM64 x64 код исполняется через **слой эмуляции CHPE (Compiled Hybrid Portable Executable)**. Kernel debugger (ARM64 EL1) видит user-mode контекст как x86/x64 WOW64, а не native ARM64 — отсюда регистры `rax/rip` вместо `x0/pc`.
+The binary was compiled as x64. On Windows 11 ARM64, x64 code executes under the **XTA / ARM64EC execution translator**. The kernel debugger (EL1) intercepts the exception from the XTA context, presenting a synthetic WOW64 (AMD64) register frame with uninitialized register state (`rax=0`, `rip=0`).
 
-**2. `rip = 0x0000000000000000` — NULL PC**
+**2. `rip = 0x0000000000000000` — Inference on Crash Mechanism**
 
-Когда `obj->action()` был вызван через corrupted function pointer, процессор прыгнул по адресу из heap metadata. Heap allocator записал в слот `+0x28` (поле `action`) данные которые при интерпретации как ARM64/x64 указатель дали `NULL` после применения ASLR / CHPE трансляции адреса.
+When `obj->action()` was invoked via the dangling pointer, execution halted at `0x0`. Possible causes include:
+* The corrupted pointer value was invalid or mapped to 0 during indirect branch resolution.
+* Exception dispatch state was lost when transitioning across the XTA emulation boundary.
+* Synthetic WinDbg WOW64 context initialization defaults uncaptured registers to 0 during an unhandled exception break.
 
-Итог: CPU попытался выполнить инструкцию по адресу `0x0` → **NULL dereference → немедленный краш**.
+**3. Observed Evidence vs. Interpretation**
 
-**3. Все регистры = 0**
-
-Kernel debugger показывает **частичный контекст** (`partially valid`) — EL1 не имеет доступа к полному снимку x64 регистров WOW64 процесса в момент краша. Это артефакт кросс-архитектурной эмуляции, а не реальное состояние CPU.
+* **Observed:** `ExceptionCode: 80000003` (STATUS_BREAKPOINT / INT3 break or unmapped target trap), `rip = 0x0` in synthetic x64 frame.
+* **Inference:** The CPU attempted an indirect call through the corrupted heap pointer; the resulting invalid target triggered an exception, rendering a zeroed register frame in WinDbg.
 
 ---
 
@@ -432,27 +434,17 @@ obj->action()  [UAF!]          →  читает +0x28 по старому ад�
 
 ### Ключевые выводы из heap forensics
 
-**1. ARM64 heap metadata ≠ x64 инструкции**
+**1. Heap metadata vs ARM64 instruction decoding**
 
-Windows NT Heap Manager записывает в освобождённый блок **ARM64 machine code** (freelist pointers, chunk headers). WinDbg декодирует их в x64 контексте CHPE — получается бессмысленный x64 код с множеством `???` (невалидные опкоды).
+Windows NT Heap Manager writes **allocator metadata** (freelist pointers, chunk headers) into freed blocks. Because ARM64 uses fixed-width 32-bit instruction encoding, arbitrary 32-bit metadata values can coincidentally decode as valid ARM64 instructions when parsed in an ARM64 disassembler.
 
-**2. `d6` = невалидный x64 опкод, но `BR Xn` в ARM64**
+**2. `0xd61f0200` decodes to `BR X8`**
 
-Байт `0xd6` в x64 — зарезервированный/невалидный опкод (показан как `???`).  
-В ARM64: `0xd61f0200` = `BR X8` — безусловный прыжок по регистру X8.  
-Это **нативный JOP (Jump-Oriented Programming) гаджет**, случайно оказавшийся в heap metadata freed блока — именно то, что ищут при heap spray атаках на ARM64.
+The byte sequence `00 02 1f d6` (Little Endian `0xd61f0200`) decodes to `BR X8`. However, as shown by VAD analysis (`PAGE_READWRITE` 0x04), DEP/NX prevents executing these heap bytes directly.
 
-**3. Адрес `+0x14`: heap flink содержит `BR X8`**
+**3. Cross-ISA Decoding Differences**
 
-```
-+0x14: 00 02 1f d6  →  ARM64: BR X8
-```
-
-Heap freelist forward-link (`flink`) содержит ARM64 инструкцию `BR X8`. Если атакующий может контролировать значение X8 в момент когда управление передаётся на этот адрес — возможен JOP chain.
-
-**4. Cross-ISA heap spray — уникальная особенность ARM64 Windows**
-
-На Windows 11 ARM64 с x64 процессами: heap metadata пишется ARM64 кодом (NT Heap Manager native ARM64), но читается x64 CHPE эмулятором. Это создаёт **cross-ISA семантическое несоответствие** — один и тот же байтовый паттерн имеет разное значение в зависимости от того, какой ISA его интерпретирует.
+When x64 processes run on ARM64 Windows under XTA emulation, heap metadata written by native kernel allocators can be parsed differently depending on whether the disassembler decodes in ARM64 or x64 mode.
 
 ---
 
@@ -518,8 +510,9 @@ dt nt!_MMVAD 0xffffce0d`ff0e2e90 Core.u.VadFlags
 ---
 
 ### 4. Дополнительные факты, найденные «за кадром» через WinDbg
-* **Защита DEP/NX на уровне ядра (`_MMVAD`):** Мы изучили дерево виртуальной памяти процесса (`VadRoot` в `_EPROCESS`). Память кучи имеет флаги `PAGE_READWRITE` (`0x04`) и `PrivateMemory = 1`. Это доказывает, что в памяти кучи отключено право исполнения кода (`PAGE_EXECUTE`). Прямой шелл-код в куче заблокируется аппаратно.
-* **Cross-ISA эффект (ARM64 vs x64):** Менеджер кучи ядра пишет байты метаданных в формате ARM64. Например, байты `00 02 1f d6` в куче — это нативная инструкция ARM64 **`BR X8`** (прыжок по регистру, готовый JOP-гаджет). Но при отладке в контексте x64 они расшифровываются как случайные инструкции `add [rdx], al`. Это создает несовпадение семантики байтов между архитектурами.
+* **Защита DEP/NX на уровне ядра (`_MMVAD`):** Дерево виртуальной памяти процесса (`VadRoot` в `_EPROCESS`) подтверждает, что память кучи имеет флаги `PAGE_READWRITE` (`0x04`) и `PrivateMemory = 1`. Это гарантирует, что исполнение кода из кучи заблокировано аппаратно.
+* **Интерпретация байтов кучи:** Освобожденный блок содержит метаданные аллокатора. Байт-последовательность `00 02 1f d6` декодируется в ARM64 как `BR X8`, однако благодаря DEP прямое исполнение этой памяти невозможно.
+* **Синтетический кадр WinDbg при краше:** Состояние `RIP = 0x0` при `ExceptionCode: 80000003` отражает синтетический контекст WOW64/XTA эмуляции в WinDbg при необработанном исключении, а не непреложный факт нулевого адреса функции.
 
 ---
 
@@ -600,10 +593,10 @@ Run directly on Target VM after compiling with MSVC `/guard:cf /guard:signret /l
 
 | Protection Mechanism | Uninstrumented Binary | Protected Binary (`/guard:cf /guard:signret`) | Effect on UAF / JOP Exploitation |
 |---|---|---|---|
-| **Control Flow Guard (CFG)** | `NO` | **`YES`** | Traps indirect call via corrupt ptr before execution (`FAST_FAIL_CONTROL_INVALID_USER_CALL` 0xC0000409) |
-| **Pointer Authentication (PAC)** | `Disabled` | `Hardware Supported` | Signs stack return addresses with `paciasp`/`autiasp` instructions |
-| **Branch Target ID (BTI)** | `Legacy Mode` | `Legacy Mode` | Restricts indirect branch targets to `BTI` instructions (System legacy fallback) |
-| **DEP / NX** | `YES` | `YES` | Blocks direct shellcode execution from heap (`PAGE_READWRITE` 0x04) |
+| **Control Flow Guard (CFG)** | `NO` | **`YES`** | Validates target via `ntdll!LdrpValidateUserCallTarget`; terminates invalid target via fast fail (`FAST_FAIL_CONTROL_INVALID_USER_CALL` 0xC0000409) |
+| **Pointer Authentication (PAC)** | `Disabled` | `Hardware Supported` | Signs/authenticates return addresses (`paciasp`/`autiasp`). Application binary checks report `/guard:signret` status; Windows kernel uses PAC internally regardless of user app flags |
+| **Branch Target ID (BTI)** | `Legacy Mode` | `Legacy Mode` | Requires ARMv8.5-A+ hardware support, OS policy, and `BTI` landing pads in target binary; falls back to legacy mode if uninstrumented |
+| **DEP / NX** | `YES` | `YES` | Blocks direct execution from heap pages (`PAGE_READWRITE` 0x04) |
 | **ASLR** | `YES` | `YES` | Randomizes base addresses of image and heap allocations |
 
 ---
