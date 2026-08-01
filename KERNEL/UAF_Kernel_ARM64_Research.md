@@ -667,3 +667,25 @@ nt!KeYieldExecution:
 **Key Security Takeaway:**  
 If a JOP/ROP payload attempts to tamper with the Link Register (`LR` / `X30`) or frame stack pointers, `autibsp` invalidates the upper address bits. The subsequent `ret` instruction triggers an immediate hardware trap before any code in the payload can execute.
 
+---
+
+## 14. Architectural Refinements & Windows 11 ARM64 Ecosystem Notes
+
+### 1. Modern Emulation Architecture: ARM64EC & XTA Translator
+
+While earlier Windows 10 ARM64 builds relied primarily on legacy CHPE (Compiled Hybrid Portable Executable) structures, Windows 11 introduces **ARM64EC (Emulation Compatible)** ABI alongside the **XTA (x64-to-ARM64 Execution Translation Architecture)** translator:
+
+* **ARM64EC ABI:** Allows seamless interoperability between native ARM64 code and x64 code within the same process. Functions compiled as ARM64EC use x64 register mappings mapped directly to ARM64 physical registers (`X0`–`X28`).
+* **Cross-ISA Impact:** When `uaf_poc_raw.exe` (x64) crashes on a native ARM64 kernel, the XTA binary translator traps the illegal memory access. WinDbg running in EL1 (Kernel Mode) intercepts the exception from the XTA context, presenting a synthetic WOW64 (AMD64) register frame with uninitialized register state.
+
+---
+
+### 2. Branch Target Identification (BTI) Hardware & OS Requirements
+
+The observation of BTI running in `Legacy Mode` on Windows 11 ARM64 target VMs stems from two prerequisite layers:
+
+1. **Hardware Prerequisite (ARMv8.5-A+):**  
+   BTI enforcement relies on hardware-level instruction decoding introduced in the ARMv8.5-A architecture specification. Virtualized CPUs or legacy ARM64 SoCs (e.g., earlier Snapdragon platforms) lack physical BTI instruction decoding traps.
+2. **Compiler & OS Prerequisite:**  
+   The binary image must be compiled with BTI landing pads (`BTI C`, `BTI J`) at all indirect branch target locations, and the Windows kernel PE loader must mark the executable memory pages with `IMAGE_SCN_MEM_SHARED` / BTI protection attributes. In uninstrumented binaries, the system gracefully falls back to `Legacy Mode` without enforcing branch landing checks.
+
