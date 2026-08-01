@@ -692,8 +692,8 @@ flowchart TD
         A["1. Allocation: malloc(KernelObject)"] --> B["Heap Address: 0x00000210f537c36c<br/>obj->action = legit_action"]
         B --> C["2. Deallocation: free(obj)"]
         C --> D["Dangling Pointer Retained<br/>Heap Manager writes metadata"]
-        D --> E["3. Re-Allocation: malloc(spray)"]
-        E --> F["Allocator reuses same chunk: 0x00000210f537c36c<br/>spray->action overwrites offset +0x28"]
+        D --> E["3. Re-Allocation: Heap Spray (100 objects)"]
+        E --> F["Segment Heap reuses exact chunk: 0x00000210f537c36c<br/>spray->action overwrites offset +0x28"]
         F --> G["4. Use-After-Free: obj->action() Called"]
     end
 
@@ -701,7 +701,7 @@ flowchart TD
         G --> H{"Target Memory Location?"}
         
         H -- "Direct Heap Code Execution" --> I["DEP / NX Violation<br/>PAGE_READWRITE (0x04)"]
-        I --> J["TRAP: Access Violation Exception"]
+        I --> J["TRAP: Access Violation Exception (0xC0000005)"]
         
         H -- "Indirect Branch / JOP Chain" --> K{"Is CFG Enabled? (/guard:cf)"}
         
@@ -723,8 +723,10 @@ flowchart TD
         T -- "No" --> U["TRAP: Branch Target Exception"]
         T -- "Yes" --> V["Execution Proceeds"]
 
-        S -- "Legacy Mode" --> W["Indirect Branch via BR Xn / BLR Xn"]
-        W --> X["Crash on Invalid Address / NULL Dereference<br/>STATUS_BREAKPOINT (0x80000003)"]
+        S -- "Legacy Mode / No Mitigations" --> W{"Target Address Status?"}
+        W -- "Controlled Valid Address (Heap Spray)" --> X["Clean Redirection: sprayed_action() Executed"]
+        W -- "Embedded __debugbreak()" --> Y["TRAP: Breakpoint Exception (brk #0xF000 / 0x80000003)"]
+        W -- "Invalid Address / Corrupted Metadata" --> Z["TRAP: Access Violation / NULL Dereference"]
     end
 
     classDef danger fill:#f9f,stroke:#333,stroke-width:2px;
@@ -732,8 +734,8 @@ flowchart TD
     classDef trap fill:#f88,stroke:#333,stroke-width:2px;
 
     class A,C,E,G danger;
-    class H,K,M,O,Q,S,T success;
-    class J,N,R,U,X trap;
+    class H,K,M,O,Q,S,T,W success;
+    class J,N,R,U,X,Y,Z trap;
 ```
 
 ---
