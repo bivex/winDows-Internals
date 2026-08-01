@@ -17,8 +17,11 @@ add_executable(uaf_poc_asan ${SOURCES})
 # ── Compiler flags ─────────────────────────────────────────────────────────────
 if(MSVC)
     # MSVC / clang-cl (Windows ARM64 or x64)
-    target_compile_options(uaf_poc_raw  PRIVATE /W4 /Zi /Od)
-    target_link_options   (uaf_poc_raw  PRIVATE /DEBUG)
+    # /Zi  = full debug info (PDB)
+    # /Od  = no optimization (keeps source lines 1:1 with asm for WinDbg)
+    # /DEBUG = emit .pdb linker output
+    target_compile_options(uaf_poc_raw  PRIVATE /W4 /Zi /Od /GS-)
+    target_link_options   (uaf_poc_raw  PRIVATE /DEBUG /INCREMENTAL:NO)
 
     target_compile_options(uaf_poc_asan PRIVATE /W4 /Zi /Od /fsanitize=address)
     target_link_options   (uaf_poc_asan PRIVATE /DEBUG /INCREMENTAL:NO)
