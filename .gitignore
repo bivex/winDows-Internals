@@ -1,0 +1,45 @@
+# Compiled binaries
+*.exe
+*.out
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.so
+*.dylib
+
+# UAF PoC compiled artifacts
+KERNEL/uaf_poc/uaf_poc_raw
+KERNEL/uaf_poc/uaf_poc_asan
+KERNEL/uaf_poc/*.dSYM/
+
+# Build directories
+build/
+out/
+Release/
+Debug/
+x64/
+ARM64/
+cmake-build-*/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# WinDbg / NTSD / CDB symbol cache
+*.ntkd
+*.kdmp
+*.cab
+
+# VS / VS Code
+.vs/
+.vscode/
+*.user
+*.suo
+*.vcxproj.user
+
+# Logs
+*.log
