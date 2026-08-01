@@ -682,3 +682,56 @@ The observation of BTI running in `Legacy Mode` on Windows 11 ARM64 target VMs s
 2. **Compiler & OS Prerequisite:**  
    The binary image must be compiled with BTI landing pads (`BTI C`, `BTI J`) at all indirect branch target locations, and the Windows kernel PE loader must mark the executable memory pages with `IMAGE_SCN_MEM_SHARED` / BTI protection attributes. In uninstrumented binaries, the system gracefully falls back to `Legacy Mode` without enforcing branch landing checks.
 
+---
+
+## 15. Complete Empirical & Mitigation Flow Diagram
+
+```mermaid
+flowchart TD
+    subgraph Lifecycle["1. UAF Lifecycle"]
+        A["1. Allocation: malloc(KernelObject)"] --> B["Heap Address: 0x00000210f537c36c<br/>obj->action = legit_action"]
+        B --> C["2. Deallocation: free(obj)"]
+        C --> D["Dangling Pointer Retained<br/>Heap Manager writes metadata"]
+        D --> E["3. Re-Allocation: malloc(spray)"]
+        E --> F["Allocator reuses same chunk: 0x00000210f537c36c<br/>spray->action overwrites offset +0x28"]
+        F --> G["4. Use-After-Free: obj->action() Called"]
+    </div>
+
+    subgraph Mitigations["2. Mitigation Inspection & Hardware Traps"]
+        G --> H{"Target Memory Location?"}
+        
+        H -- "Direct Heap Code Execution" --> I["DEP / NX Violation<br/>PAGE_READWRITE (0x04)"]
+        I --> J["TRAP: Access Violation Exception"]
+        
+        H -- "Indirect Branch / JOP Chain" --> K{"Is CFG Enabled? (/guard:cf)"}
+        
+        K -- "Yes" --> L["ntdll!LdrpValidateUserCallTarget"]
+        L --> M{"Target in CFG Bitmap?"}
+        M -- "No" --> N["TRAP: FAST_FAIL_CONTROL_INVALID_USER_CALL<br/>(0xC0000409)"]
+        M -- "Yes" --> O{"Is PAC Active? (/guard:signret)"}
+
+        K -- "No (Uninstrumented)" --> O
+        
+        O -- "Yes" --> P["autibsp Instruction Check"]
+        P --> Q{"LR Signature Valid?"}
+        Q -- "No" --> R["TRAP: Hardware PAC Failure<br/>Invalid Address Masked"]
+        Q -- "Yes" --> S{"Is BTI Active? (ARMv8.5+)"}
+
+        O -- "No" --> S
+
+        S -- "Yes" --> T{"Target Has BTI Landing Pad?"}
+        T -- "No" --> U["TRAP: Branch Target Exception"]
+        T -- "Yes" --> V["Execution Proceeds"]
+
+        S -- "Legacy Mode" --> W["Indirect Branch via BR Xn / BLR Xn"]
+        W --> X["Crash on Invalid Address / NULL Dereference<br/>STATUS_BREAKPOINT (0x80000003)"]
+    end
+
+    classDef danger fill:#f9f,stroke:#333,stroke-width:2px;
+    classDef success fill:#bbf,stroke:#333,stroke-width:2px;
+    classDef trap fill:#f88,stroke:#333,stroke-width:2px;
+
+    class A,C,E,G danger;
+    class H,K,M,O,Q,S,T success;
+    class J,N,R,U,X trap;
+```
