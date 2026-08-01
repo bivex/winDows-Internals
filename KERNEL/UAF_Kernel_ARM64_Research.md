@@ -453,3 +453,38 @@ Heap freelist forward-link (`flink`) содержит ARM64 инструкцию
 **4. Cross-ISA heap spray — уникальная особенность ARM64 Windows**
 
 На Windows 11 ARM64 с x64 процессами: heap metadata пишется ARM64 кодом (NT Heap Manager native ARM64), но читается x64 CHPE эмулятором. Это создаёт **cross-ISA семантическое несоответствие** — один и тот же байтовый паттерн имеет разное значение в зависимости от того, какой ISA его интерпретирует.
+
+---
+
+## 10. Advanced Kernel & VAD Memory Analysis
+
+### Process Kernel Object Structure (`nt!_EPROCESS`)
+
+Dumped directly from active kernel memory (`0xffffce0dfdec5100`):
+
+```text
+dt nt!_EPROCESS ffffce0dfdec5100
+   +0x1c0 UniqueProcessId    : 0x00000000`00002720 (PID 9984)
+   +0x1c8 ActiveProcessLinks : _LIST_ENTRY [ 0xffffce0d`fe82a2c8 - 0xffffce0e`0d2242c8 ]
+   +0x238 Token              : _EX_FAST_REF
+   +0x2f0 ObjectTable        : 0xffff9404`45b0ec80 _HANDLE_TABLE
+   +0x618 VadRoot            : _RTL_AVL_TREE
+```
+
+### VAD (Virtual Address Descriptor) Analysis for Dangling Pointer
+
+Inspecting the AVL tree root node (`0xffffce0d`ff0e2e90`) for the dangling pointer address `0x00000210f537c36c`:
+
+```text
+dt nt!_MMVAD 0xffffce0d`ff0e2e90 Core.
+   StartingVpn        : 0x210f4f80  -> Base VA : 0x00000210`f4f80000
+   EndingVpn          : 0x210f4f8f  -> End VA  : 0x00000210`f4f8ffff
+
+dt nt!_MMVAD 0xffffce0d`ff0e2e90 Core.u.VadFlags
+   PrivateMemory      : 1           -> MEM_PRIVATE (Dynamic User Heap Region)
+   Protection         : 4 (0x04)    -> PAGE_READWRITE
+```
+
+**Key Takeaways:**
+1. **DEP/NX Enforcement:** The heap region has protection flags `PAGE_READWRITE` (0x4). Execution from the heap directly triggers a Data Execution Prevention violation.
+2. **JOP/ROP Mandate:** Because `PAGE_EXECUTE` is absent on `MEM_PRIVATE` heap allocations, memory safety exploitation requires redirecting control flow to existing executable memory (`PAGE_EXECUTE_READ`), cementing the necessity of JOP/ROP gadgets.
