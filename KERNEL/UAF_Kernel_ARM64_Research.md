@@ -765,3 +765,28 @@ Executed directly on Target VM (Windows 11 ARM64 Build 26100.1):
 3. **Debugbreak vs. Real Execution Impact:**  
    Prior `STATUS_BREAKPOINT` observations resulted from embedded `__debugbreak()` statements inserted for kernel attach. Without manual debugger breaks, controlled heap reuse allows clean, non-crashing execution redirection in uninstrumented binaries.
 
+---
+
+### Live WinDbg Trapping Log (`brk #0xF000` inside `sprayed_action`)
+
+```text
+1: kd> r
+ x0=0000000000000049   x1=0000000000000280   x2=0000000000000000   x3=0000000000000000
+ x4=0000000000000000   x5=0000000000000000   x6=0000000000000000   x7=0000000000000000
+ x8=00007ff7a094a8a0   x9=000002a00dda0000  x10=00007ff7a0a0b288  x11=00007ff7a0a0b288
+x16=0000c3b911890469  x17=0000c3b911890469  x18=0000000000000000  x19=000002a00e1061d0
+x20=000002a00e109f20  x21=0000000000000000  x22=0000000000000000  x23=0000000000000000
+ fp=000000aa8e70f4e0   lr=00007ff7a094aaa0   sp=000000aa8e70f4e0
+ pc=00007ff7a094a8a8  psr=80000040 N--- EL0
+00007ff7`a094a8a8 d43e0000 brk         #0xF000
+
+1: kd> k
+ # Child-SP          RetAddr               Call Site
+00 000000aa`8e70f4e0 00007ff7`a094aaa0     uaf_spray_test_arm64!sprayed_action
+01 000000aa`8e70f4e0 00000000`00000000     uaf_spray_test_arm64!main+0x140
+```
+
+**Register State Verification:**
+* **`pc = 0x00007ff7a094a8a8`**: Execution trapped precisely at entry of `sprayed_action`.
+* **`lr = 0x00007ff7a094aaa0`**: Link Register confirms clean caller return site (`main+0x140`).
+* **`x19 = 0x000002a00e1061d0`**: Dangling pointer holding the reused heap chunk address.
