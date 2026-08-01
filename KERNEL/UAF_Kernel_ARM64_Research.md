@@ -606,3 +606,64 @@ Run directly on Target VM after compiling with MSVC `/guard:cf /guard:signret /l
 | **DEP / NX** | `YES` | `YES` | Blocks direct shellcode execution from heap (`PAGE_READWRITE` 0x04) |
 | **ASLR** | `YES` | `YES` | Randomizes base addresses of image and heap allocations |
 
+---
+
+## 13. Advanced JOP Execution Mechanics & Kernel Disassembly Analysis
+
+### Detailed JOP Chain Execution Flow Post-UAF
+
+When a Use-After-Free condition corrupts a function pointer, control flow is redirected away from the intended function onto a **Dispatcher Gadget**:
+
+```text
+[ UAF Heap Object ] ──(dangling ptr)──► [ Dispatcher Gadget ]
+                                              │
+                                              ▼ (BR X16 / BR X8)
+                                        [ Functional Gadget 1 ]
+                                              │
+                                              ▼ (BR Xn / RET)
+                                        [ Functional Gadget 2 ]
+```
+
+---
+
+### Step-by-Step Mechanics of JOP Execution
+
+1. **Initial Hijack (Indirect Branch):**  
+   The program attempts to execute `obj->action()`. The compiler generates an indirect call through a register containing the dangling pointer value:
+   ```assembly
+   ldr  x8, [x0, #0x28]    ; Read corrupted function pointer (+0x28 offset)
+   blr  x8                 ; Indirect call to attacker-influenced address
+   ```
+
+2. **Dispatcher Loop Execution:**  
+   The dispatcher gadget advances a pointer through a controlled memory buffer (Dispatcher Table) and jumps to functional gadgets without modifying the call stack (`SP`):
+   ```assembly
+   ldr  x16, [x19], #8     ; Load next gadget address into X16, advance X19 by 8
+   br   x16                ; Branch to functional gadget
+   ```
+
+3. **Functional Gadget Execution:**  
+   The functional gadget performs a single operation (e.g., register manipulation or memory write) and returns control to the dispatcher:
+   ```assembly
+   str  x0, [x1]           ; Memory write primitive
+   br   x8                 ; Branch back to Dispatcher Gadget
+   ```
+
+---
+
+### Disassembled Kernel Epilogue with PAC Safeguards (`nt!KeYieldExecution`)
+
+From live ARM64 kernel disassembly (`fffff800`1127aa20` – `fffff800`1127b1c4`):
+
+```assembly
+nt!KeYieldExecution:
+  pacibsp                                  ; 1. Entry: Sign LR (X30) with SP and B-Key
+  ...
+  ldp   fp, lr, [sp], #0x40                 ; 2. Restore Frame Pointer & Link Register
+  autibsp                                  ; 3. Exit: Authenticate LR signature against SP
+  ret                                      ; 4. Branch to LR (Traps if LR signature invalid)
+```
+
+**Key Security Takeaway:**  
+If a JOP/ROP payload attempts to tamper with the Link Register (`LR` / `X30`) or frame stack pointers, `autibsp` invalidates the upper address bits. The subsequent `ret` instruction triggers an immediate hardware trap before any code in the payload can execute.
+
