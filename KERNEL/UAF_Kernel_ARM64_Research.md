@@ -735,3 +735,33 @@ flowchart TD
     class H,K,M,O,Q,S,T success;
     class J,N,R,U,X trap;
 ```
+
+---
+
+## 16. Empirical Native ARM64 Heap Spray & Execution Hijack Verification
+
+### Live Segment Heap Spray Test (`uaf_spray_test_arm64.exe`)
+
+Executed directly on Target VM (Windows 11 ARM64 Build 26100.1):
+
+```text
+[1] Initial call: [LEGIT] Legitimate function called!
+[+] Allocated obj at: 0000022C20113600
+[+] Freed obj at: 0000022C20113600
+[+] Heap Spray Success! Chunk reused at index 70 (0000022C20113600)
+[2] Call via dangling pointer (obj->action): [EXPLOIT] SPRAYED FUNCTION EXECUTED VIA UAF!
+```
+
+---
+
+### Key Empirical Findings
+
+1. **Exact Segment Heap Chunk Reuse:**  
+   The Windows 11 ARM64 Segment Heap allocator placed the 70th allocation in the spray array at the exact memory address (`0x0000022C20113600`) previously occupied by the freed object.
+
+2. **Clean Control Flow Redirection (No Crash):**  
+   Calling `obj->action()` through the dangling pointer invoked `sprayed_action` without triggering an Access Violation (`0xC0000005`) or Breakpoint Exception (`0x80000003`).
+
+3. **Debugbreak vs. Real Execution Impact:**  
+   Prior `STATUS_BREAKPOINT` observations resulted from embedded `__debugbreak()` statements inserted for kernel attach. Without manual debugger breaks, controlled heap reuse allows clean, non-crashing execution redirection in uninstrumented binaries.
+
