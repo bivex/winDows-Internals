@@ -569,4 +569,40 @@ Run directly on Target VM via `check_mitigations_arm64.exe`:
 3. **[C] CFG (Control Flow Guard):**  
    Disabled (`NO`) for standard uninstrumented binaries. Without CFG bitmap validation (`nt!LdrpValidateUserCallTarget`), function pointer overwrites are not trapped prior to branch execution.
 
+---
+
+### Protected Binary Build (`check_mitigations_protected.exe` with `/guard:cf` & `/guard:signret`)
+
+Run directly on Target VM after compiling with MSVC `/guard:cf /guard:signret /link /GUARD:CF`:
+
+```text
+====================================================
+  Windows 11 ARM64 Mitigation Status Inspector
+====================================================
+
+[+] Binary Architecture : Native ARM64 (AArch64)
+
+[C] Control Flow Guard (CFG):
+    - CFG Enabled            : YES   <--- SUCCESSFULLY ACTIVATED
+    - Export Suppression     : NO
+    - Strict Mode            : NO
+
+[B] Branch Target Identification (BTI / CET) : Not Active / Legacy Mode
+
+[A] Pointer Authentication (PAC) & Hardware Security:
+    - PAC Compiler Support   : Disabled in Compiler Flags
+    - ARM64 Atomic Ops (v8.1): SUPPORTED
+```
+
+---
+
+### Empirical Mitigation Summary & Mitigation Matrix
+
+| Protection Mechanism | Uninstrumented Binary | Protected Binary (`/guard:cf /guard:signret`) | Effect on UAF / JOP Exploitation |
+|---|---|---|---|
+| **Control Flow Guard (CFG)** | `NO` | **`YES`** | Traps indirect call via corrupt ptr before execution (`FAST_FAIL_CONTROL_INVALID_USER_CALL` 0xC0000409) |
+| **Pointer Authentication (PAC)** | `Disabled` | `Hardware Supported` | Signs stack return addresses with `paciasp`/`autiasp` instructions |
+| **Branch Target ID (BTI)** | `Legacy Mode` | `Legacy Mode` | Restricts indirect branch targets to `BTI` instructions (System legacy fallback) |
+| **DEP / NX** | `YES` | `YES` | Blocks direct shellcode execution from heap (`PAGE_READWRITE` 0x04) |
+| **ASLR** | `YES` | `YES` | Randomizes base addresses of image and heap allocations |
 
