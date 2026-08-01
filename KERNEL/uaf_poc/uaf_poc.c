@@ -2,7 +2,19 @@
  * UAF Proof-of-Concept — Research & Educational Purposes
  *
  * Demonstrates a classic Use-After-Free in user-space C.
- * Run with AddressSanitizer to observe the detection:
+ *
+ * Build (Windows ARM64, no ASan, full debug symbols):
+ *   cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug && cmake --build build --target uaf_poc_raw
+ *
+ * Debug with WinDbg (kernel debugger on Debugger VM):
+ *   1. Run uaf_poc_raw.exe on Target VM
+ *   2. !process 0 0 uaf_poc_raw.exe          -- find EPROCESS
+ *   3. .process /i <EPROCESS addr>            -- switch context
+ *   4. g                                      -- run to __debugbreak()
+ *   5. bp uaf_poc_raw!main                    -- optional user-mode bp
+ *
+ * Debug with WinDbg (user-mode, directly on Target VM):
+ *   windbg -g uaf_poc_raw.exe
  *
  *   macOS/Linux:
  *     clang -fsanitize=address -g -o uaf_poc uaf_poc.c && ./uaf_poc
@@ -56,9 +68,22 @@ int main(void)
     printf("[+] Spray allocation at %p\n", (void*)spray);
 
     /* 4. USE-AFTER-FREE: call via stale dangling pointer */
+    printf("[!] About to trigger UAF. Attach WinDbg now if not already attached.\n");
+    printf("[!] Press Enter to trigger UAF...\n");
+    getchar();  /* pause — lets kernel debugger do: !process + .process /i + g */
+
+#ifdef _MSC_VER
+    __debugbreak();  /* software breakpoint — WinDbg catches this before UAF */
+#endif
+
     printf("[!] Calling obj->action() via dangling pointer...\n");
     obj->action();  /* <-- UAF: obj was freed, spray now occupies same address */
 
     free(spray);
+
+    printf("[+] Done. Process still alive — inspect with WinDbg before exiting.\n");
+    printf("[+] Press Enter to exit...\n");
+    getchar();
+
     return 0;
 }
