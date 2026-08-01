@@ -373,3 +373,83 @@ obj->action()  [UAF!]          →  читает +0x28 по старому ад�
 | `rip = 0x0` | Function pointer из heap metadata резолвится в NULL после ASLR/CHPE трансляции |
 | Все регистры `= 0` | Kernel debugger видит частичный WOW64 контекст — артефакт ARM64 cross-ISA эмуляции |
 | Без защит (`/GS-`, нет ASan) | UAF произошёл молча, без предупреждений, вплоть до финального краша |
+
+---
+
+## 9. Heap Memory Forensics — Raw Bytes & Cross-ISA Disassembly
+
+### Raw Byte Dump (`db 00000210f537c36c L60`)
+
+```
+00000210`f537c36c  f8 03 1a 2a 29 75 03 d1-e7 0b 41 b9 27 8b f3 35  ...*)u....A.'..5
+00000210`f537c37c  2e 9b ff 97 00 02 1f d6-30 76 2e f5 10 02 00 00  ........0v......
+00000210`f537c38c  a0 79 35 d4 f4 08 ae c4-f6 7f 00 00 87 00 c0 80  .y5.............
+00000210`f537c39c  9b 2b 40 f9 0c 56 1e 91-2c 76 2e f5 10 02 00 00  .+@..V..,v......
+00000210`f537c3ac  04 00 00 14 00 00 00 00-00 04 00 01 ff ff ff ff  ................
+00000210`f537c3bc  9b 2b 40 f9 9c c3 00 b1-1f 40 00 d5 ed 03 1c aa  .+@......@......
+```
+
+### x64 Disassembly of Freed Heap Block (`u 00000210f537c36c L10`)
+
+```asm
+; WinDbg context: AMD64 (CHPE x64 emulation on ARM64 host)
+; These are ARM64 heap metadata bytes being decoded as x64 instructions
+
+00000210`f537c36c  f8              clc
+00000210`f537c36d  03 1a           add     ebx,dword ptr [rdx]     ; ARM64: 2a1a03f8 = ldp w24,w0,[x29]
+00000210`f537c36f  2a 29           sub     ch,byte ptr [rcx]
+00000210`f537c371  75 03           jne     00000210`f537c376       ; ARM64: d1037529 = sub x9,x9,#0xD
+00000210`f537c373  d1 e7           shl     edi,1
+00000210`f537c375  0b 41 b9        or      eax,dword ptr [rcx-47h]
+00000210`f537c378  27              ???                              ; ARM64: b9410be7 = ldr w7,[sp,#0x108]
+00000210`f537c379  8b f3           mov     esi,ebx
+00000210`f537c37b  35 2e 9b ff 97  xor     eax,97FF9B2Eh           ; ARM64: 97ff9b2e = bl <-0x1a6d4*4>
+00000210`f537c380  00 02 1f d6     add     byte ptr [rdx],al       ; ARM64: d61f0200 = BR X8  ← JOP GADGET!
+00000210`f537c384  30 76 2e f5     xor     byte ptr [rsi+2Eh],dh
+00000210`f537c387  10 02 00 00     ???
+00000210`f537c38b  a0 79 35 d4     ???                             ; ARM64: d43579a0 = hlt #0xABCD
+00000210`f537c38f  f4 08 ae c4     ???
+00000210`f537c393  f6 7f 00 00     ???
+00000210`f537c397  87 00 c0 80     ???                             ; ARM64: 80c00087 = corrupt fn ptr
+```
+
+---
+
+### Побайтовый анализ: ARM64 vs x64 интерпретация
+
+| Offset | Raw bytes (LE) | ARM64 (native) | x64 (CHPE эмуляция) | Значение |
+|---|---|---|---|---|
+| `+0x00` | `f8 03 1a 2a` | `ldp w24,w0,[x29]` | `clc / add ebx,[rdx]` | NT Heap chunk header |
+| `+0x04` | `29 75 03 d1` | `sub x9,x9,#0xD` | `sub ch,[rcx] / jne` | Heap freelist pointer |
+| `+0x08` | `e7 0b 41 b9` | `ldr w7,[sp,#0x108]` | `or eax,[rcx-47h]` | Heap metadata |
+| `+0x0c` | `27 8b f3 35` | `(part of prev instr)` | `??? / mov esi,ebx` | |
+| `+0x10` | `2e 9b ff 97` | `bl <backward branch>` | `xor eax,97FF9B2Eh` | Heap freelist flink |
+| **`+0x14`** | **`00 02 1f d6`** | **`BR X8`** ← JOP | **`add [rdx],al`** | **ARM64 JOP гаджет в heap!** |
+| `+0x18` | `30 76 2e f5` | `str d16,[x17,#0x5c0]` | `xor [rsi+2eh],dh` | Heap blink pointer |
+| `+0x28` | `87 00 c0 80` | `(invalid ARM64)` | `???` | Перезаписанный `action` ptr |
+
+---
+
+### Ключевые выводы из heap forensics
+
+**1. ARM64 heap metadata ≠ x64 инструкции**
+
+Windows NT Heap Manager записывает в освобождённый блок **ARM64 machine code** (freelist pointers, chunk headers). WinDbg декодирует их в x64 контексте CHPE — получается бессмысленный x64 код с множеством `???` (невалидные опкоды).
+
+**2. `d6` = невалидный x64 опкод, но `BR Xn` в ARM64**
+
+Байт `0xd6` в x64 — зарезервированный/невалидный опкод (показан как `???`).  
+В ARM64: `0xd61f0200` = `BR X8` — безусловный прыжок по регистру X8.  
+Это **нативный JOP (Jump-Oriented Programming) гаджет**, случайно оказавшийся в heap metadata freed блока — именно то, что ищут при heap spray атаках на ARM64.
+
+**3. Адрес `+0x14`: heap flink содержит `BR X8`**
+
+```
++0x14: 00 02 1f d6  →  ARM64: BR X8
+```
+
+Heap freelist forward-link (`flink`) содержит ARM64 инструкцию `BR X8`. Если атакующий может контролировать значение X8 в момент когда управление передаётся на этот адрес — возможен JOP chain.
+
+**4. Cross-ISA heap spray — уникальная особенность ARM64 Windows**
+
+На Windows 11 ARM64 с x64 процессами: heap metadata пишется ARM64 кодом (NT Heap Manager native ARM64), но читается x64 CHPE эмулятором. Это создаёт **cross-ISA семантическое несоответствие** — один и тот же байтовый паттерн имеет разное значение в зависимости от того, какой ISA его интерпретирует.
