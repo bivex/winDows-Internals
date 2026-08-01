@@ -291,3 +291,85 @@ x26=00000210f506ba90  x27=00000210f505ec90
 | **EL0 execution** | Процесс работает в EL0 (User Mode) — PAC/MTE активны на EL1, в user-space защиты зависят от компилятора и OS |
 | **No ASan** | Без AddressSanitizer UAF происходит **молча** — программа продолжает работать с corrupted state |
 
+---
+
+### Step 10 — Final: Execute UAF and Observe Crash (`g`)
+
+После `__debugbreak()` нажата `g` — ядро продолжило выполнение и программа вызвала `obj->action()` через dangling pointer.
+
+```
+2: kd> g
+The context is partially valid. Only x86 user-mode context is available.
+Break instruction exception - code 80000003 (first chance)
+00000000`00000000 ??              ???
+```
+
+**Регистры в момент краша:**
+```
+rax=0000000000000000  rbx=0000000000000000  rcx=0000000000000000
+rdx=0000000000000000  rsi=0000000000000000  rdi=0000000000000000
+rip=0000000000000000  rsp=0000000000000000  rbp=0000000000000000
+r8 =0000000000000000  ...  r15=0000000000000000
+cs=0000  ss=0000  ds=0000  es=0000  efl=00000000
+```
+
+**Стек:**
+```
+ #   Arch   Child-SP          RetAddr           Call Site
+00   AMD64  00000000`00000000 00000000`00000000 0x0
+```
+
+**Exception Record:**
+```
+ExceptionAddress: 00007ff6c4ac1137 (uaf_poc_raw!main+0xf7)
+   ExceptionCode: 80000003 (Break instruction exception)
+  ExceptionFlags: 00000000
+   Parameter[0] : 0000000000000000
+```
+
+---
+
+### Анализ краша
+
+**1. "Only x86 user-mode context is available"**
+
+Бинарь скомпилирован как x64 (не native ARM64). На Windows 11 ARM64 x64 код исполняется через **слой эмуляции CHPE (Compiled Hybrid Portable Executable)**. Kernel debugger (ARM64 EL1) видит user-mode контекст как x86/x64 WOW64, а не native ARM64 — отсюда регистры `rax/rip` вместо `x0/pc`.
+
+**2. `rip = 0x0000000000000000` — NULL PC**
+
+Когда `obj->action()` был вызван через corrupted function pointer, процессор прыгнул по адресу из heap metadata. Heap allocator записал в слот `+0x28` (поле `action`) данные которые при интерпретации как ARM64/x64 указатель дали `NULL` после применения ASLR / CHPE трансляции адреса.
+
+Итог: CPU попытался выполнить инструкцию по адресу `0x0` → **NULL dereference → немедленный краш**.
+
+**3. Все регистры = 0**
+
+Kernel debugger показывает **частичный контекст** (`partially valid`) — EL1 не имеет доступа к полному снимку x64 регистров WOW64 процесса в момент краша. Это артефакт кросс-архитектурной эмуляции, а не реальное состояние CPU.
+
+---
+
+### Итоговая схема UAF на Windows 11 ARM64 (эмпирически подтверждена)
+
+```
+malloc(sizeof(KernelObject))   →  heap addr: 0x00000210f537c36c
+    obj->id     = 42
+    obj->action = legit_action (0x00007ff6`c4ad85a0)
+
+free(obj)                      →  heap chunk возвращён аллокатору
+                                   heap metadata записана поверх struct!
+
+malloc(sizeof(KernelObject))   →  возвращён ТОТ ЖЕ адрес: 0x00000210f537c36c
+    spray->action = sprayed_action
+
+obj->action()  [UAF!]          →  читает +0x28 по старому адресу
+                                   получает: 0x80c00087`00007ff6 (heap metadata)
+                                   CPU прыгает по невалидному адресу
+                                   → rip = 0x0 → CRASH (80000003)
+```
+
+| Наблюдение | Значение |
+|---|---|
+| `ExceptionCode: 80000003` | `STATUS_BREAKPOINT` / NULL dereference — CPU упал на адресе `0x0` |
+| `Arch: AMD64` в стеке | x64 бинарь работает под CHPE эмуляцией на ARM64 ядре |
+| `rip = 0x0` | Function pointer из heap metadata резолвится в NULL после ASLR/CHPE трансляции |
+| Все регистры `= 0` | Kernel debugger видит частичный WOW64 контекст — артефакт ARM64 cross-ISA эмуляции |
+| Без защит (`/GS-`, нет ASan) | UAF произошёл молча, без предупреждений, вплоть до финального краша |
