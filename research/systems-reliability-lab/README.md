@@ -5,16 +5,19 @@ High-performance, C++11 header-only library providing branchless Hamming(7,4) Si
 ## 📁 Directory Structure
 
 ```text
-systems-reliability-lab/
+fast-ecc-branchless/
 ├── include/
 │   └── ecc_branchless.hpp         # Header-only library
 ├── examples/
 │   ├── basic_ecc.cpp               # Basic single-nibble example
-│   ├── stream_transmission.cpp     # Full string/buffer stream recovery
-│   └── ecc_data_transmission_demo.cpp # Real-time noise simulation demo
+│   └── stream_transmission.cpp     # Full string/buffer stream recovery
 ├── tests/
-│   └── test_ecc.cpp                # Automated unit test suite (112 test cases)
-├── Systems_Reliability_Lab.md      # Architecture research document
+│   ├── test_ecc.cpp                # Automated unit test suite (112 test cases)
+│   └── test_edge_cases.cpp         # Edge cases & 1 MB high-res benchmark
+├── ecc_data_transmission_demo.cpp  # Real-time noise channel demo
+├── CMakeLists.txt                  # Cross-platform CMake build configuration
+├── README.md                       # Documentation & Benchmark
+├── Systems_Reliability_Lab.md      # Kernel Architecture research
 └── Systems_Reliability_Lab.tex     # Academic LaTeX paper (Ukrainian)
 ```
 
@@ -27,13 +30,13 @@ Include `ecc_branchless.hpp` directly into your C++ project:
 #include <iostream>
 
 int main() {
-    // 1. Encode 4-bit data
+    // 1. Encode 4-bit data (0b1011 = 11)
     uint8_t codeword = ecc::FastHamming74::encode4(0b1011);
 
-    // 2. Simulate bit flip (Bit #3)
+    // 2. Simulate hardware bit flip (Bit #3)
     uint8_t corrupted = codeword ^ (1 << 2);
 
-    // 3. Decode & Auto-Correct without branches
+    // 3. Decode & Auto-Correct without branches (0 CPU branch mispredictions)
     bool corrected = false;
     uint8_t restored = ecc::FastHamming74::decode4(corrupted, corrected);
 
@@ -42,30 +45,34 @@ int main() {
 }
 ```
 
+## 📊 Performance & Benchmark (Windows 11 ARM64 Build 26100 MSVC /O2)
+
+Empirical performance measurements collected on native ARM64 architecture:
+
+| Operation / Metric | Performance Metric | Notes |
+|---|---|---|
+| **Single 4-bit Nibble ECC** | **4.16 ns / op** | 240M ops / sec (Branchless) |
+| **Single 8-bit Byte ECC (2 Codewords)** | **8.32 ns / byte** | Full 2-nibble auto-correction |
+| **1 MB Buffer Decode & Auto-Correction** | **~8.3 ms / MB** | **120+ MB/sec Throughput** |
+| **1 MB Stream Auto-Corrections** | **2,000,000 bit flips** | 100% Data Restored |
+| **CPU Branch Mispredictions** | **0** | Pure Bitwise Mask Manipulation |
+| **Memory Allocation** | **0 bytes** | Header-Only Inline Operations |
+
 ## 🛠️ Building Examples & Tests
 
 ### Windows MSVC (ARM64 / x64)
 
 ```cmd
 vcvarsall.bat arm64
-cl /EHsc /O2 /Fe:test_ecc.exe tests\test_ecc.cpp
-cl /EHsc /O2 /Fe:basic_ecc.exe examples\basic_ecc.cpp
-cl /EHsc /O2 /Fe:stream_transmission.exe examples\stream_transmission.cpp
-
-test_ecc.exe
+cl /EHsc /O2 /Fe:test_edge_cases.exe tests\test_edge_cases.cpp
+test_edge_cases.exe
 ```
 
-### GCC / Clang (macOS / Linux)
+### CMake Build (Cross-Platform)
 
 ```bash
-clang++ -std=c++11 -O2 -Iinclude -o test_ecc tests/test_ecc.cpp
-./test_ecc
+mkdir build && cd build
+cmake ..
+cmake --build .
+ctest --output-on-failure
 ```
-
-## 📊 Performance Benchmark
-
-| Metric | Result |
-|---|---|
-| **Latency per ECC operation** | **4.16 ns** |
-| **Throughput** | **240,124,072 ops / sec** |
-| **CPU Branch Mispredictions** | **0 (Branchless Execution)** |

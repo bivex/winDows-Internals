@@ -5,6 +5,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
+#include <chrono>
+#include <iomanip>
 #include "../include/ecc_branchless.hpp"
 
 // 1. Test All-Zeros and All-Ones Boundary Nibbles and Bytes
@@ -44,8 +46,7 @@ void testExtremeBoundaries() {
 void testBinaryPayloads() {
     std::cout << "[TEST] 2. Binary Data Stream with Embedded Null Bytes...\n";
 
-    // Binary payload with null bytes, executable headers (MZ, ELF), and random binary
-    uint8_t binaryData[] = { 0x7F, 'E', 'L', 'F', 0x00, 0x00, 0x01, 0x02, 0xFF, 0xFE, 0x00, 0xDEAD, 0xBEEF };
+    uint8_t binaryData[] = { 0x7F, 'E', 'L', 'F', 0x00, 0x00, 0x01, 0x02, 0xFF, 0xFE, 0x00, 0xDE, 0xAD, 0xBE, 0xEF };
     size_t dataLen = sizeof(binaryData);
 
     auto encoded = ecc::FastHamming74::encodeBuffer(binaryData, dataLen);
@@ -88,18 +89,21 @@ void testEmptyBuffers() {
     std::cout << " -> PASSED: Empty buffer edge cases handled safely!\n\n";
 }
 
-// 4. Test Large Stress Buffer (100,000 Bytes = 200,000 Codewords)
-void testLargeStressBuffer() {
-    std::cout << "[TEST] 4. Large Stress Buffer (100,000 bytes / 200,000 codewords)...\n";
+// 4. Test Large Stress Buffer with Microsecond Latency Benchmark
+void testLargeStressBufferWithBenchmark() {
+    std::cout << "[TEST] 4. Stress Buffer Benchmark (1,000,000 bytes / 2,000,000 codewords)...\n";
 
-    const size_t STRESS_SIZE = 100000;
+    const size_t STRESS_SIZE = 1000000; // 1 MB
     std::vector<uint8_t> stressBuffer(STRESS_SIZE);
 
     for (size_t i = 0; i < STRESS_SIZE; ++i) {
         stressBuffer[i] = static_cast<uint8_t>(i & 0xFF);
     }
 
+    // Measure Encoding Speed
+    auto t1 = std::chrono::high_resolution_clock::now();
     auto encodedStream = ecc::FastHamming74::encodeBuffer(stressBuffer.data(), STRESS_SIZE);
+    auto t2 = std::chrono::high_resolution_clock::now();
     assert(encodedStream.size() == STRESS_SIZE * 2);
 
     // Corrupt 1 random bit in every single codeword
@@ -108,28 +112,40 @@ void testLargeStressBuffer() {
         encodedStream[i] ^= (1 << bitPos);
     }
 
+    // Measure Decoding & Auto-Correction Speed
+    auto t3 = std::chrono::high_resolution_clock::now();
     int totalCorrections = 0;
     auto restoredStream = ecc::FastHamming74::decodeBuffer(encodedStream, totalCorrections);
+    auto t4 = std::chrono::high_resolution_clock::now();
 
     assert(restoredStream.size() == STRESS_SIZE);
     assert(restoredStream == stressBuffer);
     assert(totalCorrections == (int)(STRESS_SIZE * 2));
 
-    std::cout << " -> PASSED: 100,000 bytes (200,000 errors corrected) 100% verified!\n\n";
+    std::chrono::duration<double, std::milli> encodeTime = t2 - t1;
+    std::chrono::duration<double, std::milli> decodeTime = t4 - t3;
+    double nsPerByte = (decodeTime.count() * 1000000.0) / STRESS_SIZE;
+    double mbPerSec = (STRESS_SIZE / (1024.0 * 1024.0)) / (decodeTime.count() / 1000.0);
+
+    std::cout << " -> PASSED: 1,000,000 bytes (2,000,000 bit flips corrected) 100% verified!\n";
+    std::cout << "    [BENCHMARK] Encode Time    : " << std::fixed << std::setprecision(2) << encodeTime.count() << " ms\n";
+    std::cout << "    [BENCHMARK] Decode Time    : " << std::fixed << std::setprecision(2) << decodeTime.count() << " ms\n";
+    std::cout << "    [BENCHMARK] Latency        : " << std::fixed << std::setprecision(2) << nsPerByte << " ns / byte\n";
+    std::cout << "    [BENCHMARK] Throughput     : " << std::fixed << std::setprecision(2) << mbPerSec << " MB / sec\n\n";
 }
 
 int main() {
     std::srand(42); // Deterministic seed
 
     std::cout << "========================================================\n";
-    std::cout << "     ECC Branchless Library Edge Cases Test Suite       \n";
+    std::cout << "     ECC Branchless Library Edge Cases & Benchmark     \n";
     std::cout << "========================================================\n\n";
 
     testExtremeBoundaries();
     testBinaryPayloads();
     testEmptyBuffers();
-    testLargeStressBuffer();
+    testLargeStressBufferWithBenchmark();
 
-    std::cout << ">>> ALL EDGE CASE TESTS PASSED SUCCESSFULLY! <<<\n";
+    std::cout << ">>> ALL EDGE CASE TESTS & BENCHMARKS PASSED! <<<\n";
     return 0;
 }
