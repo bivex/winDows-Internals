@@ -15,6 +15,8 @@ add_executable(ecc_data_transmission_demo ecc_data_transmission_demo.cpp)
 enable_testing()
 add_executable(test_ecc tests/test_ecc.cpp)
 add_executable(test_edge_cases tests/test_edge_cases.cpp)
+add_executable(test_memleak tests/test_memleak.cpp)
 
 add_test(NAME test_ecc COMMAND test_ecc)
 add_test(NAME test_edge_cases COMMAND test_edge_cases)
+add_test(NAME test_memleak COMMAND test_memleak)
