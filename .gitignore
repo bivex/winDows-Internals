@@ -45,3 +45,5 @@ cmake-build-*/
 *.log
 /KERNEL/uaf_poc/build_macos
 /KERNEL/uaf_poc/deploy
+/KERNEL/uaf_poc
+KERNEL/uaf_poc/CMakeLists.txt
