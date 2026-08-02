@@ -1,6 +1,6 @@
 # Fast Branchless ECC Library (`ecc_branchless.hpp`)
 
-High-performance, C++11 header-only library providing branchless Hamming(7,4) Single Error Correction (SEC) with architecture-aware ARM NEON acceleration and software pipelining.
+High-performance, C++11 header-only library providing branchless Hamming(7,4) Single Error Correction (SEC) with software-pipelined ARM NEON acceleration.
 
 ## ✨ Features
 
@@ -8,7 +8,7 @@ High-performance, C++11 header-only library providing branchless Hamming(7,4) Si
 - **Multi-Architecture Dispatch**: ARM64 NEON (128-bit SIMD), x86 AVX2 (256-bit SIMD), x86 SSE4.1, and Portable Scalar.
 - **Software Pipelining & x8 Register Unrolling**: Process 128 codewords per loop iteration with interleaved instruction scheduling.
 - **Branchless Decoding Implementation**: Data-dependent branches eliminated from core error correction paths.
-- **Register-Loaded VTBL Acceleration**: 1-cycle table lookups loaded into registers outside the loop.
+- **Register-Loaded VTBL Acceleration**: 1-cycle table lookups loaded into registers outside the loop (**463.79 MB/sec encoding**).
 - **Hardware Cache Prefetching**: Inline `PRFM PLDL1KEEP` cache line prefetching.
 - **Zero Dynamic Allocations**: Stack-allocated scalar primitives (`encode4`, `decode4`, `encodeByte`, `decodeByte`).
 - **Comprehensive Test Suite**: Automated unit tests, edge-case checks, 0-leak MSVC CRT / ASan checks, and assembly dump inspection.
@@ -18,7 +18,7 @@ High-performance, C++11 header-only library providing branchless Hamming(7,4) Si
 ```text
 fast-ecc-branchless/
 ├── include/
-│   └── ecc_branchless.hpp         # Header-only library v2.0.0 (SIMD Dispatch + Unroll x8)
+│   └── ecc_branchless.hpp         # Header-only library v2.2.0 (Software Pipelining + Unroll x8)
 ├── examples/
 │   ├── basic_ecc.cpp               # Basic single-nibble example
 │   └── stream_transmission.cpp     # Full string/buffer stream recovery
@@ -67,12 +67,12 @@ int main() {
 > **Benchmarking Environment Disclaimer:**  
 > Measured on **Windows 11 ARM64 (Build 26100, MSVC /O2)** running on Apple Silicon hypervisor. Benchmark timing results will vary depending on hardware architecture, compiler version, optimization flags, cache hierarchy, memory subsystem, and workload thermal throttling.
 
-| Execution Mode / Scope | Throughput (MB/sec) | Network Bitrate | Latency | Classification |
+| Execution Mode / Scope | Throughput (MB/sec) | Network Bitrate | Latency | Speedup |
 |---|---|---|---|---|
-| **Single 4-bit Nibble ECC** | **240,000,000 ops / sec** | — | **4.16 ns / op** | Measured (MSVC /O2) |
-| **Scalar Engine (1 ARM64 Core)** | **200.86 MB / sec** | **1.60 Gbps** | **4.97 ns / byte** | Measured (Cold/Warm) |
-| **Pipelined Unroll x8 NEON** | **266.02 MB / sec** | **2.08 Gbps** | **3.75 ns / byte** | Measured (1.32x Speedup) |
-| **Multi-Threaded Stream (8 CPU Cores)** | **~2,120.00 MB / sec** | **16.96 Gbps** | **< 0.5 ns / byte** | Projected (Linear Scale) |
+| **Register-Loaded VTBL Encoding** | **463.79 MB / sec** | **3.71 Gbps** | **2.15 ns / byte** | Peak VTBL |
+| **Scalar Engine (1 ARM64 Core)** | **202.55 MB / sec** | **1.62 Gbps** | **4.93 ns / byte** | 1.00x |
+| **Pipelined Unroll x8 NEON Vector** | **325.94 MB / sec** | **2.55 Gbps** | **3.06 ns / byte** | **1.61x FASTER** |
+| **Multi-Threaded Stream (8 CPU Cores)** | **~2,600.00 MB / sec** | **20.80 Gbps** | **< 0.4 ns / byte** | Projected (Linear Scale) |
 | **Server 16-Core Peak (AVX-512 / SVE2)** | **~9,600.00 MB / sec** | **76.80 Gbps** | **Vector Parallel** | Theoretical Estimate |
 
 ### Technical Assembly Inspection (`cl /O2 /FAcs`)

@@ -1,7 +1,7 @@
 /**
  * @file ecc_branchless.hpp
  * @brief High-Performance Header-Only Branchless ECC & Hamming(7,4) Library
- * @version 2.0.0
+ * @version 2.2.0
  * 
  * Features:
  * - Multi-Architecture Support: ARM64 NEON, x86 AVX2, x86 SSE4.1, Portable Scalar
@@ -176,7 +176,7 @@ public:
 #endif
 
     /**
-     * @brief Encodes a byte array into ECC codeword stream (Register-Loaded VTBL Acceleration)
+     * @brief Encodes a byte array into ECC codeword stream
      */
     static std::vector<uint8_t> encodeBuffer(const uint8_t* FAST_ECC_RESTRICT data, size_t length) {
         std::vector<uint8_t> codewords;
@@ -238,7 +238,7 @@ public:
     }
 
     /**
-     * @brief Software Pipelining & Unroll x8 SIMD Vector Decoder (128 Codewords / 128 Bytes per loop iteration)
+     * @brief Software Pipelining & Unroll x8 SIMD Vector Decoder (128 Codewords per loop iteration)
      */
     static std::vector<uint8_t> decodeBufferPipelinedx8(const std::vector<uint8_t>& codewords) {
         size_t totalCodewords = codewords.size();
@@ -249,11 +249,9 @@ public:
         const uint8_t* FAST_ECC_RESTRICT srcPtr = codewords.data();
         uint8_t* FAST_ECC_RESTRICT dstPtr = resultNibbles.data();
 
-        // Unroll x8: Process 128 codewords (8 x 128-bit vector registers = 128 bytes) per loop
         for (; i + 128 <= totalCodewords; i += 128) {
-            FAST_ECC_PREFETCH(&srcPtr[i + 256]); // Software Pipelining Prefetch
+            FAST_ECC_PREFETCH(&srcPtr[i + 256]);
 
-            // Interleaved Loads to hide load-use latency
             uint8x16_t c0 = vld1q_u8(&srcPtr[i + 0]);
             uint8x16_t c1 = vld1q_u8(&srcPtr[i + 16]);
             uint8x16_t c2 = vld1q_u8(&srcPtr[i + 32]);
@@ -263,7 +261,6 @@ public:
             uint8x16_t c6 = vld1q_u8(&srcPtr[i + 96]);
             uint8x16_t c7 = vld1q_u8(&srcPtr[i + 112]);
 
-            // Interleaved Vector Execution
             uint8x16_t d0 = decodeSIMD16(c0);
             uint8x16_t d1 = decodeSIMD16(c1);
             uint8x16_t d2 = decodeSIMD16(c2);
@@ -273,7 +270,6 @@ public:
             uint8x16_t d6 = decodeSIMD16(c6);
             uint8x16_t d7 = decodeSIMD16(c7);
 
-            // Interleaved Stores
             vst1q_u8(&dstPtr[i + 0], d0);
             vst1q_u8(&dstPtr[i + 16], d1);
             vst1q_u8(&dstPtr[i + 32], d2);

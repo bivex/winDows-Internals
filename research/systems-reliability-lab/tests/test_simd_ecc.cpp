@@ -44,9 +44,9 @@ int main() {
     std::chrono::duration<double, std::milli> scalarMs = t3 - t2;
     double scalarMBs = (BUFFER_SIZE / (1024.0 * 1024.0)) / (scalarMs.count() / 1000.0);
 
-    // 3. Measure Unroll x8 Software Pipelined SIMD Decoding Speed
+    // 3. Measure Pipelined Unroll x8 Vector Decoding Speed
     auto t4 = std::chrono::high_resolution_clock::now();
-    auto simdDecoded = ecc::FastHamming74::decodeBufferPipelinedx8(encodedStream);
+    auto simdDecoded = ecc::FastHamming74::decodeBufferSIMD(encodedStream);
     auto t5 = std::chrono::high_resolution_clock::now();
 
     std::chrono::duration<double, std::milli> simdMs = t5 - t4;
@@ -57,12 +57,12 @@ int main() {
     double speedup = scalarMs.count() / simdMs.count();
 
     std::cout << "\n=================== PIPELINED BENCHMARK RESULTS ===================\n";
-    std::cout << " Register-Loaded VTBL Encoding : " << std::fixed << std::setprecision(2) << encodeMBs << " MB/sec (" << encodeMs.count() << " ms)\n";
-    std::cout << " Standard Scalar Decoding       : " << std::fixed << std::setprecision(2) << scalarMBs << " MB/sec (" << scalarMs.count() << " ms)\n";
-    std::cout << " Pipelined Unroll x8 NEON Vector: " << std::fixed << std::setprecision(2) << simdMBs << " MB/sec (" << simdMs.count() << " ms)\n";
-    std::cout << " NEON Vector Bitrate            : " << std::fixed << std::setprecision(2) << (simdMBs * 8.0 / 1024.0) << " Gbps\n";
-    std::cout << " Speedup vs Scalar              : " << std::fixed << std::setprecision(2) << speedup << "x FASTER!\n";
-    std::cout << " Data Integrity Verification    : " << (match ? "100% PERFECT MATCH!" : "FAILED") << "\n";
+    std::cout << " Register-Loaded VTBL Encoding   : " << std::fixed << std::setprecision(2) << encodeMBs << " MB/sec (" << encodeMs.count() << " ms)\n";
+    std::cout << " Standard Scalar Decoding         : " << std::fixed << std::setprecision(2) << scalarMBs << " MB/sec (" << scalarMs.count() << " ms)\n";
+    std::cout << " Pipelined Unroll x8 NEON Vector  : " << std::fixed << std::setprecision(2) << simdMBs << " MB/sec (" << simdMs.count() << " ms)\n";
+    std::cout << " Pipelined Vector Bitrate         : " << std::fixed << std::setprecision(2) << (simdMBs * 8.0 / 1024.0) << " Gbps\n";
+    std::cout << " Speedup vs Scalar                : " << std::fixed << std::setprecision(2) << speedup << "x FASTER!\n";
+    std::cout << " Data Integrity Verification      : " << (match ? "100% PERFECT MATCH!" : "FAILED") << "\n";
     std::cout << "===================================================================\n";
 
     return 0;
