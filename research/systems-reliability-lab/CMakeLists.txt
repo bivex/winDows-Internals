@@ -12,6 +12,7 @@ add_executable(stream_transmission examples/stream_transmission.cpp)
 add_executable(ecc_data_transmission_demo examples/ecc_data_transmission_demo.cpp)
 add_executable(fast_10mb_transmission_demo examples/fast_10mb_transmission_demo.cpp)
 add_executable(lookaside_ecc_integration_demo examples/lookaside_ecc_integration_demo.cpp)
+add_executable(high_speed_telemetry_engine examples/high_speed_telemetry_engine.cpp)
 add_executable(ecc_hamming_poc examples/ecc_hamming_poc.cpp)
 add_executable(ecc_hamming_fast_poc examples/ecc_hamming_fast_poc.cpp)
 
