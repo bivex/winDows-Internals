@@ -88,8 +88,39 @@ typedef struct _RECONSTRUCTED_MMVAD_CSRSS {
 
 ---
 
-## 3. Git Commit Record
+## 3. Execution Control & Hardware Protection Analysis (`FileObject` vs. `RIP`/`EIP`/`PC`)
+
+### 3.1 Structural Semantics vs. CPU Execution
+
+A common misconception in kernel memory research is attributing execution capability to metadata pointers like `_MMVAD.FileObject` (`+0x080`).
+
+- **`FileObject` Role:** `FileObject` points to a kernel-space `nt!_FILE_OBJECT` structure (`0xFFFF...`) used exclusively by the **Memory Manager (MM)** during Page Faults to resolve disk-backed file pages. It is **never** invoked as a code pointer by the OS.
+- **CPU Execution Model:** The CPU Instruction Pointer (`RIP`/`EIP` on x86/x64, `PC` on ARM64) fetches opcodes strictly from Virtual Addresses based on **MMU Page Table Entries (PTE)**, independently of kernel VAD metadata.
+
+### 3.2 MMU & Hardware Security Enforcement Matrix
+
+When execution control (`RIP`/`EIP`/`PC`) is redirected to an arbitrary address (e.g. heap-allocated or kernel-structure address), the processor and OS enforce the following hardware checks:
+
+```
+[RIP / PC] ---> MMU Page Table Entry (PTE) Lookup
+                   ├── 1. User/Supervisor Bit (U/S) ──► SMEP / PXN Check
+                   ├── 2. No-Execute Bit (NX / XN)  ──► DEP / W^X Check
+                   └── 3. Control Flow Guard Bitmap ──► CFG / CET Check
+```
+
+| Memory Target / Region | PTE Attributes | Hardware Mitigation | Operating System Result |
+| :--- | :--- | :--- | :--- |
+| **Kernel Structure** (`_FILE_OBJECT`, `0xFFFF...`) | Supervisor Only (`U/S=0`) | **SMEP** (x64) / **PXN** (ARM64) | ❌ Crash: `STATUS_ACCESS_VIOLATION` (`#PF`) |
+| **User Heap / Stack** (`PAGE_READWRITE`) | User, No-Execute (`NX=1`) | **DEP** / **W^X** | ❌ Crash: `STATUS_ACCESS_VIOLATION` (`0xC0000005`) |
+| **Unbacked Executable Memory** (`RWX`) | User, Executable (`NX=0`) | **CFG** / **XFG** | ❌ Crash: `FAST_FAIL_GUARD_ICALL` (`0xC0000409`) |
+| **Altered Stack Return Address** | User, Executable | **CET** (Shadow Stack) | ❌ Exception: `#CP` (Control Protection) |
+| **Legitimate `.text` PE Section** | User, Executable (`NX=0`) | Valid CFG Bitmap Entry | ✅ Normal CPU Instruction Execution |
+
+---
+
+## 4. Git Commit Record
 
 - Document created: `KERNEL/VAD_CSRSS_Research.md`
 - Repository: `/Volumes/External/Code/winDows-Internals`
 - Related tools: `structscan` v4.5 (`structscan_arm64.dll`)
+
