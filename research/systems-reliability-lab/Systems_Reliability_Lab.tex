@@ -1,6 +1,7 @@
 \documentclass[12pt,a4paper]{article}
 
-\usepackage[utf8]{utf8}
+\usepackage[T2A]{fontenc}
+\usepackage[utf8]{inputenc}
 \usepackage[ukrainian]{babel}
 \usepackage{amsmath,amssymb,amsfonts}
 \usepackage{geometry}
@@ -59,7 +60,7 @@
 
 Без наявності спеціалізованих систем захисту навіть поодинокий спотворений біт у критичній структурі ядра призводить до краху операційної системи (BSOD) або тихого псування даних (Silent Data Corruption). Для забезпечення безперебійної роботи серверних та корпоративних систем застосовується багаторівнева ієрархія захисту.
 
-\section{Багаторівнева Архітектура та Закон Ірархії Затримок}
+\section{Багаторівнева Архітектура та Закон Ієрархії Затримок}
 
 Захист даних у системі побудовано за принципом від найближчого до джерела помилки рівня до високорівневих абстракцій.
 
@@ -85,7 +86,7 @@
 Швидкість реагування обернено пропорційна глибині обробки: апаратний рівень лікує помилку за наносекунди, ядро ізолює несправний вузол за мілісекунди, а файлова система проводить блокове відновлення.
 
 \section{Апаратний Рівень: Коди Хеммінга (ECC RAM)}
-Апаратна пам'ять з корекцією помилок (ECC) використовує схему **Hamming(7,4)** або **SECDED** (Single Error Correction, Double Error Detection). На кожні 64 біти даних додається 8 паритетних бітів (12.5\% надлишковості).
+Апаратна пам'ять з корекцією помилок (ECC) використовує схему \textbf{Hamming(7,4)} або \textbf{SECDED} (Single Error Correction, Double Error Detection). На кожні 64 біти даних додається 8 паритетних бітів (12.5\% надлишковості).
 
 При виникненні спотворення обчислюється вектор синдрому $S = (S_4, S_2, S_1)$:
 \begin{equation}
@@ -96,31 +97,31 @@ S_4 = b_4 \oplus b_5 \oplus b_6 \oplus b_7
 Значення синдрому вказує на точний номер біта, у якому відбувся збій, що дозволяє апаратурі інвертувати його назад без запиту повторної передачі.
 
 \section{Підсистема WHEA та Формат Записів CPER}
-Підсистема **WHEA** (\texttt{Windows Hardware Error Architecture}) виступає центральним діагностичним вузлом ядра Windows (\texttt{ntoskrnl.exe}). 
+Підсистема \textbf{WHEA} (\texttt{Windows Hardware Error Architecture}) виступає центральним діагностичним вузлом ядра Windows (\texttt{ntoskrnl.exe}). 
 
-Вона отримує сигнали від Machine Check Architecture (MCA), Corrected Machine Check Interrupt (CMCI) та PCIe Advanced Error Reporting (AER), пакує їх у стандартизований формат **CPER** (Common Platform Error Record) та класифікує рівень загрози:
+Вона отримує сигнали від Machine Check Architecture (MCA), Corrected Machine Check Interrupt (CMCI) та PCIe Advanced Error Reporting (AER), пакує їх у стандартизований формат \textbf{CPER} (Common Platform Error Record) та класифікує рівень загрози:
 
-\begin{lstlisting}[language=C, caption=Перераховані рівні важкості помилок у ядрі Windows]
+\begin{lstlisting}[language=C, caption=WHEA Error Severity Enumeration in Windows Kernel]
 typedef enum _WHEA_ERROR_SEVERITY {
-    WheaErrSevRecoverable   = 0, // Можливо усунути (наприклад, ізолювати сторінку)
-    WheaErrSevFatal         = 1, // Невиправна помилка -> BSOD BugCheck 0x124
-    WheaErrSevCorrected     = 2, // Виправлено апаратурою (Single-Bit ECC)
-    WheaErrSevInformational = 3  // Інформаційне повідомлення
+    WheaErrSevRecoverable   = 0, // Recoverable error (e.g. page offline possible)
+    WheaErrSevFatal         = 1, // Unrecoverable error -> BugCheck 0x124
+    WheaErrSevCorrected     = 2, // Corrected by hardware (Single-Bit ECC)
+    WheaErrSevInformational = 3  // Audit log event
 } WHEA_ERROR_SEVERITY;
 \end{lstlisting}
 
 \section{Динамічна Ізоляція Пам'яті (Page Offlining)}
-Якщо апаратна пам'ять генерує занадто багато виправлених однобітових помилок на одній фізичній сторінці (перевищення порогу \texttt{WheapRegPolicyMemPfaTimeout}), ядро запускає процедуру **Page Offlining** у функції \texttt{nt!WheapAttemptPhysicalPageOffline}:
+Якщо апаратна пам'ять генерує занадто багато виправлених однобітових помилок на одній фізичній сторінці (перевищення порогу \texttt{WheapRegPolicyMemPfaTimeout}), ядро запускає процедуру \textbf{Page Offlining} у функції \texttt{nt!WheapAttemptPhysicalPageOffline}:
 
-\begin{lstlisting}[language=VHDL, caption=Дизасемблерний фрагмент ядра Windows 11 ARM64]
-; Перетворення номера сторінки PFN у фізичну адресу (Page Alignment 4KB)
+\begin{lstlisting}[language=VHDL, caption=Windows 11 ARM64 Kernel Assembly Disassembly]
+; PFN to Physical Address Translation (4KB Page Alignment)
 lsl  x0, x23, #0xC    ; PhysicalAddress = PFN << 12
-mov  x8, #0x1000      ; Розмір сторінки = 4096 байт
+mov  x8, #0x1000      ; Page Size = 4096 bytes
 
-; Позначення сторінки як непридатної у Менеджері Пам'яті
+; Mark Memory Frame as Bad in Memory Manager
 bl   nt!MmMarkPhysicalMemoryAsBad
 
-; Збереження номера зіпсованої сторінки у BCD для блокування при перезавантаженні
+; Persist Bad Page across reboots in BCD and Registry
 bl   nt!WheaPersistBadPageToBcd
 bl   nt!WheaPersistBadPageToRegistry
 \end{lstlisting}
@@ -133,11 +134,11 @@ bl   nt!WheaPersistBadPageToRegistry
 \section{Емпіричні Результати та Бенчмаркінг}
 В рамках дослідження було розроблено та протестовано високоефективний C++ PoC рушій без умовних переходів (\texttt{ecc\_hamming\_fast\_poc.cpp}).
 
-\begin{lstlisting}[language=C++, caption=Branchless інверсія помилки без конпресійних затримок]
+\begin{lstlisting}[language=C++, caption=Branchless Error Correction Engine]
 uint32_t syndrome = (s4 << 2) | (s2 << 1) | s1;
-// Маскування без гілкувань if/else (Branchless Execution)
+// Branchless Error Masking (0 CPU branch mispredictions)
 uint32_t mask = (syndrome != 0) ? (1U << (syndrome - 1)) : 0U;
-codeword ^= mask; // Апаратна корекція за 1 такт
+codeword ^= mask; // Hardware bit correction in 1 CPU cycle
 \end{lstlisting}
 
 Тестування на цільовій системі Windows 11 ARM64 (Build 26100) під компілятором MSVC (\texttt{cl /O2}) показало наступні результати:
