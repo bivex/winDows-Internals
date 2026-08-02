@@ -94,3 +94,27 @@ fffff802`abd1aac0 nt!armv8_crc32_pmull_little
 2. **Localization:** Precise isolation of PFN (Page Frame Number) or storage block LBA.
 3. **Isolation:** Soft blacklisting (`BadPageList`) and persistent BCD blacklisting.
 4. **Restoration:** Self-healing via Storage Spaces parity stream or backup fetch.
+
+---
+
+## 5. The Proximity & Latency Hierarchy Rule
+
+> *"The fastest error correction mechanism is the one closest to the physical fault location."*
+
+```text
+1. CPU / ECC RAM (Nanoseconds)
+   └─ Corrected instantly in hardware before the OS is aware
+
+2. WHEA Notification (Microseconds)
+   └─ Captures interrupt, logs CPER record, classifies severity
+
+3. Memory Manager Page Offlining (Milliseconds)
+   └─ Kernel isolates PFN, updates BadPageList and BCD
+
+4. ReFS / Storage Self-Healing (Milliseconds+)
+   └─ Validates checksum (RtlpCrc32c), fetches mirror/parity block, restores data
+```
+
+**Architecture Law:**  
+$$\text{Hardware (Fast Correction)} \longrightarrow \text{Kernel (Safe Isolation)} \longrightarrow \text{Filesystem (Data Restoration)}$$
+
