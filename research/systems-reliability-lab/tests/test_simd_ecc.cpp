@@ -8,8 +8,16 @@
 
 int main() {
     std::cout << "========================================================\n";
-    std::cout << "   Scalar vs SIMD NEON Vectorized ECC Benchmark         \n";
+    std::cout << "  Software Pipelined Unroll x8 ARM NEON Benchmark       \n";
     std::cout << "========================================================\n\n";
+
+    std::cout << "[+] Detected Architecture: ";
+    switch (ecc::FastHamming74::getDetectedArchitecture()) {
+        case ecc::Architecture::ARM_NEON: std::cout << "ARM64 NEON (128-bit SIMD)\n"; break;
+        case ecc::Architecture::x86_AVX2: std::cout << "x86 AVX2 (256-bit SIMD)\n"; break;
+        case ecc::Architecture::x86_SSE41: std::cout << "x86 SSE4.1 (128-bit SIMD)\n"; break;
+        default: std::cout << "Portable C++ Scalar\n"; break;
+    }
 
     const size_t BUFFER_SIZE = 64 * 1024 * 1024; // 64 MB Buffer
     std::cout << "[+] Allocating & Initializing " << (BUFFER_SIZE / (1024 * 1024)) << " MB Test Buffer...\n";
@@ -36,9 +44,9 @@ int main() {
     std::chrono::duration<double, std::milli> scalarMs = t3 - t2;
     double scalarMBs = (BUFFER_SIZE / (1024.0 * 1024.0)) / (scalarMs.count() / 1000.0);
 
-    // 3. Measure SIMD NEON Decoding Speed
+    // 3. Measure Unroll x8 Software Pipelined SIMD Decoding Speed
     auto t4 = std::chrono::high_resolution_clock::now();
-    auto simdDecoded = ecc::FastHamming74::decodeBufferSIMD(encodedStream);
+    auto simdDecoded = ecc::FastHamming74::decodeBufferPipelinedx8(encodedStream);
     auto t5 = std::chrono::high_resolution_clock::now();
 
     std::chrono::duration<double, std::milli> simdMs = t5 - t4;
@@ -48,14 +56,14 @@ int main() {
     bool match = (scalarDecoded == simdDecoded);
     double speedup = scalarMs.count() / simdMs.count();
 
-    std::cout << "\n=================== BENCHMARK RESULTS ===================\n";
-    std::cout << " 1-Cycle Register VTBL Encoding : " << std::fixed << std::setprecision(2) << encodeMBs << " MB/sec (" << encodeMs.count() << " ms)\n";
+    std::cout << "\n=================== PIPELINED BENCHMARK RESULTS ===================\n";
+    std::cout << " Register-Loaded VTBL Encoding : " << std::fixed << std::setprecision(2) << encodeMBs << " MB/sec (" << encodeMs.count() << " ms)\n";
     std::cout << " Standard Scalar Decoding       : " << std::fixed << std::setprecision(2) << scalarMBs << " MB/sec (" << scalarMs.count() << " ms)\n";
-    std::cout << " Architecture-Aware NEON Vector : " << std::fixed << std::setprecision(2) << simdMBs << " MB/sec (" << simdMs.count() << " ms)\n";
+    std::cout << " Pipelined Unroll x8 NEON Vector: " << std::fixed << std::setprecision(2) << simdMBs << " MB/sec (" << simdMs.count() << " ms)\n";
     std::cout << " NEON Vector Bitrate            : " << std::fixed << std::setprecision(2) << (simdMBs * 8.0 / 1024.0) << " Gbps\n";
     std::cout << " Speedup vs Scalar              : " << std::fixed << std::setprecision(2) << speedup << "x FASTER!\n";
     std::cout << " Data Integrity Verification    : " << (match ? "100% PERFECT MATCH!" : "FAILED") << "\n";
-    std::cout << "=========================================================\n";
+    std::cout << "===================================================================\n";
 
     return 0;
 }
