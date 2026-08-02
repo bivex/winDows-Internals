@@ -18,21 +18,25 @@ High-performance, C++11 header-only library providing branchless Hamming(7,4) Si
 ```text
 fast-ecc-branchless/
 ├── include/
-│   └── ecc_branchless.hpp         # Header-only library v2.2.0 (Software Pipelining + Unroll x8)
+│   └── ecc_branchless.hpp         # Header-only library v2.2.0
 ├── examples/
 │   ├── basic_ecc.cpp               # Basic single-nibble example
-│   └── stream_transmission.cpp     # Full string/buffer stream recovery
+│   ├── stream_transmission.cpp     # Full string/buffer stream recovery
+│   ├── ecc_data_transmission_demo.cpp # Real-time noise channel demo
+│   ├── ecc_hamming_poc.cpp         # Standard Hamming C++ PoC
+│   └── ecc_hamming_fast_poc.cpp    # Branchless C++ PoC
 ├── tests/
 │   ├── test_ecc.cpp                # Automated unit test suite (112 test cases)
 │   ├── test_edge_cases.cpp         # Edge cases & 1 MB high-res benchmark
 │   ├── test_memleak.cpp            # MSVC CRT & ASan 0-leak memory check
 │   ├── test_max_throughput.cpp     # 64 MB Multi-Pass Peak Throughput benchmark
 │   └── test_simd_ecc.cpp           # Pipelined Unroll x8 NEON Benchmark
-├── ecc_data_transmission_demo.cpp  # Real-time noise channel demo
+├── docs/
+│   ├── Systems_Reliability_Lab.md  # Systems Reliability Architecture research
+│   └── Systems_Reliability_Lab.tex # Academic LaTeX paper (Ukrainian)
 ├── CMakeLists.txt                  # Cross-platform CMake build configuration
 ├── README.md                       # Documentation & Benchmark Breakdown
-├── Systems_Reliability_Lab.md      # Architecture research document
-└── Systems_Reliability_Lab.tex     # Academic LaTeX paper (Ukrainian)
+└── .gitignore                      # Git ignore rules
 ```
 
 ## 🚀 Quick Start
