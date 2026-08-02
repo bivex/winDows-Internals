@@ -1,7 +1,7 @@
 /**
  * @file ecc_branchless.hpp
- * @brief High-Performance Header-Only Branchless ECC & Hamming(7,4) Library (with Kernel-Level NEON VTBL & Prefetch)
- * @version 1.2.0
+ * @brief High-Performance Header-Only Branchless ECC & Hamming(7,4) Library
+ * @version 1.4.0
  */
 
 #ifndef FAST_ECC_BRANCHLESS_HPP
@@ -20,8 +20,10 @@
 #if defined(_MSC_VER)
 #include <intrin.h>
 #define FAST_ECC_PREFETCH(addr) __prefetch(reinterpret_cast<const void*>(addr))
+#define FAST_ECC_RESTRICT __restrict
 #else
 #define FAST_ECC_PREFETCH(addr) __builtin_prefetch(reinterpret_cast<const void*>(addr), 0, 3)
+#define FAST_ECC_RESTRICT __restrict__
 #endif
 
 namespace ecc {
@@ -45,7 +47,7 @@ public:
     }
 
     /**
-     * @brief Branchless decoding and single-bit error correction (Scalar 4-bit)
+     * @brief Branchless decoding (data-dependent branches eliminated)
      */
     static inline uint8_t decode4(uint8_t codeword, bool& corrected) noexcept {
         uint32_t c = codeword;
@@ -98,16 +100,9 @@ public:
 #if FAST_ECC_HAS_NEON
     /**
      * @brief 1-Cycle ARM NEON Vector Table Lookup (VTBL) Encoding
-     * Encodes 16 nibbles simultaneously in 1 CPU Clock Cycle!
      */
-    static inline uint8x16_t encodeSIMD16_VTBL(uint8x16_t vecNibbles) noexcept {
-        // Pre-computed Hamming(7,4) Codeword LUT for all 16 nibble values (0..15)
-        static const uint8_t lutData[16] = {
-            0x00, 0x07, 0x19, 0x1E, 0x2A, 0x2D, 0x33, 0x34,
-            0x4B, 0x4C, 0x52, 0x55, 0x61, 0x66, 0x78, 0x7F
-        };
-        uint8x16_t lut = vld1q_u8(lutData);
-        return vqtbl1q_u8(lut, vandq_u8(vecNibbles, vdupq_n_u8(0x0F)));
+    static inline uint8x16_t encodeSIMD16_VTBL(uint8x16_t vecNibbles, uint8x16_t lutReg) noexcept {
+        return vqtbl1q_u8(lutReg, vandq_u8(vecNibbles, vdupq_n_u8(0x0F)));
     }
 
     /**
@@ -128,15 +123,12 @@ public:
 
         uint8x16_t syndrome = vorrq_u8(vorrq_u8(s1, vshlq_n_u8(s2, 1)), vshlq_n_u8(s4, 2));
 
-        // Vectorized bitmask shift for auto-correction
         uint8x16_t mask1 = vshlq_u8(vdupq_n_u8(1), vsubq_u8(syndrome, vdupq_n_u8(1)));
         uint8x16_t isNonZero = vtstq_u8(syndrome, syndrome);
         uint8x16_t finalMask = vandq_u8(mask1, isNonZero);
 
-        // Corrected Vector
         uint8x16_t corrected = veorq_u8(vecCode, finalMask);
 
-        // Reconstruct nibbles
         uint8x16_t d0 = vandq_u8(vshrq_n_u8(corrected, 2), vdupq_n_u8(1));
         uint8x16_t d1 = vandq_u8(vshrq_n_u8(corrected, 4), vdupq_n_u8(1));
         uint8x16_t d2 = vandq_u8(vshrq_n_u8(corrected, 5), vdupq_n_u8(1));
@@ -147,26 +139,30 @@ public:
 #endif
 
     /**
-     * @brief Encodes a byte array into ECC codeword stream (with 1-Cycle VTBL NEON Acceleration)
+     * @brief Encodes a byte array into ECC codeword stream
      */
-    static std::vector<uint8_t> encodeBuffer(const uint8_t* data, size_t length) {
+    static std::vector<uint8_t> encodeBuffer(const uint8_t* FAST_ECC_RESTRICT data, size_t length) {
         std::vector<uint8_t> codewords;
         codewords.reserve(length * 2);
 
         size_t i = 0;
 #if FAST_ECC_HAS_NEON
-        // Process 16 bytes (32 nibbles) per unrolled loop with Prefetch
+        static const uint8_t lutData[16] = {
+            0x00, 0x07, 0x19, 0x1E, 0x2A, 0x2D, 0x33, 0x34,
+            0x4B, 0x4C, 0x52, 0x55, 0x61, 0x66, 0x78, 0x7F
+        };
+        const uint8x16_t lutReg = vld1q_u8(lutData);
+
         for (; i + 16 <= length; i += 16) {
-            FAST_ECC_PREFETCH(&data[i + 64]); // L1 Cache Prefetch
+            FAST_ECC_PREFETCH(&data[i + 128]);
 
             uint8x16_t bytes = vld1q_u8(&data[i]);
             uint8x16_t lowNibbles = vandq_u8(bytes, vdupq_n_u8(0x0F));
             uint8x16_t highNibbles = vshrq_n_u8(bytes, 4);
 
-            uint8x16_t lowCodewords = encodeSIMD16_VTBL(lowNibbles);
-            uint8x16_t highCodewords = encodeSIMD16_VTBL(highNibbles);
+            uint8x16_t lowCodewords = encodeSIMD16_VTBL(lowNibbles, lutReg);
+            uint8x16_t highCodewords = encodeSIMD16_VTBL(highNibbles, lutReg);
 
-            // Interleave low & high codewords
             alignas(16) uint8_t lowArr[16];
             alignas(16) uint8_t highArr[16];
             vst1q_u8(lowArr, lowCodewords);
@@ -205,38 +201,22 @@ public:
     }
 
     /**
-     * @brief Ultra-Fast Kernel-Style Unrolled SIMD Decoder (Loop Unroll x4 + NEON)
+     * @brief Architecture-Aware Vector Decoder (SIMD NEON)
      */
-    static std::vector<uint8_t> decodeBufferKernelMax(const std::vector<uint8_t>& codewords) {
+    static std::vector<uint8_t> decodeBufferSIMD(const std::vector<uint8_t>& codewords) {
         size_t totalCodewords = codewords.size();
         std::vector<uint8_t> resultNibbles(totalCodewords);
 
         size_t i = 0;
 #if FAST_ECC_HAS_NEON
-        // Unroll 64 codewords per loop (4 x 128-bit vector registers)
-        for (; i + 64 <= totalCodewords; i += 64) {
-            FAST_ECC_PREFETCH(&codewords[i + 128]); // L1 Cache Prefetch
-
-            uint8x16_t c0 = vld1q_u8(&codewords[i + 0]);
-            uint8x16_t c1 = vld1q_u8(&codewords[i + 16]);
-            uint8x16_t c2 = vld1q_u8(&codewords[i + 32]);
-            uint8x16_t c3 = vld1q_u8(&codewords[i + 48]);
-
-            uint8x16_t d0 = decodeSIMD16(c0);
-            uint8x16_t d1 = decodeSIMD16(c1);
-            uint8x16_t d2 = decodeSIMD16(c2);
-            uint8x16_t d3 = decodeSIMD16(c3);
-
-            vst1q_u8(&resultNibbles[i + 0], d0);
-            vst1q_u8(&resultNibbles[i + 16], d1);
-            vst1q_u8(&resultNibbles[i + 32], d2);
-            vst1q_u8(&resultNibbles[i + 48], d3);
-        }
+        const uint8_t* FAST_ECC_RESTRICT srcPtr = codewords.data();
+        uint8_t* FAST_ECC_RESTRICT dstPtr = resultNibbles.data();
 
         for (; i + 16 <= totalCodewords; i += 16) {
-            uint8x16_t c = vld1q_u8(&codewords[i]);
+            FAST_ECC_PREFETCH(&srcPtr[i + 128]);
+            uint8x16_t c = vld1q_u8(&srcPtr[i]);
             uint8x16_t d = decodeSIMD16(c);
-            vst1q_u8(&resultNibbles[i], d);
+            vst1q_u8(&dstPtr[i], d);
         }
 #endif
         for (; i < totalCodewords; ++i) {
@@ -244,7 +224,6 @@ public:
             resultNibbles[i] = decode4(codewords[i], dummy);
         }
 
-        // Pack nibbles into bytes
         size_t byteCount = totalCodewords / 2;
         std::vector<uint8_t> bytes(byteCount);
         for (size_t j = 0; j < byteCount; ++j) {

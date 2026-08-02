@@ -8,7 +8,7 @@
 
 int main() {
     std::cout << "========================================================\n";
-    std::cout << "  Kernel-Max (VTBL + Prefetch + Unroll x4) Benchmark    \n";
+    std::cout << "   Scalar vs SIMD NEON Vectorized ECC Benchmark         \n";
     std::cout << "========================================================\n\n";
 
     const size_t BUFFER_SIZE = 64 * 1024 * 1024; // 64 MB Buffer
@@ -19,7 +19,7 @@ int main() {
         inputBuffer[i] = static_cast<uint8_t>(i & 0xFF);
     }
 
-    // 1. Measure 1-Cycle VTBL NEON Vector Encoding Speed
+    // 1. Measure Register-Loaded VTBL Encoding Speed
     auto t0 = std::chrono::high_resolution_clock::now();
     auto encodedStream = ecc::FastHamming74::encodeBuffer(inputBuffer.data(), BUFFER_SIZE);
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -36,26 +36,26 @@ int main() {
     std::chrono::duration<double, std::milli> scalarMs = t3 - t2;
     double scalarMBs = (BUFFER_SIZE / (1024.0 * 1024.0)) / (scalarMs.count() / 1000.0);
 
-    // 3. Measure Kernel-Max Unrolled SIMD Decoding Speed (decodeBufferKernelMax)
+    // 3. Measure SIMD NEON Decoding Speed
     auto t4 = std::chrono::high_resolution_clock::now();
-    auto kernelMaxDecoded = ecc::FastHamming74::decodeBufferKernelMax(encodedStream);
+    auto simdDecoded = ecc::FastHamming74::decodeBufferSIMD(encodedStream);
     auto t5 = std::chrono::high_resolution_clock::now();
 
-    std::chrono::duration<double, std::milli> kernelMaxMs = t5 - t4;
-    double kernelMaxMBs = (BUFFER_SIZE / (1024.0 * 1024.0)) / (kernelMaxMs.count() / 1000.0);
+    std::chrono::duration<double, std::milli> simdMs = t5 - t4;
+    double simdMBs = (BUFFER_SIZE / (1024.0 * 1024.0)) / (simdMs.count() / 1000.0);
 
     // Verification
-    bool match = (scalarDecoded == kernelMaxDecoded);
-    double speedup = scalarMs.count() / kernelMaxMs.count();
+    bool match = (scalarDecoded == simdDecoded);
+    double speedup = scalarMs.count() / simdMs.count();
 
-    std::cout << "\n=================== KERNEL-MAX BENCHMARK RESULTS ===================\n";
-    std::cout << " 1-Cycle VTBL Encoding Speed : " << std::fixed << std::setprecision(2) << encodeMBs << " MB/sec (" << encodeMs.count() << " ms)\n";
-    std::cout << " Standard Scalar Decoding    : " << std::fixed << std::setprecision(2) << scalarMBs << " MB/sec (" << scalarMs.count() << " ms)\n";
-    std::cout << " Kernel-Max Vector Decoding  : " << std::fixed << std::setprecision(2) << kernelMaxMBs << " MB/sec (" << kernelMaxMs.count() << " ms)\n";
-    std::cout << " Kernel Vector Bitrate       : " << std::fixed << std::setprecision(2) << (kernelMaxMBs * 8.0 / 1024.0) << " Gbps\n";
-    std::cout << " Speedup vs Scalar           : " << std::fixed << std::setprecision(2) << speedup << "x FASTER!\n";
-    std::cout << " Data Integrity Verification : " << (match ? "100% PERFECT MATCH!" : "FAILED") << "\n";
-    std::cout << "===================================================================\n";
+    std::cout << "\n=================== BENCHMARK RESULTS ===================\n";
+    std::cout << " 1-Cycle Register VTBL Encoding : " << std::fixed << std::setprecision(2) << encodeMBs << " MB/sec (" << encodeMs.count() << " ms)\n";
+    std::cout << " Standard Scalar Decoding       : " << std::fixed << std::setprecision(2) << scalarMBs << " MB/sec (" << scalarMs.count() << " ms)\n";
+    std::cout << " Architecture-Aware NEON Vector : " << std::fixed << std::setprecision(2) << simdMBs << " MB/sec (" << simdMs.count() << " ms)\n";
+    std::cout << " NEON Vector Bitrate            : " << std::fixed << std::setprecision(2) << (simdMBs * 8.0 / 1024.0) << " Gbps\n";
+    std::cout << " Speedup vs Scalar              : " << std::fixed << std::setprecision(2) << speedup << "x FASTER!\n";
+    std::cout << " Data Integrity Verification    : " << (match ? "100% PERFECT MATCH!" : "FAILED") << "\n";
+    std::cout << "=========================================================\n";
 
     return 0;
 }
