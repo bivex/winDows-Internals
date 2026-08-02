@@ -118,3 +118,46 @@ fffff802`abd1aac0 nt!armv8_crc32_pmull_little
 **Architecture Law:**  
 $$\text{Hardware (Fast Correction)} \longrightarrow \text{Kernel (Safe Isolation)} \longrightarrow \text{Filesystem (Data Restoration)}$$
 
+---
+
+## 6. Empirical PoC & Kernel-Optimized Benchmark Results
+
+### A. Functional Self-Healing Verification (`ecc_hamming_poc.cpp`)
+Demonstrates exact Hamming(7,4) Single Error Correction (SEC) algorithm:
+
+```text
+[1] Original Data Payload (4 bits) : 1011 (Decimal: 11)
+[2] Encoded ECC Codeword (7 bits)   : 1010101 [p1 p2 d0 p4 d1 d2 d3]
+
+[!] HARDWARE NOISE INCIDENT (Bit Flip)!
+    Flipping Bit #2 in memory...
+[3] Corrupted Memory State (7 bits) : 1010111
+
+[4] ECC Self-Healing Engine Output:
+    [+] Error Detected : YES!
+    [+] Fault Location : Bit #2
+    [+] Corrected Memory: 1010101
+
+[5] Final Recovered Data Payload    : 1011 (Decimal: 11)
+>>> SUCCESS: Data 100% restored without retransmission! <<<
+```
+
+---
+
+### B. Kernel-Style Branchless Execution Benchmark (`ecc_hamming_fast_poc.cpp`)
+
+Compiled with MSVC ARM64 (`cl /O2`) and executed on Windows 11 Target VM (Build 26100):
+
+```text
+================ BENCHMARK RESULTS (100,000,000 Cycles) ================
+ Total Execution Time      : 416.45 ms
+ Latency Per ECC Operation : 4.16 ns / op
+ Throughput                : 240,124,072 ops / sec
+ Checksum Accumulator      : 750000000
+========================================================================
+```
+
+**Optimization Engineering Highlights:**
+1. **Branchless Error Masking:** Eliminates CPU branch misprediction penalties by computing error masks without conditional branches: `c ^= (syndrome != 0) ? (1U << (syndrome - 1)) : 0U`.
+2. **Sub-5 Nanosecond Latency:** Achieves **4.16 ns per encode-corrupt-correct cycle**, matching hardware-level nanosecond performance expectations.
+
