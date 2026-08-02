@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(FastECCBranchless VERSION 1.1.0 LANGUAGES CXX)
+project(FastECCBranchless VERSION 2.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,7 +9,9 @@ include_directories(include)
 # Examples
 add_executable(basic_ecc examples/basic_ecc.cpp)
 add_executable(stream_transmission examples/stream_transmission.cpp)
-add_executable(ecc_data_transmission_demo ecc_data_transmission_demo.cpp)
+add_executable(ecc_data_transmission_demo examples/ecc_data_transmission_demo.cpp)
+add_executable(ecc_hamming_poc examples/ecc_hamming_poc.cpp)
+add_executable(ecc_hamming_fast_poc examples/ecc_hamming_fast_poc.cpp)
 
 # Tests
 enable_testing()
