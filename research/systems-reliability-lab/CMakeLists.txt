@@ -1,0 +1,20 @@
+cmake_minimum_required(VERSION 3.14)
+project(FastECCBranchless VERSION 1.0.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+include_directories(include)
+
+# Examples
+add_executable(basic_ecc examples/basic_ecc.cpp)
+add_executable(stream_transmission examples/stream_transmission.cpp)
+add_executable(ecc_data_transmission_demo ecc_data_transmission_demo.cpp)
+
+# Tests
+enable_testing()
+add_executable(test_ecc tests/test_ecc.cpp)
+add_executable(test_edge_cases tests/test_edge_cases.cpp)
+
+add_test(NAME test_ecc COMMAND test_ecc)
+add_test(NAME test_edge_cases COMMAND test_edge_cases)
