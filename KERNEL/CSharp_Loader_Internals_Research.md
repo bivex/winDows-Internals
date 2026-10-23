@@ -251,26 +251,82 @@ typedef struct {
 
 ## 5. Execution Pipeline: Classic .NET Framework
 
-### Stage 1: Kernel Creation (`ntoskrnl.exe`)
-1. User or shell invokes `CreateProcessW` $\to$ `ntdll!NtCreateUserProcess`.
-2. The Memory Manager (`nt!MiCreateImageFileMap`) reads the DOS/PE headers.
-3. Kernel inspects `IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR` (Directory 14):
-   - Reads `Flags` from `IMAGE_COR20_HEADER`.
-   - If `COMIMAGE_FLAGS_32BITREQUIRED` is set on 64-bit Windows, the kernel configures the process as a **WOW64** container (`SysWOW64\ntdll.dll`).
-4. System maps the executable image section with `SEC_IMAGE`.
+### Stage 1: Kernel Creation & Image Verification (`ntoskrnl.exe`)
+1. The user or shell invokes `CreateProcessW` $\to$ `ntdll!NtCreateUserProcess`.
+2. In kernel mode, the Memory Manager creates a file-backed section via `nt!MiCreateImageFileMap` $\to$ `nt!MiVerifyImageHeader`.
+3. **Low-Level Header Verification in `nt!MiVerifyImageHeader` (ARM64 Disassembly):**
+   The kernel extracts the PE Optional Header and validates `NumberOfRvaAndSizes`. If greater than 14 (`0xE`), it directly reads Data Directory 14:
+   ```asm
+   ; ntkrnlmp!MiVerifyImageHeader (ARM64)
+   fffff800`545e4708 b9408409 ldr   w9, [x0, #0x84]       ; OptionalHeader.NumberOfRvaAndSizes
+   fffff800`545e470c 7100393f cmp   w9, #0xE              ; Check if DataDirectory[14] exists
+   fffff800`545e4710 54000968 bhi   nt!MiVerifyImageHeader+0x24c
+   ...
+   fffff800`545e483c b940f809 ldr   w9, [x0, #0xF8]       ; DataDirectory[14].VirtualAddress (COM RVA)
+   fffff800`545e4840 b9005149 str   w9, [x10, #0x50]      ; Store into SectionImageInfo
+   fffff800`545e4844 b940fc09 ldr   w9, [x0, #0xFC]       ; DataDirectory[14].Size (COM Size, 0x48)
+   fffff800`545e4848 b9005549 str   w9, [x10, #0x54]      ; Store into SectionImageInfo
+   fffff800`545e484c b940f809 ldr   w9, [x0, #0xF8]
+   fffff800`545e4850 34fff649 cbz   w9, nt!MiVerifyImageHeader+0x128
+   fffff800`545e4854 b940fc09 ldr   w9, [x0, #0xFC]
+   fffff800`545e4858 34fff609 cbz   w9, nt!MiVerifyImageHeader+0x128
+   fffff800`545e485c 32000108 orr   w8, w8, #1            ; SET COM FLAG (Bit 0/1)
+   fffff800`545e4860 b9001548 str   w8, [x10, #0x14]      ; Store ImageFlags into section descriptor
+   ```
+4. **The `_SECTION_IMAGE_INFORMATION` Kernel Structure:**
+   The parsed image state is packaged into `nt!_SECTION_IMAGE_INFORMATION` (`dt nt!_SECTION_IMAGE_INFORMATION`):
+   ```text
+   +0x000 TransferAddress             : Ptr64 Void
+   +0x020 SubSystemType               : Uint4B
+   +0x030 Machine                     : Uint2B (0x14C, 0x8664, 0xAA64)
+   +0x032 ImageContainsCode           : UChar
+   +0x033 ImageFlags                  : UChar
+          +0x033 ComPlusNativeReady   : Pos 0, 1 Bit  (ReadyToRun / NGEN)
+          +0x033 ComPlusILOnly        : Pos 1, 1 Bit  (Pure CIL Assembly)
+          +0x033 ImageDynamicallyRelocated : Pos 2, 1 Bit
+          +0x033 ImageMappedFlat      : Pos 3, 1 Bit
+          +0x033 BaseBelow4gb         : Pos 4, 1 Bit
+          +0x033 ComPlusPrefer32bit   : Pos 5, 1 Bit  (AnyCPU 32-bit Preferred)
+   +0x038 ImageFileSize               : Uint4B
+   ```
+5. **Process Architecture Selection (`nt!PspSelectMachineForProcess`):**
+   During process construction (`nt!PspCreateProcess`), the kernel decides whether an executable runs native 64-bit/ARM64 or under WOW64:
+   ```asm
+   ; ntkrnlmp!PspSelectMachineForProcess (ARM64)
+   fffff800`544f08e0 7940d28a ldrh  w10, [x20, #0x68]     ; Machine type from image information
+   fffff800`544f0904 7105315f cmp   w10, #0x14C           ; Machine == IMAGE_FILE_MACHINE_I386?
+   fffff800`544f0914 3941ae88 ldrb  w8, [x20, #0x6B]      ; ImageFlags byte (+0x033)
+   fffff800`544f0918 36080068 tbz   w8, #1, +0x6c         ; Test Bit 1: ComPlusILOnly
+   fffff800`544f091c 7200011f tst   w8, #1                ; Test Bit 0: ComPlusNativeReady
+   ...
+   fffff800`544f0a1c 3941ae88 ldrb  w8, [x20, #0x6B]      ; Re-read ImageFlags
+   fffff800`544f0a20 36280068 tbz   w8, #5, +0x174        ; Test Bit 5: ComPlusPrefer32bit
+   fffff800`544f0a44 97f8bd51 bl    nt!PspQueryComPlusRunUnderWoW
+   ```
+   * If `ComPlusILOnly == 1` and `ComPlusPrefer32bit == 0`, a 32-bit marked AnyCPU binary is **promoted to native 64-bit/ARM64**.
+   * If `ComPlusPrefer32bit == 1`, or if IFEO specifies `RunUnderWoW` (checked in `nt!PspQueryComPlusRunUnderWoW`), the kernel routes process creation into WOW64.
 
 ### Stage 2: User-Mode Loader Handshake (`ntdll.dll`)
-1. Process boots into user space via `ntdll!LdrInitializeThunk` $\to$ `ntdll!LdrpInitializeProcess`.
-2. The loader builds the dependency Directed Acyclic Graph (`_LDR_DDAG_NODE`).
-3. **OS Entry Point Interception:**
-   - In standard native PE files, `ntdll!LdrpInitializeProcess` transfers control to `OptionalHeader.AddressOfEntryPoint`.
-   - In .NET Framework PEs, `ntdll` detects non-zero `DataDirectory[14]`.
-   - Instead of branching to `AddressOfEntryPoint`, `ntdll` explicitly loads `mscoree.dll` (if not already bound) and executes:
+1. The kernel creates the initial thread and sets instruction pointer to `ntdll!LdrInitializeThunk` $\to$ `ntdll!LdrpInitializeProcess`.
+2. The user-mode loader receives `_SECTION_IMAGE_INFORMATION` from the kernel section object.
+3. **Hardcoded CLR Redirection Data in `ntdll.dll`:**
+   Binary analysis of `C:\Windows\System32\ntdll.dll` reveals dedicated static data structures embedded directly within the Windows loader's `.rdata` section:
+   - **Offset `0x330EC8`:** A static 64-bit `UNICODE_STRING` descriptor:
+     ```text
+     Length = 0x0016 (22 bytes)
+     MaximumLength = 0x0018 (24 bytes)
+     Buffer -> 0x0000000180338058 (Points to "MSCOREE.DLL\0")
+     ```
+   - **Offset `0x330E70`:** ASCII string: `_CorExeMain\0`
+   - **Offset `0x330E80`:** Unicode string: `COMPLUS_InstallRoot\0`
+   - **Offset `0x330EA8`:** Unicode string: `COMPLUS_Version\0`
+4. **OS Entry Point Interception:**
+   - Instead of branching to `OptionalHeader.AddressOfEntryPoint`, `ntdll!LdrpInitializeProcess` verifies the kernel's `ComPlusILOnly` / `ComPlusNativeReady` flags.
+   - `ntdll` dynamically binds `MSCOREE.DLL` and calls:
      ```cpp
      mscoree!_CorExeMain();
      ```
-   - *Fallback protection:* If an external custom loader or older OS attempts to jump to `AddressOfEntryPoint`, the 6-byte native stub (`jmp [__imp__CorExeMain]`) redirects control to the identical destination.
-
+   - *Fallback protection:* If a non-standard loader bypasses this check and transfers control to `AddressOfEntryPoint`, the 6-byte native stub (`FF 25 00 20 40 00` $\to$ `jmp dword ptr [__imp__CorExeMain]`) catches execution and routes it to `mscoree.dll`.
 ### Stage 3: Runtime Shim Dispatch (`mscoree.dll`)
 1. `mscoree.dll` (Microsoft .NET Execution Engine Shim) acts as a runtime router.
 2. Locates `<ApplicationName>.exe.config` in the application directory.
