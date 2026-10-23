@@ -465,13 +465,58 @@ The CLR **never uses `NtSuspendThread`** to pause managed threads for Garbage Co
    If a thread is executing unmanaged/P-Invoke code, the CLR locates the thread's stack and overwrites the return address (`[rsp]`) to point to `clr!OnHijackWorker`. As soon as the unmanaged call returns, the thread immediately enters the CLR suspension handler without needing `NtSuspendThread`.
 
 ### 6.4 JIT Code Heaps & Arbitrary Code Guard (W^X Dual Mapping)
-On modern Windows 10/11 with Arbitrary Code Guard (ACG) enabled, no virtual page may be simultaneously writable and executable (`PAGE_EXECUTE_READWRITE` is blocked).
-To allow JIT compilation under strict ACG:
-* The CLR creates a section object via `NtCreateSection`.
-* Maps **two separate views** of the identical physical RAM pages:
-  1. **RW View (`PAGE_READWRITE`):** Private to RyuJIT compiler threads to write generated machine code.
-  2. **RX View (`PAGE_EXECUTE_READ`):** Exposed to application execution threads to run the compiled code.
-* Once RyuJIT finishes writing native instructions, CPU instruction caches are flushed via `FlushInstructionCache`, and code executes exclusively through the RX view.
+
+On modern Windows 10/11 with **Arbitrary Code Guard (ACG)** active, virtual memory pages cannot be simultaneously writable and executable (`PAGE_EXECUTE_READWRITE` is forbidden), and existing executable pages cannot be written to (`PAGE_READWRITE` $\to$ `PAGE_EXECUTE` protection changes are blocked).
+
+#### 1. Kernel-Level Enforcement (`nt!MiArbitraryCodeBlocked`):
+Reverse-engineering of the Windows Memory Manager in WinDbg reveals the exact check:
+```asm
+; ntkrnlmp!MiArbitraryCodeBlocked (ARM64)
+fffff800`545f5fe0 f944c648 ldr   x8, [xpr, #0x988]     ; x8 = CurrentThread (ETHREAD)
+fffff800`545f5fe4 aa0003f3 mov   x19, x0               ; x19 = CurrentProcess (EPROCESS)
+fffff800`545f5fe8 b948126a ldr   w10, [x19, #0x810]    ; w10 = EPROCESS->MitigationFlags (+0x810)
+fffff800`545f5ff0 3740012a tbnz  w10, #8, +0x44        ; Test Bit 8: DisableDynamicCode
+fffff800`545f5ff4 3758022a tbnz  w10, #0xB, +0x68      ; Test Bit 11: AuditDisableDynamicCode
+...
+; If Bit 8 is set, verify thread opt-out exception:
+fffff800`545f6014 b9458108 ldr   w8, [x8, #0x580]      ; w8 = ETHREAD->CrossThreadFlags (+0x580)
+fffff800`545f6018 3797fee8 tbnz  w8, #0x12, -0x24      ; Test Bit 18 (0x12): DisableDynamicCodeOptOut!
+...
+; If thread did not opt out:
+fffff800`545f602c 97f5d226 bl    nt!EtwTimLogProhibitDynamicCode ; Log ETW violation event
+fffff800`545f6030 18000100 ldr   w0, =0xC0000604       ; STATUS_DYNAMIC_CODE_BLOCKED
+fffff800`545f6034 17fffff4 b     nt!MiArbitraryCodeBlocked+0x34
+```
+
+#### 2. The Underlying Bitfields Discovered in WinDbg:
+* **`_EPROCESS.MitigationFlags` (`+0x810`):**
+  * `Bit 8`: `DisableDynamicCode` (ACG enforcement).
+  * `Bit 9`: `DisableDynamicCodeAllowOptOut` (permits JIT threads to opt out).
+  * `Bit 11`: `AuditDisableDynamicCode` (audit mode logging).
+* **`_ETHREAD.CrossThreadFlags` (`+0x580`):**
+  * `Bit 18`: `DisableDynamicCodeOptOut` (set when a JIT thread enters a code generation scope).
+
+#### 3. RyuJIT W^X Dual-Mapping Architecture:
+To allow runtime code generation under ACG without violating the W^X invariant, modern .NET (CoreCLR) implements a **Dual-View Code Heap (`ExecutableAllocator`)**:
+1. **Section Allocation:** The CLR calls `NtCreateSection` backed by pagefile space.
+2. **Dual Mapping via `NtMapViewOfSection`:**
+   * **View 1 (RW Projection):** Mapped with `PAGE_READWRITE`. Only compiler threads write to this address space. No instruction pointer (`EIP`/`RIP`/`PC`) ever executes here.
+   * **View 2 (RX Projection):** Mapped with `PAGE_EXECUTE_READ`. Pointed to by `MethodDesc` and invoked by application worker threads. This view is strictly immutable.
+3. Both virtual views map to the **exact same physical Page Frame Numbers (PFNs)** in RAM:
+   ```
+   Physical RAM (PFNs) ◄──────────────┐
+            ▲                         │
+            │ (Same physical pages)   │
+   ┌────────┴─────────┐      ┌────────┴─────────┐
+   │  RW Projection   │      │  RX Projection   │
+   │ (Writeable View) │      │ (Executable View)│
+   │  RyuJIT writes   │      │  Threads execute │
+   └──────────────────┘      └──────────────────┘
+   ```
+4. **Thread Opt-Out Mode:**
+   When configured with `DisableDynamicCodeAllowOptOut`, RyuJIT threads call `SetThreadInformation(ThreadDynamicCodePolicy)` to set `ETHREAD->CrossThreadFlags.DisableDynamicCodeOptOut` (Bit 18), write code, and immediately clear the bit.
+5. **Out-of-Process JIT Server:**
+   In ultra-hardened environments (where ACG forbids even in-process section mapping), the JIT compiler runs in an external helper process (`JIT Server`), which writes to the shared memory section and passes the read-only executable handle back to the client process.
 ---
 
 ## 7. Execution Pipeline: Modern .NET (.NET Core / 5 / 6 / 8 / 10)
