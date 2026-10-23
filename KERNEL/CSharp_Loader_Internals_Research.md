@@ -327,17 +327,64 @@ typedef struct {
      mscoree!_CorExeMain();
      ```
    - *Fallback protection:* If a non-standard loader bypasses this check and transfers control to `AddressOfEntryPoint`, the 6-byte native stub (`FF 25 00 20 40 00` $\to$ `jmp dword ptr [__imp__CorExeMain]`) catches execution and routes it to `mscoree.dll`.
-### Stage 3: Runtime Shim Dispatch (`mscoree.dll`)
-1. `mscoree.dll` (Microsoft .NET Execution Engine Shim) acts as a runtime router.
-2. Locates `<ApplicationName>.exe.config` in the application directory.
-3. Parses XML `<supportedRuntime version="v4.0.30319"/>` tags.
-4. Reads the Windows Registry key `HKLM\SOFTWARE\Microsoft\.NETFramework` to identify the highest matching installed CLR version.
-5. Invokes `mscoree!CLRCreateInstance`:
-   - Instantiates `ICLRMetaHost`.
-   - Requests `ICLRRuntimeInfo` for the resolved version.
-   - Calls `ICLRRuntimeInfo::GetInterface(CLSID_CLRRuntimeHost, IID_ICLRRuntimeHost)`.
-   - Invokes `ICLRRuntimeHost::Start()`, which dynamically loads `clr.dll`.
+### Stage 3: Runtime Shim Dispatch (`mscoree.dll` & `mscoreei.dll`)
 
+Empirical reverse-engineering of `mscoree.dll` (outer OS shim) and `mscoreei.dll` (inner execution engine shim) reveals the exact internal pipeline:
+
+#### 1. The Dispatch Thunk (`mscoree!_CorExeMain`):
+In modern Windows (including ARM64EC), `mscoree.dll` exports `_CorExeMain` (Ordinal 105) as a thin entry point that immediately branches to the worker routine:
+```asm
+; C:\Windows\System32\mscoree.dll!_CorExeMain (RVA 0x00002650)
+48 8B C4        mov     rax, rsp
+48 89 58 20     mov     qword ptr [rax+20h], rbx
+55              push    rbp
+5D              pop     rbp
+E9 92 2D 06 00  jmp     mscoree!CorExeMainWorker (RVA 0x000653F0)
+```
+*Note on ARM64:* On Windows on ARM64, `mscoree.dll` is compiled as **ARM64EC**. While the entry stub accepts x64 calls, `CorExeMainWorker` branches into native ARM64 instructions beginning with `pacibsp` (`0xD503237F`).
+
+#### 2. The Implementation Worker (`mscoreei!_CorExeMain`):
+The core hosting and loading logic resides in `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\mscoreei.dll` at RVA `0x0000D5E0`.
+
+Disassembly of `mscoreei!_CorExeMain`:
+```asm
+; Prologue & Stack Frame Setup
+0xd5e0: push    rbp
+0xd5e2: push    rbx
+0xd5e3: push    rdi
+0xd5e4: mov     rbp, rsp
+0xd5e7: sub     rsp, 0x40
+
+; Internal Configuration & Logging Init
+0xd5ef: call    mscoreei!InitErrors
+0xd5f7: mov     edx, 0x91
+0xd5fc: call    mscoreei!LogHelp_Initialize
+
+; Instantiating the MetaHost Interface via CLRCreateInstance
+0xd66b: mov     r8, qword ptr [rbp + 0x30]        ; ppvTarget (Out parameter: &pMetaHost)
+0xd66f: lea     rdx, [rip + 0x6177a]              ; riid: IID_ICLRMetaHost
+0xd676: lea     rcx, [rip + 0x61763]              ; rclsid: CLSID_CLRMetaHost
+0xd67d: call    mscoreei!CLRCreateInstance        ; RVA 0x000175B0
+```
+
+**The Concrete GUIDs Passed:**
+* **`rcx` (`rclsid`):** `{9280188d-0e8e-4867-b30c-7fa83884e8de}` $\equiv$ `CLSID_CLRMetaHost`
+* **`rdx` (`riid`):**   `{d332db9e-b9b3-4125-8207-a14884f53216}` $\equiv$ `IID_ICLRMetaHost`
+
+#### 3. Execution & Exit Code Propagation:
+Once `ICLRMetaHost` is initialized, `_CorExeMain` queries the runtime for the host assembly, binds `clr.dll`, transfers control to the entry point, and captures the managed return value:
+```asm
+0xd6b9: mov     rcx, qword ptr [rbp - 0x18]       ; rcx = pMetaHost
+0xd6bd: mov     rax, qword ptr [rcx]              ; rax = pMetaHost->lpVtbl
+0xd6c0: mov     edx, dword ptr [rbp + 0x20]       ; startup flags / version
+0xd6c3: mov     rax, qword ptr [rax + 0x48]       ; Invoke runtime host slot (+0x48)
+0xd6c7: call    qword ptr [__guard_dispatch_icall] ; Control Flow Guard dispatch
+...
+; Process Termination with Managed Exit Code:
+0xd6dc: mov     ecx, ebx                          ; ecx = exit code returned from managed Main()
+0xd6de: call    qword ptr [KERNEL32!ExitProcess]   ; Direct process exit
+```
+`_CorExeMain` never returns to `ntdll`. When `Program.Main()` terminates, `_CorExeMain` captures the integer exit code in `ebx`, moves it to `ecx`, and directly calls `KERNEL32!ExitProcess`.
 ### Stage 4: Execution Engine Startup (`clr.dll!EEStartup`)
 1. `clr!EEStartup` initializes internal CLR subsystems:
    - **Garbage Collector (`gc.cpp`):** Allocates Gen 0/1/2 heaps, Large Object Heap (LOH), and Pinned Object Heap (POH). Selects Workstation GC (`WKS::gc_heap`) or Server GC (`SVR::gc_heap`).
