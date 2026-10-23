@@ -612,7 +612,146 @@ typedef int (*coreclr_execute_assembly_fn)(
 
 ---
 
-## 8. Comparative Technical Matrix
+## 8. Live Dynamic Process Tracing: .NET 10 vs .NET Framework 4.8.1 (cdb / WinDbg)
+
+To move beyond static analysis and verify the exact live runtime behavior, two standalone test applications were compiled on the Windows 11 ARM64 target and traced from process launch to execution using the command-line WinDbg engine (`cdb.exe` ARM64):
+1. **`C:\test_net10\bin\Release\net10.0\TestNet10.exe`:** .NET 10.0.8 SDK (ARM64 native AppHost + companion DLL).
+2. **`C:\test_netfx.exe`:** .NET Framework 4.8.1 (compiled via `csc.exe /out:C:\test_netfx.exe`).
+
+### 8.1 Modern .NET 10: Step-by-Step Execution Verification
+
+#### 1. Factual Module Load Sequence (`sxe ld`):
+1. `apphost.exe` (mapped at `0x00007ff7'd36b0000`)
+2. `ntdll.dll` $\to$ `KERNEL32.DLL` $\to$ `KERNELBASE.dll` $\to$ `ucrtbase.dll`
+3. `C:\Program Files\dotnet\host\fxr\10.0.8\hostfxr.dll` (loaded dynamically by AppHost)
+4. `C:\Program Files\dotnet\shared\Microsoft.NETCore.App\10.0.8\hostpolicy.dll` (loaded by hostfxr)
+5. `C:\Program Files\dotnet\shared\Microsoft.NETCore.App\10.0.8\coreclr.dll` (loaded by hostpolicy)
+6. `System.Private.CoreLib.dll` (core framework assembly)
+7. `C:\Program Files\dotnet\shared\Microsoft.NETCore.App\10.0.8\clrjit.dll` (loaded by EEJitManager)
+8. `TestNet10.dll` (target managed assembly loaded into default AssemblyLoadContext)
+9. `System.Runtime.dll` $\to$ `System.Console.dll` $\to$ `System.Threading.dll`
+
+#### 2. Call Stack at Runtime Handoff (`coreclr!coreclr_execute_assembly`):
+```text
+Child-SP          RetAddr               Call Site
+00000085`9bb7ec00 00007ff8`0081d6fc     coreclr!coreclr_execute_assembly
+00000085`9bb7ec00 00007ff8`0081ee80     hostpolicy!run_app+0x85c
+00000085`9bb7edd0 00007ff8`05752728     hostpolicy!corehost_main+0x140
+00000085`9bb7eeb0 00007ff8`05751b34     hostfxr!fx_muxer_t::handle_exec_host_command+0x420
+00000085`9bb7f000 00007ff8`05749410     hostfxr!fx_muxer_t::execute+0xe8c
+00000085`9bb7f470 00007ff7`d36b2bac     hostfxr!hostfxr_main_startupinfo+0x90
+00000085`9bb7f540 00007ff7`d36b3610     apphost!exe_start+0x75c
+00000085`9bb7f720 00007ff7`d36c1134     apphost!wmain+0x830
+00000085`9bb7fa90 00007ff7`d36c11d4     apphost!__scrt_common_main_seh+0x11c
+00000085`9bb7fad0 00007ff8`23cf8740     apphost!wmainCRTStartup+0x14
+```
+
+#### 3. Call Stack at JIT Compilation (`clrjit!getJit` via `PreStub`):
+```text
+Child-SP          RetAddr               Call Site
+00000085`9bb7b510 00007fff`ba8a5cd0     clrjit!getJit
+00000085`9bb7b510 00007fff`ba7b4698     coreclr!LoadAndInitializeJIT+0x658
+00000085`9bb7bbd0 00007fff`ba7b4b80     coreclr!EEJitManager::LoadJIT+0xd0
+00000085`9bb7bc40 00007fff`ba783c94     coreclr!UnsafeJitFunction+0xe8
+00000085`9bb7bf60 00007fff`ba783908     coreclr!MethodDesc::JitCompileCodeLocked+0xb4
+00000085`9bb7c060 00007fff`ba782f5c     coreclr!MethodDesc::JitCompileCodeLockedEventWrapper+0x588
+00000085`9bb7c180 00007fff`ba7860f4     coreclr!MethodDesc::JitCompileCode+0x5ac
+00000085`9bb7c240 00007fff`ba785a64     coreclr!CodeVersionManager::PublishVersionableCodeIfNecessary+0x64c
+00000085`9bb7c490 00007fff`ba7851f0     coreclr!MethodDesc::DoPrestub+0x65c
+00000085`9bb7c570 00007fff`ba761218     coreclr!PreStubWorker+0x550
+00000085`9bb7c830 00007fff`a4178bf8     coreclr!ThePreStub+0x50
+```
+
+#### 4. SOS Managed Breakpoint & DAC Notification:
+Setting an unresolved breakpoint on managed code via SOS (`!bpmd TestNet10.dll Program.Main`):
+* The CLR emits internal notification exception **`0xE0444143`** (ASCII `"DAC"` = Data Access Component) upon assembly load.
+* SOS intercepts the event, resolves the metadata token, and tracks JIT compilation:
+  ```text
+  JITTED TestNet10!Program.Main(System.String[])
+  Setting breakpoint: bp 00007FFF5AD34E30 [Program.Main(System.String[])]
+  Breakpoint 1 hit
+  OS Thread Id: 0x147c (0)
+          Child SP               IP Call Site
+  0000001D1337E1A0 00007FFF5AD34E30 Program.Main(System.String[])
+      PARAMETERS:
+          args (<CLR reg>) = 0x0000018f5089cf68
+  ```
+
+#### 5. Disassembly of the Live JIT-Compiled Native ARM64 Code:
+Inspecting memory at `0x00007FFF5AD34E30` (`u @pc L15`):
+```asm
+00007fff`5ad34e30 a9be7bfd stp   fp, lr, [sp, #-0x20]! ; Prologue
+00007fff`5ad34e34 910003fd mov   fp, sp
+00007fff`5ad34e38 f9000fa0 str   x0, [fp, #0x18]       ; Save args (string[])
+; Load string literal "MAIN_REACHED_NET10"
+00007fff`5ad34e3c d28c9900 mov   x0, #0x64C8
+00007fff`5ad34e40 f2a99040 movk  x0, #0x4C82, lsl #0x10
+00007fff`5ad34e44 f2c031e0 movk  x0, #0x18F, lsl #0x20 ; x0 = 0x0000018f4c8264c8
+; Invoke Console.WriteLine(x0)
+00007fff`5ad34e48 d2881801 mov   x1, #0x40C0
+00007fff`5ad34e4c f2ab5de1 movk  x1, #0x5AEF, lsl #0x10
+00007fff`5ad34e50 f2cfffe1 movk  x1, #0x7FFF, lsl #0x20
+00007fff`5ad34e54 f9400021 ldr   x1, [x1]
+00007fff`5ad34e58 d63f0020 blr   x1                    ; Call System.Console.WriteLine
+; Evaluate expression: return args.Length == 0 ? 7 : 9
+00007fff`5ad34e5c f9400fa0 ldr   x0, [fp, #0x18]       ; x0 = args pointer
+00007fff`5ad34e60 b9400800 ldr   w0, [x0, #8]          ; w0 = args.Length (+0x08 in .NET array header!)
+00007fff`5ad34e64 34000080 cbz   w0, +0x10             ; If Length == 0 jump to return 7
+00007fff`5ad34e68 52800120 mov   w0, #9                ; return 9
+00007fff`5ad34e6c a8c27bfd ldp   fp, lr, [sp], #0x20
+00007fff`5ad34e70 d65f03c0 ret
+00007fff`5ad34e74 528000e0 mov   w0, #7                ; return 7
+00007fff`5ad34e78 a8c27bfd ldp   fp, lr, [sp], #0x20
+00007fff`5ad34e7c d65f03c0 ret
+```
+*Empirical observation:* The JIT compiler emitted direct native ARM64 instructions where array bounds check `args.Length` is an offset `[x0, #8]`, and the ternary branch evaluates via `cbz` directly to immediate returns `#7` and `#9`.
+
+---
+
+### 8.2 Classic .NET Framework 4.8.1: Step-by-Step Execution Verification
+
+#### 1. Factual Module Load Sequence (`sxe ld`):
+1. `C:\test_netfx.exe` (mapped at `0x00000000'00c20000`)
+2. `ntdll.dll`
+3. `C:\WINDOWS\System32\xtajit64se.dll` (x64 execution translation engine on ARM64 Windows)
+4. `C:\WINDOWS\SYSTEM32\MSCOREE.DLL` (ARM64EC outer shim)
+5. `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\mscoreei.dll` (AMD64 inner shim)
+6. `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\clr.dll` (CLR execution engine)
+7. `mscorlib.ni.dll` (precompiled Native Image GAC assembly)
+8. `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\clrjit.dll`
+
+#### 2. The Multi-Architecture Transition Call Stack:
+The live call stack captured during process termination demonstrates the multi-layered transition between ARM64EC and AMD64 emulation:
+```text
+  Arch   Child-SP          RetAddr               Call Site
+ ARM64EC 00000000`00d7f1a0 00007ff8`2500713c     ntdll!#NtTerminateProcessActual+0x14
+ ARM64EC 00000000`00d7f1b0 00007ff8`250af800     ntdll!#NtTerminateProcess+0x5c
+ ARM64EC 00000000`00d7f1e0 00007ff8`23d608e0     ntdll!#RtlExitUserProcess+0x90
+ ARM64EC 00000000`00d7f200 00007ff8`23de0f34     KERNEL32!#ExitProcessImplementation+0x10
+ ARM64EC 00000000`00d7f210 00007ff8`0eb7882e     KERNEL32!$ientry_thunk$cdecl$d$i8+0x24   ◄── Thunk to ARM64EC
+   AMD64 00000000`00d7f2c0 00007ff8`0eb7f344     mscoreei!RuntimeDesc::ShutdownAllActiveRuntimes+0x2fa
+   AMD64 00000000`00d7f5a0 00007fff`e48f462b     mscoreei!CLRRuntimeHostInternalImpl::ShutdownAllRuntimesThenExit+0x14
+   AMD64 00000000`00d7f5d0 00007fff`e48f44a9     clr!EEPolicy::ExitProcessViaShim+0x8b
+   AMD64 00000000`00d7f630 00007fff`e48f43fe     clr!SafeExitProcess+0x9d
+   AMD64 00000000`00d7f8b0 00007fff`e48f3f24     clr!HandleExitProcessHelper+0x3e
+   AMD64 00000000`00d7f8e0 00007fff`e48f3e04     clr!_CorExeMainInternal+0xf8
+   AMD64 00000000`00d7f970 00007ff8`0eb6d6da     clr!CorExeMain+0x14
+   AMD64 00000000`00d7f9b0 00007ff8`0581f2cc     mscoreei!CorExeMain+0xfa
+ ARM64EC 00000000`00d7fa10 00007ff8`058051a4     MSCOREE!$iexit_thunk$cdecl$i8$i8+0x1c    ◄── Thunk to AMD64
+ ARM64EC 00000000`00d7fa40 00007ff8`05805404     MSCOREE!#ShellShim__CorExeMain+0xe4
+ ARM64EC 00000000`00d7fa70 00007ff8`23d615f8     MSCOREE!#_CorExeMain_Exported+0x14
+```
+*Execution Lifecycle:*
+1. The binary starts in `MSCOREE!#_CorExeMain_Exported` as ARM64EC code.
+2. Transitions through `$iexit_thunk` into AMD64 mode inside `mscoreei!CorExeMain`.
+3. Calls `clr!CorExeMain` $\to$ executes `Program.Main()` in .NET 4.8.1.
+4. Upon return, `clr!SafeExitProcess` calls `mscoreei` to shut down the runtime.
+5. Transitions through `$ientry_thunk` back into ARM64EC to invoke `KERNEL32!ExitProcessImplementation` and `ntdll!NtTerminateProcess`.
+
+---
+
+## 9. Comparative Technical Matrix
+
 | Parameter | Classic .NET Framework (CLR 4.x) | Modern .NET (.NET 5 – 10) |
 |---|---|---|
 | **Root Executable Format** | Managed PE32/PE32+ (CLI Assembly) | Native Win32/ARM64 PE (AppHost) |
@@ -628,22 +767,25 @@ typedef int (*coreclr_execute_assembly_fn)(
 
 ---
 
-## 9. Security & Offensive Engineering Implications
+## 10. Security & Offensive Engineering Implications
 
-### 9.1 Unmanaged CLR Injection & In-Memory Execution
+### 10.1 Unmanaged CLR Injection & In-Memory Execution
 Because `coreclr.dll` and `mscoree.dll` expose documented C-ABI export functions (`coreclr_initialize` and `CLRCreateInstance`), native unmanaged processes can host the CLR on demand. This enables:
 - Executing managed assemblies purely from unmanaged memory buffers without writing files to disk via `Assembly.Load(byte[])` or `ICLRRuntimeHost::ExecuteInDefaultAppDomain`.
 - Bypassing static file-based security controls (e.g. basic AppLocker path rules).
 
-### 9.2 Antimalware Scan Interface (AMSI) & ETW Bypass Mechanisms
+### 10.2 Antimalware Scan Interface (AMSI) & ETW Bypass Mechanisms
+- **AMSI in CLR:** Before compiling CIL into native machine code, `clr.dll` / `coreclr.dll` submits the assembly buffer to `amsi.dll!AmsiScanBuffer`. Patching the first bytes of `amsi!AmsiScanBuffer` to return `AMSI_RESULT_CLEAN` (`0x00000000`) disables in-memory script and assembly inspection.
 - **ETW Instrumentation:** The CLR emits high-fidelity runtime telemetry via `ntdll!EtwEventWrite` (assembly loads, JIT events, GC allocation). In-memory patch techniques targeting `clr!EtwEventWrite` or `ntdll!EtwEventWrite` blinding suppress runtime tracing.
 
-### 9.3 JIT Trampoline & PreStub Hooking
+### 10.3 JIT Trampoline & PreStub Hooking
+Because every managed method passes through a `PreStub` before JIT compilation, security instrumentation (or offensive rootkits) can manipulate the `MethodDesc` slot table. Hooking the native pointer after `PreStubWorker` executes permits seamless inline hooking of managed functions without modifying the underlying CIL bytecode or invalidating strong name signatures.
 
 ---
 
-## 10. Verification Artifacts & References
+## 11. Verification Artifacts & References
 - ECMA-335 Standard: *Common Language Infrastructure (CLI), 6th Edition*.
 - Windows SDK `<corhdr.h>`: *Common Language Runtime Header Definitions*.
 - Microsoft .NET Runtime Repository: `dotnet/runtime` (`src/coreclr/hosts/`, `src/native/corehost/`).
 - WinDbg Target Session: Windows 11 ARM64 Build 26100.1, Target PID 0 (`ntkrnlmp.exe`).
+- Live Debugger Sessions: `cdb.exe` ARM64 on Windows 11 Pro ARM64 (`TestNet10.exe` PID 0x1b10 / 0x1d0, `test_netfx.exe` PID 0x2a10).
