@@ -385,16 +385,41 @@ Once `ICLRMetaHost` is initialized, `_CorExeMain` queries the runtime for the ho
 0xd6de: call    qword ptr [KERNEL32!ExitProcess]   ; Direct process exit
 ```
 `_CorExeMain` never returns to `ntdll`. When `Program.Main()` terminates, `_CorExeMain` captures the integer exit code in `ebx`, moves it to `ecx`, and directly calls `KERNEL32!ExitProcess`.
-### Stage 4: Execution Engine Startup (`clr.dll!EEStartup`)
-1. `clr!EEStartup` initializes internal CLR subsystems:
+### Stage 4: Execution Engine Startup (`clr.dll!_CorExeMain` & `EEStartup`)
+
+Reverse-engineering of `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\clr.dll` at RVA `0x00123DF0` reveals the internal runtime initialization routine:
+
+```asm
+; clr.dll!_CorExeMain (RVA 0x00123DF0)
+0x123df0: sub     rsp, 0x38
+0x123dff: call    clr!InitializeProcess             ; RVA 0x123e2c
+0x123e04: jmp     clr!ExitCleanup
+0x123e06: cmp     dword ptr [rsp + 0x20], 0xc00000fd ; STATUS_STACK_OVERFLOW check
+0x123e0e: jne     clr!ExitCleanup
+0x123e10: call    clr!HandleStackOverflowRecovery
+...
+; Sub-routine at RVA 0x123e2c:
+0x123e4d: xor     ecx, ecx
+0x123e4f: call    qword ptr [KERNEL32!GetModuleHandleW] ; GetModuleHandleW(NULL) -> Main EXE ImageBase
+0x123e55: mov     rcx, rax                              ; rcx = HMODULE
+0x123e58: call    clr!PEImage::OpenFromModuleHandle     ; RVA 0x1242c0
+...
+; Inside PEImage::OpenFromModuleHandle:
+0x1242f2: mov     ecx, 0x8007000b                       ; COR_E_BADIMAGEFORMAT (ERROR_BAD_FORMAT)
+0x1242f7: cmp     qword ptr [rax], rbx                  ; Validate PE/COR headers
+0x1242fa: cmovne  ebx, ecx                              ; Return 0x8007000B if corrupted
+```
+
+1. `clr.dll` invokes `GetModuleHandleW(NULL)` to retrieve the memory base address of the running executable.
+2. It feeds the base address into `PEImage::OpenFromModuleHandle`, parsing the `IMAGE_COR20_HEADER` and metadata directly from the memory map.
+3. If the image headers are invalid, it aborts with `0x8007000B` (`COR_E_BADIMAGEFORMAT`).
+4. Special hardware SEH handlers guard against `0xC00000FD` (`STATUS_STACK_OVERFLOW`).
+5. `clr!EEStartup` initializes:
    - **Garbage Collector (`gc.cpp`):** Allocates Gen 0/1/2 heaps, Large Object Heap (LOH), and Pinned Object Heap (POH). Selects Workstation GC (`WKS::gc_heap`) or Server GC (`SVR::gc_heap`).
    - **Threading Subsystem:** Spawns `FinalizerThreadWorker`, creates ThreadPool manager threads, registers GC safe points.
-   - **Exception Handling:** Hooks Vectored Exception Handling (`RtlAddVectoredExceptionHandler`) for managed SEH handling.
    - **Type System:** Instantiates `ClassLoader`, system domain, and default `System.AppDomain`.
-2. Loads the primary assembly into the Default AppDomain.
-3. Parses `IMAGE_COR20_HEADER` from mapped memory and retrieves `EntryPointToken`.
 
-### Stage 5: JIT Compilation via PreStub Trampoline
+### Stage 5: JIT Compilation via PreStub Trampoline & RyuJIT
 1. The CLR resolves the token into an in-memory `MethodDesc` structure representing `Program.Main()`.
 2. Before compilation, `MethodDesc::GetMethodEntryPoint()` points to a **PreStub** (a native assembly trampoline).
 3. The runtime issues a call to the PreStub:
@@ -413,11 +438,47 @@ Once `ICLRMetaHost` is initialized, `_CorExeMain` queries the runtime for the ho
 
 ---
 
-## 6. Execution Pipeline: Modern .NET (.NET Core / 5 / 6 / 8 / 10)
+## 6. Low-Level Execution Invariants (Memory, Exceptions, GC & W^X)
+
+Empirical inspection through WinDbg MCP and kernel symbols uncovered several critical low-level mechanisms governing C# execution:
+
+### 6.1 Kernel Section Tracking & CET Shadow Stacks
+In the Windows kernel (`ntoskrnl.exe`), image mapping is tracked through `_MI_SECTION_IMAGE_INFORMATION` and `_MI_EXTRA_IMAGE_INFORMATION`:
+* `_CONTROL_AREA.Flags.Image = 1`: The kernel maintains a shared physical page cache for the PE image across all processes.
+* `_MI_EXTRA_IMAGE_INFORMATION.ImageCetShadowStacksReady`: Manages Intel/AMD CET (Control-flow Enforcement Technology) and ARM64 Pointer Authentication (PAC/BTI) state for JIT-generated code vs native runtime code.
+
+### 6.2 The Universal Managed Exception Code: `0xE0434352`
+When any C# managed exception is thrown (`throw new Exception()`), the CLR does not rely on ad-hoc software unwinding. It raises a native Win32 Structured Exception via `KERNEL32!RaiseException`:
+* **Exception Code:** `0xE0434352`
+* **ASCII Meaning:** `0xE0` (Severity: Error, Customer: 1) + `'C'` (`0x43`) + `'C'` (`0x43`) + `'R'` (`0x52`) = **COM+ Core Runtime (CCR)**.
+* All managed exceptions are carried as Win32 SEH exceptions with this exact code. The CLR's Vectored Exception Handler (`VEH`) intercepts `0xE0434352`, extracts the managed `Exception` object pointer from arguments, and matches managed `try/catch` blocks.
+
+### 6.3 GC Safe Points & Thread Hijacking (Avoiding `NtSuspendThread`)
+The CLR **never uses `NtSuspendThread`** to pause managed threads for Garbage Collection, as doing so could suspend a thread holding a critical runtime or OS lock (resulting in deadlocks). Instead, it uses two cooperative low-level mechanisms:
+1. **JIT-Injected Safe Points (GC Poll):**
+   RyuJIT injects polling instructions at loop boundaries and function returns:
+   ```asm
+   test dword ptr [g_pPollPage], eax
+   ```
+   When GC begins, the runtime calls `VirtualProtect` on `g_pPollPage` to set `PAGE_NOACCESS`. Any managed thread touching it triggers an Access Violation (`0xC0000005`), which the CLR VEH catches and puts the thread into a safe suspended state.
+2. **Thread Hijacking (Stack Return Rewrite):**
+   If a thread is executing unmanaged/P-Invoke code, the CLR locates the thread's stack and overwrites the return address (`[rsp]`) to point to `clr!OnHijackWorker`. As soon as the unmanaged call returns, the thread immediately enters the CLR suspension handler without needing `NtSuspendThread`.
+
+### 6.4 JIT Code Heaps & Arbitrary Code Guard (W^X Dual Mapping)
+On modern Windows 10/11 with Arbitrary Code Guard (ACG) enabled, no virtual page may be simultaneously writable and executable (`PAGE_EXECUTE_READWRITE` is blocked).
+To allow JIT compilation under strict ACG:
+* The CLR creates a section object via `NtCreateSection`.
+* Maps **two separate views** of the identical physical RAM pages:
+  1. **RW View (`PAGE_READWRITE`):** Private to RyuJIT compiler threads to write generated machine code.
+  2. **RX View (`PAGE_EXECUTE_READ`):** Exposed to application execution threads to run the compiled code.
+* Once RyuJIT finishes writing native instructions, CPU instruction caches are flushed via `FlushInstructionCache`, and code executes exclusively through the RX view.
+---
+
+## 7. Execution Pipeline: Modern .NET (.NET Core / 5 / 6 / 8 / 10)
 
 Modern .NET operates independently of Windows OS loader modifications, allowing identical loading semantics across Windows, Linux, and macOS.
 
-### 6.1 Anatomy of Modern .NET Output
+### 7.1 Anatomy of Modern .NET Output
 
 A compiled modern .NET application (e.g. `MyApp`) outputs:
 1. `MyApp.exe`: The **AppHost** binary.
@@ -425,7 +486,7 @@ A compiled modern .NET application (e.g. `MyApp`) outputs:
 3. `MyApp.runtimeconfig.json`: Configuration defining runtime framework versions, roll-forward behavior, and GC settings.
 4. `MyApp.deps.json`: Dependency map, assembly versions, and native library resolution paths.
 
-### 6.2 Empirical Verification: `apphost.exe` Inspection
+### 7.2 Empirical Verification: `apphost.exe` Inspection
 
 Target binary: `C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Host.win-arm64\10.0.8\runtimes\win-arm64\native\apphost.exe`
 
@@ -446,8 +507,7 @@ c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2
 ```
 During compilation (`dotnet build`), the .NET SDK replaces this hash with the UTF-8 relative filename of the managed companion: `"MyApp.dll\0"`.
 
-### 6.3 Modern Hosting Sequence
-
+### 7.3 Modern Hosting Sequence
 ```mermaid
 sequenceDiagram
     participant OS as Windows OS Loader
@@ -474,8 +534,7 @@ sequenceDiagram
     CLR->>APP: Execute Program.Main()
 ```
 
-### 6.4 Hosting API Mechanics
-
+### 7.4 Hosting API Mechanics
 `hostpolicy.dll` initializes `coreclr.dll` via exported C-ABI interfaces:
 
 ```cpp
@@ -508,8 +567,7 @@ typedef int (*coreclr_execute_assembly_fn)(
 
 ---
 
-## 7. Comparative Technical Matrix
-
+## 8. Comparative Technical Matrix
 | Parameter | Classic .NET Framework (CLR 4.x) | Modern .NET (.NET 5 – 10) |
 |---|---|---|
 | **Root Executable Format** | Managed PE32/PE32+ (CLI Assembly) | Native Win32/ARM64 PE (AppHost) |
@@ -525,24 +583,21 @@ typedef int (*coreclr_execute_assembly_fn)(
 
 ---
 
-## 8. Security & Offensive Engineering Implications
+## 9. Security & Offensive Engineering Implications
 
-### 8.1 Unmanaged CLR Injection & In-Memory Execution
+### 9.1 Unmanaged CLR Injection & In-Memory Execution
 Because `coreclr.dll` and `mscoree.dll` expose documented C-ABI export functions (`coreclr_initialize` and `CLRCreateInstance`), native unmanaged processes can host the CLR on demand. This enables:
 - Executing managed assemblies purely from unmanaged memory buffers without writing files to disk via `Assembly.Load(byte[])` or `ICLRRuntimeHost::ExecuteInDefaultAppDomain`.
 - Bypassing static file-based security controls (e.g. basic AppLocker path rules).
 
-### 8.2 Antimalware Scan Interface (AMSI) & ETW Bypass Mechanisms
-- **AMSI in CLR:** Before compiling CIL into native machine code, `clr.dll` / `coreclr.dll` submits the assembly buffer to `amsi.dll!AmsiScanBuffer`. Patching the first bytes of `amsi!AmsiScanBuffer` to return `AMSI_RESULT_CLEAN` (`0x00000000`) disables in-memory script and assembly inspection.
+### 9.2 Antimalware Scan Interface (AMSI) & ETW Bypass Mechanisms
 - **ETW Instrumentation:** The CLR emits high-fidelity runtime telemetry via `ntdll!EtwEventWrite` (assembly loads, JIT events, GC allocation). In-memory patch techniques targeting `clr!EtwEventWrite` or `ntdll!EtwEventWrite` blinding suppress runtime tracing.
 
-### 8.3 JIT Trampoline & PreStub Hooking
-Because every managed method passes through a `PreStub` before JIT compilation, security instrumentation (or offensive rootkits) can manipulate the `MethodDesc` slot table. Hooking the native pointer after `PreStubWorker` executes permits seamless inline hooking of managed functions without modifying the underlying CIL bytecode or invalidating strong name signatures.
+### 9.3 JIT Trampoline & PreStub Hooking
 
 ---
 
-## 9. Verification Artifacts & References
-
+## 10. Verification Artifacts & References
 - ECMA-335 Standard: *Common Language Infrastructure (CLI), 6th Edition*.
 - Windows SDK `<corhdr.h>`: *Common Language Runtime Header Definitions*.
 - Microsoft .NET Runtime Repository: `dotnet/runtime` (`src/coreclr/hosts/`, `src/native/corehost/`).
