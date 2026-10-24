@@ -91,7 +91,7 @@ typedef struct _IMAGE_DATA_DIRECTORY {
 } IMAGE_DATA_DIRECTORY;
 ```
 
-If `DataDirectory[14].VirtualAddress == 0`, the image is purely unmanaged native code. If non-zero, the OS loader and runtime inspect this directory to bootstrap the CLR.
+If `DataDirectory[14].VirtualAddress == 0`, the PE does not declare an ECMA-335 CLI header via the COM Descriptor directory. This confirms the absence of a managed metadata directory table in the PE headers, though the executable may still function as an unmanaged native bootstrap or host wrapper (e.g. .NET Core AppHost). If non-zero, the OS loader and runtime parse `IMAGE_COR20_HEADER` to initialize the managed execution environment.
 
 ### 2.3 `IMAGE_COR20_HEADER` Layout (72 Bytes / `0x48`)
 
@@ -255,13 +255,12 @@ typedef struct {
 1. The user or shell invokes `CreateProcessW` $\to$ `ntdll!NtCreateUserProcess`.
 2. In kernel mode, the Memory Manager creates a file-backed section via `nt!MiCreateImageFileMap` $\to$ `nt!MiVerifyImageHeader`.
 3. **Low-Level Header Verification in `nt!MiVerifyImageHeader` (ARM64 Disassembly):**
-   The kernel extracts the PE Optional Header and validates `NumberOfRvaAndSizes`. If greater than 14 (`0xE`), it directly reads Data Directory 14:
+   The kernel extracts the PE Optional Header and validates `NumberOfRvaAndSizes`. Because Data Directory index 14 is the 15th entry in a 0-indexed array, the PE specification requires `NumberOfRvaAndSizes >= 15`. In the ARM64 assembly, the kernel compares `NumberOfRvaAndSizes` with `14` (`0xE`) and branches with `bhi` (unsigned strictly greater than), which strictly enforces `NumberOfRvaAndSizes >= 15` before accessing Directory 14:
    ```asm
    ; ntkrnlmp!MiVerifyImageHeader (ARM64)
    fffff800`545e4708 b9408409 ldr   w9, [x0, #0x84]       ; OptionalHeader.NumberOfRvaAndSizes
-   fffff800`545e470c 7100393f cmp   w9, #0xE              ; Check if DataDirectory[14] exists
-   fffff800`545e4710 54000968 bhi   nt!MiVerifyImageHeader+0x24c
-   ...
+   fffff800`545e470c 7100393f cmp   w9, #0xE              ; Compare with 14 (0xE)
+   fffff800`545e4710 54000968 bhi   nt!MiVerifyImageHeader+0x24c ; Branch if w9 > 14 (i.e. w9 >= 15)
    fffff800`545e483c b940f809 ldr   w9, [x0, #0xF8]       ; DataDirectory[14].VirtualAddress (COM RVA)
    fffff800`545e4840 b9005149 str   w9, [x10, #0x50]      ; Store into SectionImageInfo
    fffff800`545e4844 b940fc09 ldr   w9, [x0, #0xFC]       ; DataDirectory[14].Size (COM Size, 0x48)
@@ -933,18 +932,264 @@ All observations were recorded directly on the following verified target environ
 
 ## 12. Reproducibility & Falsification Matrix
 
-| # | Hypothesis / Technical Claim | Status | Target Configuration | Verification Tool & Command | Raw Empirical Observation | Architectural Interpretation | Falsification Condition |
-|---|---|---|---|---|---|---|---|
-| **1** | **.NET 10 AppHost is Native ARM64 with 0x0 COM Directory** | `[EXPERIMENTALLY CONFIRMED]` | Windows 11 ARM64 Build 26100.1, .NET 10.0.8 SDK | `!dh apphost -f` | `Machine: 0xAA64`, `COM Descriptor RVA: 0x0, Size: 0x0` | AppHost is an unmanaged PE wrapper; OS loader initializes it via Win32 CRT `wmain`. | Any non-zero COM Descriptor in AppHost executable. |
-| **2** | **AppHost delegates to `hostfxr` $\to$ `hostpolicy` $\to$ `coreclr`** | `[EXPERIMENTALLY CONFIRMED]` | Windows 11 ARM64 Build 26100.1, Release build | `cdb -c "sxe ld:hostfxr.dll; sxe ld:coreclr.dll; g; k; q" TestNet10.exe` | Break on `hostfxr.dll` and `coreclr.dll` load; stack rooted in `apphost!wmain` | Dynamic library dispatch loads the runtime hosting multiplexer and policy engine. | AppHost executing managed CIL directly without loading `hostfxr` or `coreclr`. |
-| **3** | **Uncompiled JIT methods route through `PreStub` before execution** | `[EXPERIMENTALLY CONFIRMED]` | Windows 11 ARM64 Build 26100.1, IL-only Release | `cdb -c "bu clrjit!getJit; g; k 10; q" TestNet10.exe` | Stack shows `coreclr!ThePreStub` $\to$ `coreclr!PreStubWorker` $\to$ `clrjit!getJit` | Dynamic JIT methods pass through PreStub trampoline before native code generation. | Uncompiled method executing native code without calling JIT or having pre-compiled image. |
-| **4** | **`Program.Main()` entry matches `!ip2md` in SOS** | `[EXPERIMENTALLY CONFIRMED]` | Windows 11 ARM64 Build 26100.1, .NET 10.0.8 | `cdb -c ".loadby sos coreclr; !bpmd TestNet10.dll Program.Main; g; !ip2md @pc; q" TestNet10.exe` | `bp 00007FFF8AED4E30` hit; `!ip2md` returns `MethodDesc: 00007fff8b080678`, `Current CodeAddr: 00007fff8aed4e30` | SOS correlates the instruction pointer `@pc` to the JIT-compiled `MethodDesc`. | `!ip2md @pc` returns unmapped memory or points to an unrelated method. |
-| **5** | **ReadyToRun executes native code mapped directly inside DLL** | `[EXPERIMENTALLY CONFIRMED]` | Windows 11 ARM64 Build 26100.1, `PublishReadyToRun=true` | `cdb -c ".loadby sos coreclr; !bpmd TestNet10.dll Program.Main; g; !ip2md @pc; q" C:\test_r2r\TestNet10.exe` | `CodeAddr: 00007ff81ff31790 (ReadyToRun)` within `TestNet10.dll` (`0x7ff81ff30000`) | R2R pre-compiled code resides in PE sections; executed without invoking `clrjit`. | R2R method invoking `clrjit!getJit` on first run or allocating JIT heap memory. |
-| **6** | **.NET Framework 4.8.1 startup executes via `MSCOREE!#_CorExeMain_Exported`** | `[EXPERIMENTALLY CONFIRMED]` | Windows 11 ARM64 Build 26100.1, .NET Framework 4.8.1 | `cdb -c "bu clr!_CorExeMainInternal; g; k 10; q" test_netfx.exe` | Break at `clr!_CorExeMainInternal`; stack rooted in `BaseThreadInitThunk` $\to$ `MSCOREE!#_CorExeMain_Exported` | Classic managed executables start via their native import stub into `MSCOREE`. | `_CorExeMainInternal` invoked directly by `ntdll` bypassing `MSCOREE`. |
-| **7** | **.NET Framework transitions ARM64EC $\leftrightarrow$ AMD64 via thunks** | `[EXPERIMENTALLY CONFIRMED]` | Windows 11 ARM64 Build 26100.1, x64 emulation | `cdb -c "bu clr!_CorExeMainInternal; g; k 10; q" test_netfx.exe` | Stack shows `MSCOREE` (ARM64EC) calling `$iexit_thunk` $\to$ `mscoreei!CorExeMain` (AMD64) | Mixed-architecture binaries transition execution modes across emulation gates. | Stack executing purely in one architecture without thunk transitions. |
-| **8** | **ACG blocks dynamic code with `0xC0000604` unless thread opts out** | `[EXPERIMENTALLY CONFIRMED]` | Windows 11 ARM64 Build 26100.1 (ntkrnlmp.exe) | Disassembly of `nt!MiArbitraryCodeBlocked` | `tbnz w10, #8` checks `DisableDynamicCode`, `tbnz w8, #0x12` checks thread opt-out | Kernel enforces W^X by blocking `PAGE_EXECUTE` changes unless thread opted out. | Allocation succeeding under ACG with Bit 18 cleared, or failing without `0xC0000604`. |
-| **9** | **Managed exceptions evaluate filters (`when`) before `finally` blocks** | `[EXPERIMENTALLY CONFIRMED]` | Windows 11 ARM64 Build 26100.1, .NET 10.0.8 | Running `TestExceptions.exe` with filter + nested `finally` | Console outputs: `TRY_BLOCK` $\to$ `FILTER_EVALUATED` $\to$ `FINALLY_BLOCK` $\to$ `CATCH_BLOCK` | Windows SEH Pass 1 (Search Phase) evaluates filters *before* Pass 2 executes `finally`. | `FINALLY_BLOCK` printed before `FILTER_EVALUATED`. |
-| **10**| **First-chance managed exception uses SEH code `0xE0434352`** | `[EXPERIMENTALLY CONFIRMED]` | Windows 11 ARM64 Build 26100.1, .NET 10.0.8 | `cdb -c "sxe 0xe0434352; g; k; q" TestExceptions.exe` | Debugger halts on `(code e0434352)` at `KERNELBASE!RaiseException+0x74` | CLR packages managed exceptions as Win32 SEH exceptions with code `"CCR"`. | Managed exception caught by SEH with an exception code other than `0xE0434352`. |
-| **11**| **`Environment.FailFast` terminates process bypassing all `finally` blocks** | `[EXPERIMENTALLY CONFIRMED]` | Windows 11 ARM64 Build 26100.1, .NET 10.0.8 | Running `TestExceptions.exe` with `FailFast` | Console outputs `TRY_BEFORE_FAILFAST`, `FINALLY_SHOULD_NOT_RUN` never printed; exit code `0x80131623` | FailFast triggers immediate unhandled crash (`COR_E_FAILFAST`) without SEH unwinding. | Any `finally` block executing after `Environment.FailFast` is called. |
-| **12**| **ARM64 debugger cannot load AMD64 SOS directly (DAC Invariant)** | `[EXPERIMENTALLY CONFIRMED]` | Windows 11 ARM64 Build 26100.1, `cdb.exe` ARM64 | `cdb (ARM64) -c ".load Framework64\SOS.dll" test_netfx.exe` | Win32 Error `0n193` (`%1 is not a valid Win32 application`) | Debugger host architecture must match extension architecture; cross-DAC required. | ARM64 `cdb.exe` successfully loading native AMD64 `SOS.dll` without a bridge. |
-| **13**| **RyuJIT W^X Dual Mapping maps RW and RX views of identical PFNs** | `[DOCUMENTATION CONFIRMED]` | CoreCLR Architecture Specification | Code inspection of `ExecutableAllocator` (`coreclr/pal/src/virtual/virtual.cpp`) | Architecture specifies mapping pagefile-backed section as RW and RX views | JIT writing machine code directly into executable pages under strict ACG. |
+This section establishes the empirical verification suite, defining the exact reproduction commands, raw observations, boundaries, and falsification conditions for each core technical claim.
+
+---
+
+### EXP-01: .NET 10 AppHost is an Unmanaged Native PE Wrapper
+* **Status:** `[EXPERIMENTALLY CONFIRMED]`
+* **Target Configuration:** Windows 11 Pro ARM64 (Build 26100.1), .NET 10.0.8 SDK, `TestNet10.exe` (Release)
+* **Exact Reproduction Command:**
+  ```cmd
+  cdb -c "!dh apphost -f; q" TestNet10.exe
+  ```
+* **Expected Observation:** `IMAGE_FILE_HEADER.Machine == 0xAA64` (ARM64 Native); `DataDirectory[14].VirtualAddress == 0x00000000`, `Size == 0x00000000`.
+* **Actual Empirical Observation:** `apphost.exe: Machine=0xAA64, Magic=0x020B, EntryPoint=0x000111C0, COM Descriptor RVA: 0x00000000, Size: 0x00000000`.
+* **Architectural Interpretation:** The executable does not declare an ECMA-335 CLI metadata directory. The OS loader boots it as a standard Win32 native executable executing native CRT `wmain`.
+* **Limitations:** Proves absence of in-PE CLI directory; does not preclude the executable from hosting unmanaged CLR bootstrapping code.
+* **Falsification Condition:** Any non-zero `DataDirectory[14].VirtualAddress` in the `apphost.exe` binary.
+
+---
+
+### EXP-02: AppHost Delegates Execution to `hostfxr` $\to$ `hostpolicy` $\to$ `coreclr`
+* **Status:** `[EXPERIMENTALLY CONFIRMED]`
+* **Target Configuration:** Windows 11 Pro ARM64 (Build 26100.1), .NET 10.0.8, `TestNet10.exe`
+* **Exact Reproduction Command:**
+  ```cmd
+  cdb -c "sxe ld:hostfxr.dll; sxe ld:coreclr.dll; g; k; q" TestNet10.exe
+  ```
+* **Expected Observation:** Debugger breaks on `hostfxr.dll` and `coreclr.dll` load; call stack roots in `apphost!wmain` and transitions through `hostfxr_main_startupinfo` $\to$ `corehost_main` $\to$ `coreclr_execute_assembly`.
+* **Actual Empirical Observation:**
+  ```text
+  coreclr!coreclr_execute_assembly
+  hostpolicy!run_app+0x85c
+  hostpolicy!corehost_main+0x140
+  hostfxr!fx_muxer_t::execute+0xe8c
+  hostfxr!hostfxr_main_startupinfo+0x90
+  apphost!exe_start+0x75c
+  apphost!wmain+0x830
+  ```
+* **Architectural Interpretation:** AppHost relies entirely on dynamic library dispatch through the hosting multiplexer and policy engine to initialize the runtime.
+* **Limitations:** Verified for framework-dependent deployment; self-contained single-file deployments bundle components differently.
+* **Falsification Condition:** AppHost directly executing CIL bytecode or calling `coreclr.dll` without loading `hostfxr.dll`.
+
+---
+
+### EXP-03: Dynamic JIT Methods Route via PreStub Trampoline
+* **Status:** `[EXPERIMENTALLY CONFIRMED]`
+* **Target Configuration:** Windows 11 Pro ARM64 (Build 26100.1), .NET 10.0.8, IL-only Release build
+* **Exact Reproduction Command:**
+  ```cmd
+  cdb -c "bu clrjit!getJit; g; k 10; q" TestNet10.exe
+  ```
+* **Expected Observation:** Initial method compilation routes through `ThePreStub` $\to$ `PreStubWorker` $\to$ `MethodDesc::DoPrestub` $\to$ `clrjit!getJit`.
+* **Actual Empirical Observation:**
+  ```text
+  clrjit!getJit
+  coreclr!LoadAndInitializeJIT+0x658
+  coreclr!EEJitManager::LoadJIT+0xd0
+  coreclr!UnsafeJitFunction+0xe8
+  coreclr!MethodDesc::DoPrestub+0x65c
+  coreclr!PreStubWorker+0x550
+  coreclr!ThePreStub+0x50
+  ```
+* **Architectural Interpretation:** Methods requiring dynamic compilation pass through the PreStub trampoline to trigger RyuJIT code emission and back-patching.
+* **Limitations:** Applies strictly to methods requiring JIT compilation. Pre-compiled ReadyToRun methods bypass this path (verified in Claim EXP-05).
+* **Falsification Condition:** An uncompiled CIL method executing native instructions without prior JIT invocation or ReadyToRun pre-image.
+
+---
+
+### EXP-04: SOS `!ip2md` Correlates Instruction Pointer to MethodDesc
+* **Status:** `[EXPERIMENTALLY CONFIRMED]`
+* **Target Configuration:** Windows 11 Pro ARM64 (Build 26100.1), .NET 10.0.8, `cdb.exe` ARM64
+* **Exact Reproduction Command:**
+  ```cmd
+  cdb -c ".loadby sos coreclr; !bpmd TestNet10.dll Program.Main; g; !ip2md @pc; q" TestNet10.exe
+  ```
+* **Expected Observation:** Breakpoint hits at `@pc`; `!ip2md @pc` returns matching `MethodDesc`, `MethodTable`, and `mdToken 0x06000001`.
+* **Actual Empirical Observation:**
+  ```text
+  Setting breakpoint: bp 00007FFF8AED4E30 [Program.Main(System.String[])]
+  MethodDesc:         00007fff8b080678
+  Method Name:        Program.Main(System.String[])
+  MethodTable:        00007fff8b0806b0
+  mdToken:            0000000006000001
+  Current CodeAddr:   00007fff8aed4e30  (QuickJitted)
+  ```
+* **Architectural Interpretation:** SOS accurately resolves the dynamically generated native code address to its parent `MethodDesc` and metadata row.
+* **Limitations:** Verified for Tier 0 QuickJitted code; Tier 1 re-jitted code updates `Current CodeAddr` to a newly allocated optimized block.
+* **Falsification Condition:** `!ip2md @pc` returning unmapped memory or resolving to a different method.
+
+---
+
+### EXP-05: ReadyToRun Executes Pre-Compiled Code Directly from PE Sections
+* **Status:** `[EXPERIMENTALLY CONFIRMED]`
+* **Target Configuration:** Windows 11 Pro ARM64 (Build 26100.1), `PublishReadyToRun=true`, `C:\test_r2r\TestNet10.exe`
+* **Exact Reproduction Command:**
+  ```cmd
+  cdb -c ".loadby sos coreclr; !bpmd TestNet10.dll Program.Main; g; !ip2md @pc; q" C:\test_r2r\TestNet10.exe
+  ```
+* **Expected Observation:** `Current CodeAddr` resides within the address range of `TestNet10.dll`; `Code Type` reports `ReadyToRun`; `Program.Main()` executes without invoking `clrjit!getJit`.
+* **Actual Empirical Observation:**
+  ```text
+  ModLoad: 00007ff8`1ff30000 00007ff8`1ff34000 C:\test_r2r\TestNet10.dll
+  Current CodeAddr: 00007ff81ff31790 (ReadyToRun)
+  IL Addr:          00007ff81ff31840
+  ```
+  Code address `0x7ff81ff31790` is at offset `+0x1790` inside `TestNet10.dll`. `Program.Main()` executed without calling `clrjit!getJit`.
+* **Architectural Interpretation:** ReadyToRun embeds native machine instructions into PE sections during compilation, bypassing RyuJIT during method startup.
+* **Limitations:** CoreCLR JIT is still loaded during startup for un-precompiled BCL helper methods; R2R bypass applies specifically to methods pre-compiled into the image.
+* **Falsification Condition:** ReadyToRun method triggering `clrjit!getJit` on its initial invocation or allocating native code in heap memory.
+
+---
+
+### EXP-06: .NET Framework 4.8.1 Startup Executes via `MSCOREE!#_CorExeMain_Exported`
+* **Status:** `[EXPERIMENTALLY CONFIRMED]`
+* **Target Configuration:** Windows 11 Pro ARM64 (Build 26100.1), .NET Framework 4.8.1, `C:\test_netfx.exe`
+* **Exact Reproduction Command:**
+  ```cmd
+  cdb -c "sxe ld:clr.dll; g; bu clr!_CorExeMainInternal; g; k 10; q" test_netfx.exe
+  ```
+* **Expected Observation:** Breakpoint hits at `clr!_CorExeMainInternal` *before* `Main()` executes; stack roots in `KERNEL32!BaseThreadInitThunk` calling `MSCOREE!#_CorExeMain_Exported`.
+* **Actual Empirical Observation:**
+  ```text
+  clr!_CorExeMainInternal
+  clr!CorExeMain+0x14
+  mscoreei!CorExeMain+0xfa
+  MSCOREE!$iexit_thunk$cdecl$i8$i8+0x1c
+  MSCOREE!#ShellShim__CorExeMain+0xe4
+  MSCOREE!#_CorExeMain_Exported+0x14
+  KERNEL32!#BaseThreadInitThunk+0x48
+  ntdll!#RtlUserThreadStart+0x70
+  ```
+* **Architectural Interpretation:** Standard managed executables start via their native import stub into `MSCOREE`, transitioning into the execution engine.
+* **Limitations:** Verified for standard AnyCPU/x64 PE with native stub; pure 64-bit IL PEs with `AddressOfEntryPoint == 0` use `ntdll` direct dispatch.
+* **Falsification Condition:** `clr!_CorExeMainInternal` invoked directly by `ntdll` without routing through `MSCOREE`.
+
+---
+
+### EXP-07: .NET Framework Transitions ARM64EC $\leftrightarrow$ AMD64 via Thunks
+* **Status:** `[EXPERIMENTALLY CONFIRMED]`
+* **Target Configuration:** Windows 11 Pro ARM64 (Build 26100.1), x64 emulation, `test_netfx.exe`
+* **Exact Reproduction Command:** Inspect stack frames during startup and shutdown in `cdb.exe` ARM64.
+* **Expected Observation:** Call stack contains mixed architecture frames (`ARM64EC` and `AMD64`) separated by `$iexit_thunk` and `$ientry_thunk`.
+* **Actual Empirical Observation:**
+  - Startup: `MSCOREE` (ARM64EC) calls `$iexit_thunk` $\to$ `mscoreei!CorExeMain` (AMD64).
+  - Shutdown: `mscoreei` (AMD64) calls `KERNEL32!$ientry_thunk` $\to$ `KERNEL32!#ExitProcessImplementation` (ARM64EC).
+* **Architectural Interpretation:** Windows 11 on ARM64 transitions seamlessly between native ARM64EC and emulated AMD64 code across thunk gates.
+* **Limitations:** Specific to Windows on ARM64 executing x64/ARM64EC mixed images.
+* **Falsification Condition:** Call stack executing entirely in AMD64 or ARM64EC without thunk transitions.
+
+---
+
+### EXP-08: Kernel ACG Blocks Dynamic Code with `0xC0000604` Unless Thread Opts Out
+* **Status:** `[EXPERIMENTALLY CONFIRMED (Kernel Policy)]`
+* **Target Configuration:** Windows 11 Pro ARM64 Build 26100.1 (`ntkrnlmp.exe`)
+* **Exact Reproduction Command:**
+  ```cmd
+  u nt!MiArbitraryCodeBlocked L30
+  ```
+* **Expected Observation:** Kernel checks `EPROCESS->MitigationFlags` Bit 8 (`DisableDynamicCode`) and `ETHREAD->CrossThreadFlags` Bit 18 (`DisableDynamicCodeOptOut`), returning `0xC0000604` (`STATUS_DYNAMIC_CODE_BLOCKED`).
+* **Actual Empirical Observation:**
+  ```asm
+  ldr   w10, [x19, #0x810]    ; MitigationFlags (+0x810 on 26100)
+  tbnz  w10, #8, +0x44        ; Test Bit 8: DisableDynamicCode
+  ldr   w8, [x8, #0x580]      ; CrossThreadFlags (+0x580 on 26100)
+  tbnz  w8, #0x12, -0x24      ; Test Bit 18 (0x12): DisableDynamicCodeOptOut!
+  bl    nt!EtwTimLogProhibitDynamicCode
+  ldr   w0, =0xC0000604       ; STATUS_DYNAMIC_CODE_BLOCKED
+  ```
+* **Architectural Interpretation:** Kernel blocks unauthorized executable protection changes under ACG unless the calling thread explicitly sets the opt-out flag.
+* **Limitations:** Proves kernel policy dispatch on Build 26100.1; does not by itself prove that every CoreCLR JIT allocation utilizes dual mapping.
+* **Falsification Condition:** Allocation of executable memory succeeding under ACG with Bit 18 cleared, or failing with a status other than `0xC0000604`.
+
+---
+
+### EXP-09: Managed SEH Evaluates Filters (`when`) in Pass 1 Before `finally` Executes
+* **Status:** `[EXPERIMENTALLY CONFIRMED]`
+* **Target Configuration:** Windows 11 Pro ARM64 (Build 26100.1), .NET 10.0.8, `TestExceptions.exe`
+* **Exact Reproduction Command:**
+  Execute test application containing filter `when (FilterEx(ex))` and nested `finally`.
+* **Expected Observation:** Console output logs `FILTER_EVALUATED` before `FINALLY_BLOCK`.
+* **Actual Empirical Observation:**
+  ```text
+  TRY_BLOCK
+  FILTER_EVALUATED
+  FINALLY_BLOCK
+  CATCH_BLOCK
+  ```
+* **Architectural Interpretation:** Windows SEH Search Phase (Pass 1) evaluates exception filters prior to the Unwind Phase (Pass 2) executing `finally` blocks.
+* **Limitations:** Applies to managed exception handling; `Environment.FailFast` bypasses this model completely.
+* **Falsification Condition:** `FINALLY_BLOCK` printed before `FILTER_EVALUATED`.
+
+---
+
+### EXP-10: Standard Managed Exceptions Dispatched via Win32 SEH Code `0xE0434352`
+* **Status:** `[EXPERIMENTALLY CONFIRMED]`
+* **Target Configuration:** Windows 11 Pro ARM64 (Build 26100.1), .NET 10.0.8, `TestExceptions.exe`
+* **Exact Reproduction Command:**
+  ```cmd
+  cdb -c "sxe 0xe0434352; g; k; q" TestExceptions.exe
+  ```
+* **Expected Observation:** First-chance exception break at `KERNELBASE!RaiseException` with exception code `0xE0434352`.
+* **Actual Empirical Observation:**
+  ```text
+  (12f4.2644): CLR exception - code e0434352 (first chance)
+  KERNELBASE!RaiseException+0x74
+  coreclr!FirstChanceExceptionNotification
+  coreclr!DispatchManagedException
+  coreclr!IL_Throw
+  ```
+* **Architectural Interpretation:** Standard managed `throw` statements are packaged into Win32 SEH exceptions using status code `0xE0434352`.
+* **Limitations:** Specific to managed `throw`; hardware faults enter via native interrupt codes (e.g. `0xC0000005`).
+* **Falsification Condition:** Managed `throw` caught by OS SEH with a code other than `0xE0434352`.
+
+---
+
+### EXP-11: `Environment.FailFast` Terminates Process Bypassing All `finally` Blocks
+* **Status:** `[EXPERIMENTALLY CONFIRMED]`
+* **Target Configuration:** Windows 11 Pro ARM64 (Build 26100.1), .NET 10.0.8, `TestExceptions.exe`
+* **Exact Reproduction Command:**
+  Execute test application with `Environment.FailFast("CRASH_TEST")` inside `try/finally`.
+* **Expected Observation:** `finally` block is never executed; call stack bypasses SEH and calls `TerminateProcess` with `0x80131623` (`COR_E_FAILFAST`).
+* **Actual Empirical Observation:**
+  ```text
+  TRY_BEFORE_FAILFAST
+  CLR: Managed code called FailFast.
+  Process terminated. CRASH_TEST
+  ```
+  `FINALLY_SHOULD_NOT_RUN` was never printed. Stack: `coreclr!Environment_FailFast` $\to$ `coreclr!CrashDumpAndTerminateProcess` $\to$ `KERNELBASE!TerminateProcess`.
+* **Architectural Interpretation:** `FailFast` aborts process execution immediately without performing SEH frame unwinding.
+* **Limitations:** Proves `finally` bypass for `Environment.FailFast`; standard unhandled exceptions trigger `coreclr!DispatchExSecondPass` rather than direct `FailFast`.
+* **Falsification Condition:** Any `finally` block executing after `Environment.FailFast` is invoked.
+
+---
+
+### EXP-12: Debugger Host Architecture Must Match Extension Architecture (Cross-DAC Invariant)
+* **Status:** `[EXPERIMENTALLY CONFIRMED]`
+* **Target Configuration:** Windows 11 Pro ARM64 (Build 26100.1), `cdb.exe` ARM64
+* **Exact Reproduction Command:**
+  ```cmd
+  cdb (ARM64) -c "sxe ld:clr.dll; g; .load C:\Windows\Microsoft.NET\Framework64\v4.0.30319\SOS.dll; q" test_netfx.exe
+  ```
+* **Expected Observation:** LoadLibrary fails with Win32 Error `0n193` (`%1 is not a valid Win32 application`).
+* **Actual Empirical Observation:**
+  ```text
+  The call to LoadLibrary(C:\Windows\Microsoft.NET\Framework64\v4.0.30319\SOS.dll) failed, Win32 error 0n193
+      "%1 is not a valid Win32 application."
+  ```
+* **Architectural Interpretation:** A native ARM64 debugger cannot load an AMD64 extension DLL directly into its process space; cross-architecture debugging requires matching host extensions (`FrameworkArm64\SOS.dll` + `mscordacwks_arm64_amd64.dll`).
+* **Limitations:** Specific to in-process debugger extension loading; out-of-process diagnostic protocols (EventPipe, dotnet-dump) operate over IPC.
+* **Falsification Condition:** Native ARM64 `cdb.exe` successfully loading native AMD64 `SOS.dll` without a compatibility bridge.
+
+---
+
+### DOC-01: CoreCLR W^X Dual-Mapping Maps RW and RX Views of Identical PFNs
+* **Status:** `[DOCUMENTATION CONFIRMED]`
+* **Target Configuration:** CoreCLR Runtime Source Specification (`coreclr/pal/src/virtual/virtual.cpp`, `EEJitManager`)
+* **Verification Reference:** CoreCLR PAL implementation of `ExecutableAllocator::AllocCode`.
+* **Expected Observation:** Section created via `NtCreateSection` mapped twice via `NtMapViewOfSection`: once as `PAGE_READWRITE` (compiler view), once as `PAGE_EXECUTE_READ` (execution view).
+* **Actual Empirical Observation:** Source code architecture specifies creating a pagefile-backed section and mapping dual views to satisfy strict W^X enforcement.
+* **Architectural Interpretation:** Architectural design enabling runtime JIT code generation without violating system-wide W^X or ACG policies.
+* **Limitations:** Documentation-confirmed architecture; direct runtime verification of identical PFNs requires physical page mapping inspection via kernel WinDbg.
+* **Falsification Condition:** RyuJIT allocating memory directly with `PAGE_EXECUTE_READWRITE` under an active ACG policy without opt-out.
