@@ -186,9 +186,91 @@ g.Greet();
 
 ---
 
-## 5. GC Generational Write Barriers & Card Tables
+## 5. GC Allocation Fast Path & Per-Thread AllocContext
 
-### 5.1 The Generational Invariant & Ephemeral Generations
+### 5.1 Inline Bump-Pointer Mechanics
+For small object allocations (Small Object Heap / SOH), RyuJIT avoids calling the general heap manager. Instead, it emits an **inline bump-pointer allocator**:
+1. Each managed thread owns an **allocation context** (`Thread::m_alloc_context`).
+2. The context defines two pointers: `alloc_ptr` (current free address) and `alloc_limit` (ceiling of current allocation quantum).
+3. If $\text{alloc\_ptr} + \text{object\_size} \le \text{alloc\_limit}$:
+   - The thread commits $\text{alloc\_ptr} += \text{object\_size}$.
+   - Writes `0` to `SyncBlockIndex` at `[x0 - 8]`.
+   - Writes `MethodTable*` at `[x0]`.
+   - **Result:** Allocation completes in 4–5 instructions with **zero locks** and **zero system calls** (lock-free because the quantum is thread-exclusive).
+4. If the bump exceeds `alloc_limit`:
+   - The thread takes the slow path (`coreclr!JIT_New` / `coreclr!WKS::gc_heap::allocate`), fetching a new quantum from the ephemeral segment.
+
+### 5.2 Live Dump of `coreclr!alloc_context` Structure:
+Inspecting `coreclr!g_global_alloc_context` in `cdb` (`dt coreclr!alloc_context 0x00007fffe511a100`):
+```text
+   +0x000 alloc_ptr        : Ptr64 UChar   (Current bump pointer)
+   +0x008 alloc_limit      : Ptr64 UChar   (Quantum ceiling)
+   +0x010 alloc_bytes      : Int8B         (Total allocated bytes in SOH)
+   +0x018 alloc_bytes_uoh  : Int8B         (Total allocated bytes in UOH: LOH/POH)
+   +0x020 gc_reserved_1    : Ptr64 Void
+   +0x028 gc_reserved_2    : Ptr64 Void
+   +0x030 alloc_count      : Int8B
+```
+
+### 5.3 Small Object Heap (SOH) vs. Large Object Heap (LOH) Boundary
+* **Threshold:** Any object whose total allocation size is $\ge \mathbf{85,000 \text{ bytes}}$ is routed to the **Large Object Heap (LOH)**.
+* **Allocation Difference:**
+  - SOH objects (`byte[] small = new byte[1024]`) are allocated via bump pointer inside the thread's ephemeral quantum.
+  - LOH objects (`byte[] large = new byte[90000]`) bypass thread allocation contexts and are allocated directly from a free-list managed by `coreclr!WKS::gc_heap::allocate_large_object`.
+  - LOH objects are never compacted during standard Gen 0/1/2 collections (preventing costly gigabyte memory moves).
+
+---
+
+## 6. SyncBlock & Monitor (`lock`) State Machine
+
+Every managed object header (`[Address - 0x08]`) is an 8-byte word (`ObjHeader`) that manages locking and object identity without wasting memory.
+
+### 6.1 The 4 Header States Observed Empirically
+
+Inspecting memory across different object states in `cdb`:
+
+#### State 0: Unlocked & Unhashed (`objUnlocked`):
+```text
+[objUnlocked - 0x08] = 0x0000000000000000
+```
+* `!syncblk` command returns `Total: 0`. No extra memory is allocated.
+
+#### State 1: Thin Lock (`objThinLocked` held by single thread):
+```text
+[objThinLocked - 0x08] = 0x0000000200000000
+```
+* When `Monitor.Enter(obj)` is called without contention, CoreCLR executes an atomic Compare-And-Swap (`CAS`), writing the current thread ID (`0x00000002`) directly into the header word!
+* `!syncblk` reports `Total: 0`! **Zero memory is allocated in the global SyncTable**.
+
+#### State 2: Hash Code Stored in Header (`objHashed`):
+```text
+[objHashed - 0x08] = 0x0E04280600000000
+```
+* Calling `GetHashCode()` computes a pseudo-random hash and packs it directly into the high bits of the header, setting bit 27 (`BIT_SBLK_IS_HASHCODE` = `0x08000000`).
+
+#### State 3: Fat Lock / Inflated SyncBlock (`objFatLocked`):
+```text
+[objFatLocked - 0x08] = 0x0800000100000000
+```
+* **The Hash & Lock Conflict:** An 8-byte header cannot hold both a thin lock thread ID and a hash code simultaneously. When `Monitor.Enter` is called on an object that already has a hash code (or when lock contention occurs between threads), the lock **inflates**!
+* CoreCLR allocates a real `SyncBlock` from the global `SyncTable`.
+* The header is updated to `0x0800000100000000`:
+  - Bit 27 (`0x08000000`) indicates `BIT_SBLK_IS_HASH_OR_SYNCBLKINDEX`.
+  - Lower index bits store `1` (SyncBlock Index #1).
+* Inspecting `!syncblk` in `cdb`:
+  ```text
+  Index         SyncBlock MonitorHeld Recursion Owning Thread Info          SyncBlock Owner
+      1 000001242D947688            1         1 000001242D1415A0 2f18   0   000001243089d4b0 LockTarget
+  -----------------------------
+  Total           1
+  ```
+* The allocated `SyncBlock` at `0x000001242D947688` holds the native Windows synchronization primitives (`AwareFlatLock`, wait events) and preserves the original hash code.
+
+---
+
+## 7. GC Generational Write Barriers & Card Tables
+
+### 7.1 The Generational Invariant & Ephemeral Generations
 
 In .NET's Generational Garbage Collector (Gen 0, Gen 1, Gen 2):
 * Objects in **Generation 0** and **Generation 1** reside in the **Ephemeral Segment**.
@@ -196,7 +278,7 @@ In .NET's Generational Garbage Collector (Gen 0, Gen 1, Gen 2):
 * Scanning the entire Gen 2 heap (which may span gigabytes) would defeat the purpose of fast ephemeral collections.
 * Therefore, the runtime enforces the **Write Barrier**: whenever an object reference field is updated, the GC is notified if an older object might now point to an ephemeral object.
 
-### 5.2 Live Disassembly: `coreclr!JIT_WriteBarrier` (ARM64)
+### 7.2 Live Disassembly: `coreclr!JIT_WriteBarrier` (ARM64)
 
 In `TestRuntime.exe`, assigning `u.Child = new User();` generates:
 ```asm
@@ -218,7 +300,7 @@ Stepping directly into `coreclr!JIT_WriteBarrier` (`0x00007fff85110030`):
 00007fff`85110044 540003a2 bhs   exit                 ; If NOT ephemeral, skip card marking!
 
 ; 2. Card Table Calculation:
-00007fff`85110048 58001f91 ldr   xip1, [g_card_table] ; Load Card Table Base Address
+00007fff`85110048 58001f91 ldr   xip1, [g_card_table] ; Load Card Table Base Address (0x0000020d3e4ae040)
 00007fff`8511004c 18001fac ldr   w12, [card_shift]    ; Shift amount (11 bits = 2048 bytes)
 00007fff`85110050 9acc25ef lsr   x15, x15, x12        ; Compute card index for source
 00007fff`85110054 8b1101ef add   x15, x15, xip1       ; Card address
@@ -241,7 +323,7 @@ $$\text{Card Byte Address} = \text{g\_card\_table} + (\text{Field Virtual Addres
 
 ---
 
-## 6. P/Invoke IL Stubs & Execution Mode Transitions
+## 8. P/Invoke IL Stubs & Execution Mode Transitions
 
 When calling native unmanaged functions:
 ```csharp
@@ -250,7 +332,7 @@ static extern uint GetCurrentProcessId();
 ```
 The runtime must guarantee that managed Garbage Collection does not pause the calling thread while it is executing inside third-party or OS kernel code.
 
-### 6.1 Cooperative vs. Preemptive State Machine
+### 8.1 Cooperative vs. Preemptive State Machine
 
 ```
               ┌────────────────────────────────────────────────────────┐
@@ -289,7 +371,32 @@ The runtime must guarantee that managed Garbage Collection does not pause the ca
 
 ---
 
-## 7. Verification Artifacts & Test Reproducibility
+## 9. Thread Local Storage (`[ThreadStatic]`) & Hardware TEB (`x18 + 0x58`)
+
+When accessing a `[ThreadStatic]` field:
+```csharp
+[ThreadStatic]
+static int s_threadCounter;
+```
+RyuJIT emits an optimized JIT helper call that reads directly from the OS Thread Environment Block without locking:
+```asm
+; In Program.Main:
+mov   w0, #0x4C            ; Field token offset
+bl    coreclr!JIT_GetNonGCThreadStaticBaseOptimized2
+str   w1, [x0, #0x10]      ; Store directly into thread-local address!
+
+; In coreclr!JIT_GetNonGCThreadStaticBaseOptimized2 (ARM64):
+00007fff`e4dbe154 b945a109 ldr   w9, [x8, #0x5A0]     ; w9 = CLR's TLS slot index
+00007fff`e4dbe158 f9402e48 ldr   x8, [xpr, #0x58]     ; xpr (x18) is TEB -> TEB->ThreadLocalStoragePointer
+00007fff`e4dbe15c f8695908 ldr   x8, [x8, w9 uxtw #3] ; Dereference ThreadLocalStoragePointer[tls_index]
+00007fff`e4dbe164 9108e108 add   x8, x8, #0x238       ; Non-GC static block pointer
+00007fff`e4dbe168 8b204100 add   x0, x8, w0, uxtw #0  ; Target field address returned in x0
+00007fff`e4dbe16c d65f03c0 ret
+```
+
+---
+
+## 10. Verification Artifacts & Test Reproducibility
 
 ### Exact Binaries & Environment:
 * **OS:** Windows 11 Pro ARM64, Build `26100.1` (24H2)
