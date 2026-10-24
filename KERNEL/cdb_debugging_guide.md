@@ -167,31 +167,44 @@ echo using System; class Program { static int Main(string[] args) { Console.Writ
 C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /out:C:\test_netfx.exe C:\test_netfx.cs
 ```
 
-### Step 2: Run Automated `cdb` Session from macOS Host
+### Step 2: Run Automated `cdb` Session to Capture Startup Call Stack
 ```bash
 prlctl exec "Windows 11 Pro (Debugger)" cmd /c \
-  "\"C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\cdb.exe\" -c \"sxe ld:mscoree.dll; sxe ld:clr.dll; g; bu mscoree!_CorExeMain; g; k 15; g; q\" C:\test_netfx.exe"
+  "\"C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\cdb.exe\" -c \"sxe ld:clr.dll; g; bu clr!_CorExeMainInternal; g; k 10; r; q\" C:\test_netfx.exe"
 ```
 
-#### Expected Output on Success:
+#### Expected Startup Output (Before `Main()` Executes):
+```text
+  Arch   Child-SP          RetAddr               Call Site
+   AMD64 00000000`008ffda8 00007fff`ea5a3e04     clr!_CorExeMainInternal
+   AMD64 00000000`008ffdb0 00007ff8`0ed0d6da     clr!CorExeMain+0x14
+   AMD64 00000000`008ffdf0 00007ff8`0581f2cc     mscoreei!CorExeMain+0xfa
+ ARM64EC 00000000`008ffe50 00007ff8`058051a4     MSCOREE!$iexit_thunk$cdecl$i8$i8+0x1c    ◄── Thunk to AMD64
+ ARM64EC 00000000`008ffe80 00007ff8`05805404     MSCOREE!#ShellShim__CorExeMain+0xe4
+ ARM64EC 00000000`008ffeb0 00007ff8`23d615f8     MSCOREE!#_CorExeMain_Exported+0x14
+ ARM64EC 00000000`008ffed0 00007ff8`250afa10     KERNEL32!#BaseThreadInitThunk+0x48
+ ARM64EC 00000000`008ffee0 00000000`00000000     ntdll!#RtlUserThreadStart+0x70
+```
+
+### Step 3: Run Automated `cdb` Session to Capture Shutdown Call Stack
+```bash
+prlctl exec "Windows 11 Pro (Debugger)" cmd /c \
+  "\"C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\cdb.exe\" -c \"sxe ld:mscoree.dll; sxe ld:clr.dll; g; bu mscoree!CorExeMain; g; k 15; g; q\" C:\test_netfx.exe"
+```
+
+#### Expected Shutdown Output (Process Termination Reverse Transition):
 ```text
   Arch   Child-SP          RetAddr               Call Site
  ARM64EC 00000000`00d7f1e0 00007ff8`23d608e0     ntdll!#RtlExitUserProcess+0x90
  ARM64EC 00000000`00d7f200 00007ff8`23de0f34     KERNEL32!#ExitProcessImplementation+0x10
- ARM64EC 00000000`00d7f210 00007ff8`0eb7882e     KERNEL32!$ientry_thunk$cdecl$d$i8+0x24   <-- Thunk back to ARM64EC
+ ARM64EC 00000000`00d7f210 00007ff8`0eb7882e     KERNEL32!$ientry_thunk$cdecl$d$i8+0x24   ◄── Thunk back to ARM64EC
    AMD64 00000000`00d7f2c0 00007ff8`0eb7f344     mscoreei!RuntimeDesc::ShutdownAllActiveRuntimes+0x2fa
    AMD64 00000000`00d7f5a0 00007fff`e48f462b     mscoreei!CLRRuntimeHostInternalImpl::ShutdownAllRuntimesThenExit+0x14
    AMD64 00000000`00d7f5d0 00007fff`e48f44a9     clr!EEPolicy::ExitProcessViaShim+0x8b
    AMD64 00000000`00d7f630 00007fff`e48f43fe     clr!SafeExitProcess+0x9d
    AMD64 00000000`00d7f8b0 00007fff`e48f3f24     clr!HandleExitProcessHelper+0x3e
    AMD64 00000000`00d7f8e0 00007fff`e48f3e04     clr!_CorExeMainInternal+0xf8
-   AMD64 00000000`00d7f970 00007ff8`0eb6d6da     clr!CorExeMain+0x14
-   AMD64 00000000`00d7f9b0 00007ff8`0581f2cc     mscoreei!CorExeMain+0xfa
- ARM64EC 00000000`00d7fa10 00007ff8`058051a4     MSCOREE!$iexit_thunk$cdecl$i8$i8+0x1c    <-- Thunk to AMD64
- ARM64EC 00000000`00d7fa40 00007ff8`05805404     MSCOREE!#ShellShim__CorExeMain+0xe4
- ARM64EC 00000000`00d7fa70 00007ff8`23d615f8     MSCOREE!#_CorExeMain_Exported+0x14
 ```
-
 ---
 
 ## 6. Common Gotchas & Troubleshooting

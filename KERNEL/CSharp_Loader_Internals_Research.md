@@ -320,13 +320,10 @@ typedef struct {
    - **Offset `0x330E70`:** ASCII string: `_CorExeMain\0`
    - **Offset `0x330E80`:** Unicode string: `COMPLUS_InstallRoot\0`
    - **Offset `0x330EA8`:** Unicode string: `COMPLUS_Version\0`
-4. **OS Entry Point Interception:**
-   - Instead of branching to `OptionalHeader.AddressOfEntryPoint`, `ntdll!LdrpInitializeProcess` verifies the kernel's `ComPlusILOnly` / `ComPlusNativeReady` flags.
-   - `ntdll` dynamically binds `MSCOREE.DLL` and calls:
-     ```cpp
-     mscoree!_CorExeMain();
-     ```
-   - *Fallback protection:* If a non-standard loader bypasses this check and transfers control to `AddressOfEntryPoint`, the 6-byte native stub (`FF 25 00 20 40 00` $\to$ `jmp dword ptr [__imp__CorExeMain]`) catches execution and routes it to `mscoree.dll`.
+4. **Execution Handoff to `_CorExeMain`:**
+   - In standard .NET Framework PEs (e.g. `test_netfx.exe`, `SMSvcHost.exe`), `OptionalHeader.AddressOfEntryPoint` points to the native stub in `.text`: `FF 25 [IAT]` (`jmp dword ptr [__imp__CorExeMain]`). The thread starts via `ntdll!#RtlUserThreadStart` $\to$ `KERNEL32!#BaseThreadInitThunk`, which executes this entry point and transfers control directly to `MSCOREE!#_CorExeMain_Exported`.
+   - In pure 64-bit IL-only images where `AddressOfEntryPoint == 0x00000000` (e.g. `InstallUtil.exe`), `ntdll!LdrpInitializeProcess` checks the kernel's `ComPlusILOnly` flag from `_SECTION_IMAGE_INFORMATION` and directly binds and invokes `mscoree!_CorExeMain`.
+   - In both cases, control converges deterministically at `MSCOREE!#_CorExeMain_Exported`.
 ### Stage 3: Runtime Shim Dispatch (`mscoree.dll` & `mscoreei.dll`)
 
 Empirical reverse-engineering of `mscoree.dll` (outer OS shim) and `mscoreei.dll` (inner execution engine shim) reveals the exact internal pipeline:
@@ -448,38 +445,42 @@ In the Windows kernel (`ntoskrnl.exe`), image mapping is tracked through `_MI_SE
 * `_MI_EXTRA_IMAGE_INFORMATION.ImageCetShadowStacksReady`: Manages Intel/AMD CET (Control-flow Enforcement Technology) and ARM64 Pointer Authentication (PAC/BTI) state for JIT-generated code vs native runtime code.
 
 ### 6.2 The Universal Managed Exception Code: `0xE0434352`
-When any C# managed exception is thrown (`throw new Exception()`), the CLR does not rely on ad-hoc software unwinding. It raises a native Win32 Structured Exception via `KERNEL32!RaiseException`:
+When any C# managed exception is thrown (`throw new Exception()`), the CLR maps it to a native Win32 Structured Exception via `KERNEL32!RaiseException`:
 * **Exception Code:** `0xE0434352`
-* **ASCII Meaning:** `0xE0` (Severity: Error, Customer: 1) + `'C'` (`0x43`) + `'C'` (`0x43`) + `'R'` (`0x52`) = **COM+ Core Runtime (CCR)**.
-* All managed exceptions are carried as Win32 SEH exceptions with this exact code. The CLR's Vectored Exception Handler (`VEH`) intercepts `0xE0434352`, extracts the managed `Exception` object pointer from arguments, and matches managed `try/catch` blocks.
+* **ASCII Encoding:** `0xE0` (Severity: Error, Customer: 1) + `'C'` (`0x43`) + `'C'` (`0x43`) + `'R'` (`0x52`) = **COM+ Core Runtime (CCR)**.
+* **Two-Phase SEH Dispatch Model:**
+  Unlike a simplified VEH interceptor, the CLR implements standard Windows 2-pass Structured Exception Handling:
+  1. **First Pass (Search Phase):** Triggered by `KiUserExceptionDispatch` $\to$ `RtlDispatchException`. The CLR's personality routine (`ClrVirtualUnwind` / `EECodeManager::StackWalk`) traverses the stack to evaluate exception filters (`when (...)`) and find a matching `catch` clause.
+  2. **Second Pass (Unwind Phase):** The runtime executes `finally` and `fault` blocks from the faulting frame down to the target handler frame, unwinds stack frames, and restores execution at the `catch` block.
+  3. **VEH Hook Role:** The CLR's Vectored Exception Handler (`VEH`) acts as a global monitor for unhandled crashes, fail-fast scenarios, and hardware exceptions (e.g. Access Violations converted to `NullReferenceException`), but managed `try/catch/finally` control flow is driven by the SEH frame unwinder.
 
-### 6.3 GC Safe Points & Thread Hijacking (Avoiding `NtSuspendThread`)
-The CLR **never uses `NtSuspendThread`** to pause managed threads for Garbage Collection, as doing so could suspend a thread holding a critical runtime or OS lock (resulting in deadlocks). Instead, it uses two cooperative low-level mechanisms:
-1. **JIT-Injected Safe Points (GC Poll):**
-   RyuJIT injects polling instructions at loop boundaries and function returns:
-   ```asm
-   test dword ptr [g_pPollPage], eax
-   ```
-   When GC begins, the runtime calls `VirtualProtect` on `g_pPollPage` to set `PAGE_NOACCESS`. Any managed thread touching it triggers an Access Violation (`0xC0000005`), which the CLR VEH catches and puts the thread into a safe suspended state.
-2. **Thread Hijacking (Stack Return Rewrite):**
-   If a thread is executing unmanaged/P-Invoke code, the CLR locates the thread's stack and overwrites the return address (`[rsp]`) to point to `clr!OnHijackWorker`. As soon as the unmanaged call returns, the thread immediately enters the CLR suspension handler without needing `NtSuspendThread`.
+### 6.3 Thread Suspension & GC Safe Points
+The CLR uses a **cooperative synchronization model** for Garbage Collection rather than relying blindly on uncoordinated OS suspension:
+1. **Cooperative GC Safe Points (GC Poll):**
+   RyuJIT injects polling checks into loop back-edges and method exits. In modern CoreCLR, threads periodically check a thread-local or runtime polling state. In classic CLR configurations, `VirtualProtect` on `g_pPollPage` to `PAGE_NOACCESS` triggers a monitored hardware check.
+2. **Preemptive vs. Cooperative Modes:**
+   Managed threads normally run in *cooperative mode* (must reach a safe point to allow GC). When a thread transitions to unmanaged code (P/Invoke or Win32 syscalls), it switches to *preemptive mode*—allowing GC to proceed without waiting for it.
+3. **Thread Hijacking:**
+   If a thread in preemptive mode returns while a GC is in progress, its stack return address (`[rsp]` / `[sp]`) is redirected to `clr!OnHijackWorker` (or checked via runtime return barrier traps), preventing it from touching managed heap memory until GC completes.
+4. **OS Suspension Fallback:**
+   While cooperative safe points are the primary mechanism, `Thread::SuspendThread` remains an internal engine wrapper capable of leveraging OS suspension when threads become unresponsive in uncooperative runtime states.
 
 ### 6.4 JIT Code Heaps & Arbitrary Code Guard (W^X Dual Mapping)
 
 On modern Windows 10/11 with **Arbitrary Code Guard (ACG)** active, virtual memory pages cannot be simultaneously writable and executable (`PAGE_EXECUTE_READWRITE` is forbidden), and existing executable pages cannot be written to (`PAGE_READWRITE` $\to$ `PAGE_EXECUTE` protection changes are blocked).
 
 #### 1. Kernel-Level Enforcement (`nt!MiArbitraryCodeBlocked`):
-Reverse-engineering of the Windows Memory Manager in WinDbg reveals the exact check:
+Reverse-engineering of the Windows Memory Manager in WinDbg (verified on Windows 11 ARM64 Build 26100.1; internal field offsets vary across builds):
 ```asm
-; ntkrnlmp!MiArbitraryCodeBlocked (ARM64)
+; ntkrnlmp!MiArbitraryCodeBlocked (ARM64, Windows 11 Build 26100.1)
 fffff800`545f5fe0 f944c648 ldr   x8, [xpr, #0x988]     ; x8 = CurrentThread (ETHREAD)
 fffff800`545f5fe4 aa0003f3 mov   x19, x0               ; x19 = CurrentProcess (EPROCESS)
-fffff800`545f5fe8 b948126a ldr   w10, [x19, #0x810]    ; w10 = EPROCESS->MitigationFlags (+0x810)
+fffff800`545f5fe8 b948126a ldr   w10, [x19, #0x810]    ; w10 = EPROCESS->MitigationFlags (+0x810 on 26100)
 fffff800`545f5ff0 3740012a tbnz  w10, #8, +0x44        ; Test Bit 8: DisableDynamicCode
 fffff800`545f5ff4 3758022a tbnz  w10, #0xB, +0x68      ; Test Bit 11: AuditDisableDynamicCode
 ...
 ; If Bit 8 is set, verify thread opt-out exception:
-fffff800`545f6014 b9458108 ldr   w8, [x8, #0x580]      ; w8 = ETHREAD->CrossThreadFlags (+0x580)
+fffff800`545f6014 b9458108 ldr   w8, [x8, #0x580]      ; w8 = ETHREAD->CrossThreadFlags (+0x580 on 26100)
 fffff800`545f6018 3797fee8 tbnz  w8, #0x12, -0x24      ; Test Bit 18 (0x12): DisableDynamicCodeOptOut!
 ...
 ; If thread did not opt out:
@@ -489,11 +490,11 @@ fffff800`545f6034 17fffff4 b     nt!MiArbitraryCodeBlocked+0x34
 ```
 
 #### 2. The Underlying Bitfields Discovered in WinDbg:
-* **`_EPROCESS.MitigationFlags` (`+0x810`):**
+* **`_EPROCESS.MitigationFlags` (`+0x810` on Build 26100):**
   * `Bit 8`: `DisableDynamicCode` (ACG enforcement).
   * `Bit 9`: `DisableDynamicCodeAllowOptOut` (permits JIT threads to opt out).
   * `Bit 11`: `AuditDisableDynamicCode` (audit mode logging).
-* **`_ETHREAD.CrossThreadFlags` (`+0x580`):**
+* **`_ETHREAD.CrossThreadFlags` (`+0x580` on Build 26100):**
   * `Bit 18`: `DisableDynamicCodeOptOut` (set when a JIT thread enters a code generation scope).
 
 #### 3. RyuJIT W^X Dual-Mapping Architecture:
@@ -662,56 +663,69 @@ Child-SP          RetAddr               Call Site
 00000085`9bb7c830 00007fff`a4178bf8     coreclr!ThePreStub+0x50
 ```
 
-#### 4. SOS Managed Breakpoint & DAC Notification:
+#### 4. SOS Managed Breakpoint, DAC Notification & Method Resolution:
 Setting an unresolved breakpoint on managed code via SOS (`!bpmd TestNet10.dll Program.Main`):
 * The CLR emits internal notification exception **`0xE0444143`** (ASCII `"DAC"` = Data Access Component) upon assembly load.
 * SOS intercepts the event, resolves the metadata token, and tracks JIT compilation:
   ```text
   JITTED TestNet10!Program.Main(System.String[])
-  Setting breakpoint: bp 00007FFF5AD34E30 [Program.Main(System.String[])]
+  Setting breakpoint: bp 00007FFF8AED4E30 [Program.Main(System.String[])]
   Breakpoint 1 hit
-  OS Thread Id: 0x147c (0)
+  OS Thread Id: 0x1480 (0)
           Child SP               IP Call Site
-  0000001D1337E1A0 00007FFF5AD34E30 Program.Main(System.String[])
+  000000A71317E4E0 00007FFF8AED4E30 Program.Main(System.String[])
       PARAMETERS:
-          args (<CLR reg>) = 0x0000018f5089cf68
+          args (<CLR reg>) = 0x0000023f4989cf68
+  ```
+* Resolving instruction pointer via `!ip2md @pc`:
+  ```text
+  MethodDesc:         00007fff8b080678
+  Method Name:        Program.Main(System.String[])
+  Class:              00007fff8b0806b0
+  MethodTable:        00007fff8b0806b0
+  mdToken:            0000000006000001 (Table 0x06 MethodDef, RID 0x01)
+  Module:             00007fff8b07ed58
+  IsJitted:           yes
+  Current CodeAddr:   00007fff8aed4e30
+  IL Addr:            0000023f45e92050 (Virtual address of CIL bytecode stream)
+  Code Type:          QuickJitted (Tier 0 JIT compilation)
   ```
 
 #### 5. Disassembly of the Live JIT-Compiled Native ARM64 Code:
-Inspecting memory at `0x00007FFF5AD34E30` (`u @pc L15`):
+Inspecting memory at `0x00007FFF8AED4E30` (`u @pc L15`):
 ```asm
-00007fff`5ad34e30 a9be7bfd stp   fp, lr, [sp, #-0x20]! ; Prologue
-00007fff`5ad34e34 910003fd mov   fp, sp
-00007fff`5ad34e38 f9000fa0 str   x0, [fp, #0x18]       ; Save args (string[])
+00007fff`8aed4e30 a9be7bfd stp   fp, lr, [sp, #-0x20]! ; Prologue
+00007fff`8aed4e34 910003fd mov   fp, sp
+00007fff`8aed4e38 f9000fa0 str   x0, [fp, #0x18]       ; Save args (string[])
 ; Load string literal "MAIN_REACHED_NET10"
-00007fff`5ad34e3c d28c9900 mov   x0, #0x64C8
-00007fff`5ad34e40 f2a99040 movk  x0, #0x4C82, lsl #0x10
-00007fff`5ad34e44 f2c031e0 movk  x0, #0x18F, lsl #0x20 ; x0 = 0x0000018f4c8264c8
+00007fff`8aed4e3c d28c9900 mov   x0, #0x64C8
+00007fff`8aed4e40 f2a99040 movk  x0, #0x4C82, lsl #0x10
+00007fff`8aed4e44 f2c031e0 movk  x0, #0x18F, lsl #0x20 ; x0 = 0x0000018f4c8264c8
 ; Invoke Console.WriteLine(x0)
-00007fff`5ad34e48 d2881801 mov   x1, #0x40C0
-00007fff`5ad34e4c f2ab5de1 movk  x1, #0x5AEF, lsl #0x10
-00007fff`5ad34e50 f2cfffe1 movk  x1, #0x7FFF, lsl #0x20
-00007fff`5ad34e54 f9400021 ldr   x1, [x1]
-00007fff`5ad34e58 d63f0020 blr   x1                    ; Call System.Console.WriteLine
+00007fff`8aed4e48 d2881801 mov   x1, #0x40C0
+00007fff`8aed4e4c f2ab5de1 movk  x1, #0x5AEF, lsl #0x10
+00007fff`8aed4e50 f2cfffe1 movk  x1, #0x7FFF, lsl #0x20
+00007fff`8aed4e54 f9400021 ldr   x1, [x1]
+00007fff`8aed4e58 d63f0020 blr   x1                    ; Call System.Console.WriteLine
 ; Evaluate expression: return args.Length == 0 ? 7 : 9
-00007fff`5ad34e5c f9400fa0 ldr   x0, [fp, #0x18]       ; x0 = args pointer
-00007fff`5ad34e60 b9400800 ldr   w0, [x0, #8]          ; w0 = args.Length (+0x08 in .NET array header!)
-00007fff`5ad34e64 34000080 cbz   w0, +0x10             ; If Length == 0 jump to return 7
-00007fff`5ad34e68 52800120 mov   w0, #9                ; return 9
-00007fff`5ad34e6c a8c27bfd ldp   fp, lr, [sp], #0x20
-00007fff`5ad34e70 d65f03c0 ret
-00007fff`5ad34e74 528000e0 mov   w0, #7                ; return 7
-00007fff`5ad34e78 a8c27bfd ldp   fp, lr, [sp], #0x20
-00007fff`5ad34e7c d65f03c0 ret
+00007fff`8aed4e5c f9400fa0 ldr   x0, [fp, #0x18]       ; x0 = args pointer
+00007fff`8aed4e60 b9400800 ldr   w0, [x0, #8]          ; w0 = args.Length (+0x08 in .NET array header!)
+00007fff`8aed4e64 34000080 cbz   w0, +0x10             ; If Length == 0 jump to return 7
+00007fff`8aed4e68 52800120 mov   w0, #9                ; return 9
+00007fff`8aed4e6c a8c27bfd ldp   fp, lr, [sp], #0x20
+00007fff`8aed4e70 d65f03c0 ret
+00007fff`8aed4e74 528000e0 mov   w0, #7                ; return 7
+00007fff`8aed4e78 a8c27bfd ldp   fp, lr, [sp], #0x20
+00007fff`8aed4e7c d65f03c0 ret
 ```
 *Empirical observation:* The JIT compiler emitted direct native ARM64 instructions where array bounds check `args.Length` is an offset `[x0, #8]`, and the ternary branch evaluates via `cbz` directly to immediate returns `#7` and `#9`.
 
 ---
 
-### 8.2 Classic .NET Framework 4.8.1: Step-by-Step Execution Verification
+### 8.2 Classic .NET Framework 4.8.1: Startup vs. Shutdown Traces
 
 #### 1. Factual Module Load Sequence (`sxe ld`):
-1. `C:\test_netfx.exe` (mapped at `0x00000000'00c20000`)
+1. `C:\test_netfx.exe` (mapped at `0x00000000'004e0000`)
 2. `ntdll.dll`
 3. `C:\WINDOWS\System32\xtajit64se.dll` (x64 execution translation engine on ARM64 Windows)
 4. `C:\WINDOWS\SYSTEM32\MSCOREE.DLL` (ARM64EC outer shim)
@@ -720,34 +734,52 @@ Inspecting memory at `0x00007FFF5AD34E30` (`u @pc L15`):
 7. `mscorlib.ni.dll` (precompiled Native Image GAC assembly)
 8. `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\clrjit.dll`
 
-#### 2. The Multi-Architecture Transition Call Stack:
-The live call stack captured during process termination demonstrates the multi-layered transition between ARM64EC and AMD64 emulation:
+#### 2. Initial Startup Call Stack (Captured at `clr!_CorExeMainInternal`):
+Breaking on `clr!_CorExeMainInternal` *before* `Program.Main()` executes verifies the exact invocation path from OS loader to runtime:
 ```text
   Arch   Child-SP          RetAddr               Call Site
- ARM64EC 00000000`00d7f1a0 00007ff8`2500713c     ntdll!#NtTerminateProcessActual+0x14
- ARM64EC 00000000`00d7f1b0 00007ff8`250af800     ntdll!#NtTerminateProcess+0x5c
- ARM64EC 00000000`00d7f1e0 00007ff8`23d608e0     ntdll!#RtlExitUserProcess+0x90
- ARM64EC 00000000`00d7f200 00007ff8`23de0f34     KERNEL32!#ExitProcessImplementation+0x10
- ARM64EC 00000000`00d7f210 00007ff8`0eb7882e     KERNEL32!$ientry_thunk$cdecl$d$i8+0x24   ◄── Thunk to ARM64EC
-   AMD64 00000000`00d7f2c0 00007ff8`0eb7f344     mscoreei!RuntimeDesc::ShutdownAllActiveRuntimes+0x2fa
-   AMD64 00000000`00d7f5a0 00007fff`e48f462b     mscoreei!CLRRuntimeHostInternalImpl::ShutdownAllRuntimesThenExit+0x14
-   AMD64 00000000`00d7f5d0 00007fff`e48f44a9     clr!EEPolicy::ExitProcessViaShim+0x8b
-   AMD64 00000000`00d7f630 00007fff`e48f43fe     clr!SafeExitProcess+0x9d
-   AMD64 00000000`00d7f8b0 00007fff`e48f3f24     clr!HandleExitProcessHelper+0x3e
-   AMD64 00000000`00d7f8e0 00007fff`e48f3e04     clr!_CorExeMainInternal+0xf8
-   AMD64 00000000`00d7f970 00007ff8`0eb6d6da     clr!CorExeMain+0x14
-   AMD64 00000000`00d7f9b0 00007ff8`0581f2cc     mscoreei!CorExeMain+0xfa
- ARM64EC 00000000`00d7fa10 00007ff8`058051a4     MSCOREE!$iexit_thunk$cdecl$i8$i8+0x1c    ◄── Thunk to AMD64
- ARM64EC 00000000`00d7fa40 00007ff8`05805404     MSCOREE!#ShellShim__CorExeMain+0xe4
- ARM64EC 00000000`00d7fa70 00007ff8`23d615f8     MSCOREE!#_CorExeMain_Exported+0x14
+   AMD64 00000000`008ffda8 00007fff`ea5a3e04     clr!_CorExeMainInternal
+   AMD64 00000000`008ffdb0 00007ff8`0ed0d6da     clr!CorExeMain+0x14
+   AMD64 00000000`008ffdf0 00007ff8`0581f2cc     mscoreei!CorExeMain+0xfa
+ ARM64EC 00000000`008ffe50 00007ff8`058051a4     MSCOREE!$iexit_thunk$cdecl$i8$i8+0x1c    ◄── Thunk to AMD64
+ ARM64EC 00000000`008ffe80 00007ff8`05805404     MSCOREE!#ShellShim__CorExeMain+0xe4
+ ARM64EC 00000000`008ffeb0 00007ff8`23d615f8     MSCOREE!#_CorExeMain_Exported+0x14
+ ARM64EC 00000000`008ffed0 00007ff8`250afa10     KERNEL32!#BaseThreadInitThunk+0x48
+ ARM64EC 00000000`008ffee0 00000000`00000000     ntdll!#RtlUserThreadStart+0x70
 ```
-*Execution Lifecycle:*
-1. The binary starts in `MSCOREE!#_CorExeMain_Exported` as ARM64EC code.
-2. Transitions through `$iexit_thunk` into AMD64 mode inside `mscoreei!CorExeMain`.
-3. Calls `clr!CorExeMain` $\to$ executes `Program.Main()` in .NET 4.8.1.
-4. Upon return, `clr!SafeExitProcess` calls `mscoreei` to shut down the runtime.
-5. Transitions through `$ientry_thunk` back into ARM64EC to invoke `KERNEL32!ExitProcessImplementation` and `ntdll!NtTerminateProcess`.
+*Startup Flow:*
+1. The thread starts in `ntdll!#RtlUserThreadStart` $\to$ `KERNEL32!#BaseThreadInitThunk`.
+2. `BaseThreadInitThunk` calls the PE entry point, which jumps into `MSCOREE!#_CorExeMain_Exported` (running as ARM64EC).
+3. `ShellShim__CorExeMain` routes the call through `$iexit_thunk`, switching the processor execution context from ARM64EC to AMD64.
+4. Execution enters `mscoreei!CorExeMain` and `clr!_CorExeMainInternal` in AMD64 mode to initialize the CLR and run `Program.Main()`.
 
+#### 3. Process Termination Call Stack (Captured at `ntdll!NtTerminateProcess`):
+Breaking on process exit after `Program.Main()` returns demonstrates the shutdown reverse-transition:
+```text
+  Arch   Child-SP          RetAddr               Call Site
+ ARM64EC 00000000`006ff340 00007ff8`2500713c     ntdll!#NtTerminateProcessActual+0x14
+ ARM64EC 00000000`006ff350 00007ff8`250af800     ntdll!#NtTerminateProcess+0x5c
+ ARM64EC 00000000`006ff380 00007ff8`23d608e0     ntdll!#RtlExitUserProcess+0x90
+ ARM64EC 00000000`006ff3a0 00007ff8`23de0f34     KERNEL32!#ExitProcessImplementation+0x10
+ ARM64EC 00000000`006ff3b0 00007ff8`0ed1882e     KERNEL32!$ientry_thunk$cdecl$d$i8+0x24   ◄── Thunk to ARM64EC
+   AMD64 00000000`006ff460 00007ff8`0ed1f344     mscoreei!RuntimeDesc::ShutdownAllActiveRuntimes+0x2fa
+   AMD64 00000000`006ff740 00007fff`ea5a462b     mscoreei!CLRRuntimeHostInternalImpl::ShutdownAllRuntimesThenExit+0x14
+   AMD64 00000000`006ff770 00007fff`ea5a44a9     clr!EEPolicy::ExitProcessViaShim+0x8b
+   AMD64 00000000`006ff7d0 00007fff`ea5a43fe     clr!SafeExitProcess+0x9d
+   AMD64 00000000`006ffa50 00007fff`ea5a3f24     clr!HandleExitProcessHelper+0x3e
+   AMD64 00000000`006ffa80 00007fff`ea5a3e04     clr!_CorExeMainInternal+0xf8
+```
+
+#### 4. Cross-Architecture Debugging Invariant (ARM64 vs. AMD64 DAC):
+When attempting to load the 64-bit AMD64 SOS extension (`Framework64\v4.0.30319\SOS.dll`) into the native ARM64 debugger (`cdb.exe` ARM64), the OS rejects the call:
+```text
+The call to LoadLibrary(C:\Windows\Microsoft.NET\Framework64\v4.0.30319\SOS.dll) failed, Win32 error 0n193
+    "%1 is not a valid Win32 application."
+```
+*Resolution:* On Windows 11 on ARM64, debuggers must use the matching architecture extension:
+- For ARM64 debuggers: `C:\Windows\Microsoft.NET\FrameworkArm64\v4.0.30319\SOS.dll`
+- For x86/WOW64 debuggers: `C:\Windows\Microsoft.NET\Framework\v4.0.30319\SOS.dll`
+- Cross-DAC debugging requires `mscordacwks_arm64_amd64.dll` to read AMD64 runtime structures from an ARM64 debugger host.
 ---
 
 ## 9. Comparative Technical Matrix
@@ -773,10 +805,9 @@ The live call stack captured during process termination demonstrates the multi-l
 Because `coreclr.dll` and `mscoree.dll` expose documented C-ABI export functions (`coreclr_initialize` and `CLRCreateInstance`), native unmanaged processes can host the CLR on demand. This enables:
 - Executing managed assemblies purely from unmanaged memory buffers without writing files to disk via `Assembly.Load(byte[])` or `ICLRRuntimeHost::ExecuteInDefaultAppDomain`.
 - Bypassing static file-based security controls (e.g. basic AppLocker path rules).
-
 ### 10.2 Antimalware Scan Interface (AMSI) & ETW Bypass Mechanisms
-- **AMSI in CLR:** Before compiling CIL into native machine code, `clr.dll` / `coreclr.dll` submits the assembly buffer to `amsi.dll!AmsiScanBuffer`. Patching the first bytes of `amsi!AmsiScanBuffer` to return `AMSI_RESULT_CLEAN` (`0x00000000`) disables in-memory script and assembly inspection.
-- **ETW Instrumentation:** The CLR emits high-fidelity runtime telemetry via `ntdll!EtwEventWrite` (assembly loads, JIT events, GC allocation). In-memory patch techniques targeting `clr!EtwEventWrite` or `ntdll!EtwEventWrite` blinding suppress runtime tracing.
+- **AMSI in CLR:** The CLR integrates with `amsi.dll!AmsiScanBuffer` primarily for dynamic, in-memory assembly loads (e.g. `Assembly.Load(byte[])`), script evaluation hosts, and unmanaged hosting invocations where file-backed disk signatures are absent. Patching the entry of `amsi!AmsiScanBuffer` to return `AMSI_RESULT_CLEAN` (`0x00000000`) neutralizes in-memory payload inspection, though disk-based files remain subject to kernel minifilter / WDAC inspection upon file creation.
+- **ETW Instrumentation:** The CLR emits high-fidelity runtime telemetry via `ntdll!EtwEventWrite` (assembly loads, JIT events, GC allocation). In-memory patch techniques targeting `clr!EtwEventWrite` or `ntdll!EtwEventWrite` suppress runtime event streams, but kernel-level ETW providers (`Microsoft-Windows-Kernel-Process`) remain unblinded.
 
 ### 10.3 JIT Trampoline & PreStub Hooking
 Because every managed method passes through a `PreStub` before JIT compilation, security instrumentation (or offensive rootkits) can manipulate the `MethodDesc` slot table. Hooking the native pointer after `PreStubWorker` executes permits seamless inline hooking of managed functions without modifying the underlying CIL bytecode or invalidating strong name signatures.
@@ -789,3 +820,19 @@ Because every managed method passes through a `PreStub` before JIT compilation, 
 - Microsoft .NET Runtime Repository: `dotnet/runtime` (`src/coreclr/hosts/`, `src/native/corehost/`).
 - WinDbg Target Session: Windows 11 ARM64 Build 26100.1, Target PID 0 (`ntkrnlmp.exe`).
 - Live Debugger Sessions: `cdb.exe` ARM64 on Windows 11 Pro ARM64 (`TestNet10.exe` PID 0x1b10 / 0x1d0, `test_netfx.exe` PID 0x2a10).
+
+---
+
+## 12. Reproducibility & Falsification Matrix
+
+To distinguish empirical facts from hypothesis and provide clear falsification criteria, the following matrix defines the verification experiments:
+
+| # | Hypothesis / Technical Claim | Verification Command in CDB / WinDbg | Expected Empirical Result | Observed Empirical Result | Falsification Condition |
+|---|---|---|---|---|---|
+| **1** | **.NET 10 AppHost is 100% Native ARM64 with 0x0 COM Descriptor** | `!dh apphost -f` | `Machine: AA64`, `DataDirectory[14].VirtualAddress == 0` | `Machine: 0xAA64`, `DataDirectory[14] RVA: 0x0, Size: 0x0` | Any non-zero COM Descriptor in AppHost executable. |
+| **2** | **AppHost delegates execution to `hostfxr` and `coreclr`** | `cdb -c "sxe ld:hostfxr.dll; sxe ld:coreclr.dll; g; k; q" TestNet10.exe` | Breakpoint on `hostfxr.dll` and `coreclr.dll` load with stack rooted in `apphost!wmain` | `apphost!wmain` $\to$ `hostfxr_main_startupinfo` $\to$ `coreclr_execute_assembly` | AppHost executing managed CIL directly without loading `hostfxr` or `coreclr`. |
+| **3** | **Method compilation passes through `PreStub` before native execution** | `cdb -c "bu clrjit!getJit; g; k 10; q" TestNet10.exe` | Stack shows `ThePreStub` $\to$ `PreStubWorker` $\to$ `MethodDesc::DoPrestub` $\to$ `LoadAndInitializeJIT` | Identical stack observed: `coreclr!ThePreStub` $\to$ `coreclr!PreStubWorker` $\to$ `clrjit!getJit` | Method executing native code without prior JIT compilation or NGEN/R2R pre-image. |
+| **4** | **`Program.Main()` entry and JIT address match `!ip2md`** | `cdb -c ".loadby sos coreclr; !bpmd TestNet10.dll Program.Main; g; !ip2md @pc; q" TestNet10.exe` | Breakpoint hits at `@pc` matching `Current CodeAddr` in `!ip2md` | `bp 00007FFF8AED4E30`, `!ip2md` returns `MethodDesc: 00007fff8b080678`, `CodeAddr: 00007fff8aed4e30` | `!ip2md @pc` returns unmapped memory or points to a different method. |
+| **5** | **.NET Framework 4.8.1 startup executes via `MSCOREE!#_CorExeMain_Exported`** | `cdb -c "bu clr!_CorExeMainInternal; g; k 10; q" test_netfx.exe` | Break at `clr!_CorExeMainInternal` with stack rooted in `MSCOREE!#_CorExeMain_Exported` | Stack: `BaseThreadInitThunk` $\to$ `MSCOREE!#_CorExeMain_Exported` $\to$ `$iexit_thunk` $\to$ `clr!_CorExeMainInternal` | `_CorExeMainInternal` invoked directly by `ntdll` without going through `MSCOREE` export stub. |
+| **6** | **ACG blocks dynamic code with `0xC0000604` unless thread opts out** | Disassembly of `nt!MiArbitraryCodeBlocked` | Check Bit 8 (`EPROCESS->MitigationFlags`) and Bit 18 (`ETHREAD->CrossThreadFlags.DisableDynamicCodeOptOut`) | Verified: `tbnz w10, #8` checks `DisableDynamicCode`, `tbnz w8, #0x12` checks thread opt-out | Allocation succeeding under ACG with Bit 18 cleared, or failing with a code other than `0xC0000604`. |
+| **7** | **Universal CLR managed exception code is `0xE0434352`** | `sxe 0xe0434352` in CDB while throwing managed exception | Debugger breaks on first-chance exception `0xE0434352` | Verified across CLR exceptions: Win32 SEH code `0xE0434352` ("CCR") | Managed exception caught by OS SEH with a code other than `0xE0434352`. |
