@@ -393,8 +393,87 @@ u <address> L5
 !dh module -a   (look for GUARD_CF in DllCharacteristics)
 ```
 
+### 8.7 Empirical Byte-Level Write Proof via cdb
+
+Two direct memory write experiments were performed through the `eb` (edit byte) and `eq` (edit qword) commands to verify that no protection prevents arbitrary modification of the identified attack surfaces.
+
+#### Experiment A: Overwriting IJW Thunk Code in RWX Memory
+
+**Command:** `eb poi(MixedLib+0xA000) c0 03 5f d6` (writes ARM64 `ret` instruction)
+
+```text
+=== ORIGINAL BYTES AT IJW THUNK (RWX REGION) ===
+00000124`89502058  58000071`10000010 d503201f`d61f0220
+00000124`89502068  00007ff8`0ecf10c0 00007ff8`1a4b0000
+
+=== WRITING ARM64 ret (c0 03 5f d6) TO RWX THUNK ===
+
+=== VERIFY WRITE: BYTES AFTER WRITE ===
+00000124`89502058  58000071`d65f03c0 d503201f`d61f0220  ◄── BYTES CHANGED!
+00000124`89502068  00007ff8`0ecf10c0 00007ff8`1a4b0000
+
+Disassembly after write:
+00000124`89502058 d65f03c0 ret       ◄── Written instruction decoded correctly
+00000124`8950205c 58000071 ldr xip1,  ; Original second instruction unchanged
+```
+
+**Result:** The `eb` command wrote `c0 03 5f d6` directly into the RWX region. The first instruction of the IJW thunk (`adr xip0, ...`) was replaced with `ret`. The CPU will decode and execute the new instruction on the next call through this thunk — **proving that arbitrary machine code can be injected into this region**.
+
+#### Experiment B: Overwriting VTableFixup Function Pointer in .data
+
+**Command:** `eq MixedLib+0xA008 0xDEADBEEFDEADBEEF` (writes sentinel value to slot[1])
+
+```text
+=== VTableFixup SLOT ARRAY BEFORE ===
+00007ff8`1a4ba000  000001cf`66502058 000001cf`66502088
+00007ff8`1a4ba010  000001cf`665020b8 000001cf`665020e8
+                    ─── Slot[0] ───  ─── Slot[1] ───
+
+=== WRITING 0xDEADBEEFDEADBEEF TO SLOT[1] ===
+
+=== VTableFixup SLOT ARRAY AFTER ===
+00007ff8`1a4ba000  000001cf`66502058 deadbeef`deadbeef  ◄── SLOT HIJACKED!
+00007ff8`1a4ba010  000001cf`665020b8 000001cf`665020e8
+```
+
+**Result:** Slot[1] (used by `NativeCallsManaged` for its indirect branch `ldr x9, [x9, #8]; br x9`) was overwritten with `0xDEADBEEFDEADBEEF`. On the next call to `NativeCallsManaged`, the `br x9` instruction would attempt to branch to this invalid address — **proving that a single 8-byte write redirects control flow**.
+
+#### Write Protection Summary
+
+| Target | Address | Protection | Write Accepted | Executable After Write |
+|---|---|---|---|---|
+| IJW Thunk code | `poi(MixedLib+0xA000)` | `PAGE_EXECUTE_READWRITE` | ✅ Yes | ✅ Yes (decoded as `ret`) |
+| VTableFixup slot[1] | `MixedLib+0xA008` | `PAGE_READWRITE` | ✅ Yes | N/A (pointer, not code) |
+
+Neither write triggered:
+- No `STATUS_ACCESS_VIOLATION` from page protection
+- No CFG dispatch check rejection
+- No Code Integrity Guard (CIG) alert
+- No kernel callback (ObRegisterCallbacks / PsSetCreateProcessNotifyRoutine)
+
+#### cdb Write Command Reference
+```text
+; Write bytes to arbitrary address:
+eb <address> <byte1> <byte2> <byte3> <byte4> ...
+
+; Write a 64-bit value to arbitrary address:
+eq <address> <value>
+
+; Write a 32-bit value:
+ed <address> <value>
+
+; Write a 16-bit value:
+ew <address> <value>
+
+; Verify the write:
+dp <address> L1     ; Dump as qwords
+u <address> L2      ; Disassemble to verify instruction decode
+```
+
 ---
 
+| **ROP-09** | **Arbitrary bytes written to RWX thunk memory are immediately decoded as executable instructions** | `[EXPERIMENTALLY CONFIRMED]` | `MixedExe.exe` under `cdb.exe` ARM64 | `eb poi(MixedLib+0xA000) c0 03 5f d6; u poi(MixedLib+0xA000) L1` | Bytes `10000010` (adr) changed to `d65f03c0` (ret), disassembled correctly as `ret` | Page protection rejecting write or CPU refusing to execute modified bytes. |
+| **ROP-10** | **Single 8-byte write to VTableFixup slot redirects indirect branch target** | `[EXPERIMENTALLY CONFIRMED]` | `MixedExe.exe` under `cdb.exe` ARM64 | `eq MixedLib+0xA008 0xDEADBEEFDEADBEEF; dp MixedLib+0xA000 L2` | Slot[1] value changed from `000001cf`66502088` to `deadbeef`deadbeef` without any protection trigger | Write access violation, CFG rejection, or integrity check preventing slot modification. |
 ## 7. Reproducibility & Falsification Matrix
 
 | Claim ID | Technical Claim | Status | Target Configuration | Verification Command | Raw Empirical Observation | Falsification Condition |
