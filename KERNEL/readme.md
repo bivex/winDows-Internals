@@ -105,6 +105,7 @@ For a detailed from-scratch checklist, see [ColdStart.md](ColdStart.md).
 - [CLR GC Collection Algorithm & Compaction Research](GC_Collection_Algorithm_Research.md) — The closing arch: gc1 phase sequence (mark, plan, relocate, compact), card table scanning, physical memory sliding, finalization queues, and NativeAOT GC identity.
 - [C++/CLI Execution Security Surface Research](RoP_CppCLI_Execution_Research.md) — RWX thunk heap, writable VTableFixup indirect branch targets, and missing Control Flow Guard in mixed-mode assemblies.
 - [C# / .NET Loader Security Surface Research](RoP_CSharp_Loader_Research.md) — CFG-enabled loading pipeline, JIT dual-mapped protection switching, delegate dispatch security, and comparison with C++/CLI attack surface.
+- [NativeAOT Security Surface Research](RoP_NativeAOT_Research.md) — No CFG in NativeAOT binaries, 500+ gadgets in 553KB, interface dispatch cells as writable function pointers, static GC globals.
 
 ### Option B — manual steps
 
