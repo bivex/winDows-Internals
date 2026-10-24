@@ -106,6 +106,7 @@ For a detailed from-scratch checklist, see [ColdStart.md](ColdStart.md).
 - [C++/CLI Execution Security Surface Research](RoP_CppCLI_Execution_Research.md) — RWX thunk heap, writable VTableFixup indirect branch targets, and missing Control Flow Guard in mixed-mode assemblies.
 - [C# / .NET Loader Security Surface Research](RoP_CSharp_Loader_Research.md) — CFG-enabled loading pipeline, JIT dual-mapped protection switching, delegate dispatch security, and comparison with C++/CLI attack surface.
 - [NativeAOT Security Surface Research](RoP_NativeAOT_Research.md) — No CFG in NativeAOT binaries, 500+ gadgets in 553KB, interface dispatch cells as writable function pointers, static GC globals.
+- [Windows 11 Process Mitigation Architecture & CFG Research](Trusted_Processes_CFG_Mitigation_Research.md) — Live kernel analysis of Process Mitigation Policies (`_EPROCESS.MitigationFlags`), PPL hierarchy (`_PS_PROTECTION`), and complete traversal of 133 target processes.
 
 ### Option B — manual steps
 
