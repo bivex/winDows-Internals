@@ -104,6 +104,7 @@ For a detailed from-scratch checklist, see [ColdStart.md](ColdStart.md).
 - [NativeAOT Loader & Execution Internals Research](NativeAOT_Loader_Internals_Research.md) — The 4th loading architecture: zero external CLR modules, statically linked Workstation GC, RhpNewFast bump allocator, and IEEType layout.
 - [CLR GC Collection Algorithm & Compaction Research](GC_Collection_Algorithm_Research.md) — The closing arch: gc1 phase sequence (mark, plan, relocate, compact), card table scanning, physical memory sliding, finalization queues, and NativeAOT GC identity.
 - [C++/CLI Execution Security Surface Research](RoP_CppCLI_Execution_Research.md) — RWX thunk heap, writable VTableFixup indirect branch targets, and missing Control Flow Guard in mixed-mode assemblies.
+- [C# / .NET Loader Security Surface Research](RoP_CSharp_Loader_Research.md) — CFG-enabled loading pipeline, JIT dual-mapped protection switching, delegate dispatch security, and comparison with C++/CLI attack surface.
 
 ### Option B — manual steps
 
