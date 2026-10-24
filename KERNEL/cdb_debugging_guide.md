@@ -207,7 +207,44 @@ prlctl exec "Windows 11 Pro (Debugger)" cmd /c \
 ```
 ---
 
-## 6. Common Gotchas & Troubleshooting
+## 6. Reproducible Recipe 3: Tracing `[ThreadStatic]` & Hardware TEB (`x18 + 0x58`)
+
+This test verifies how CoreCLR compiles C# `[ThreadStatic]` fields to lock-free direct hardware loads from the ARM64 platform register `x18` (pointing to the OS Thread Environment Block).
+
+### Step 1: Run Automated `cdb` Session
+```bash
+prlctl exec "Windows 11 Pro (Debugger)" cmd /c \
+  "\"C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\cdb.exe\" -c \"sxe ld:coreclr.dll; g; bu coreclr!coreclr_execute_assembly; g; .loadby sos coreclr; !bpmd TestTls.dll Program.Main; g; u @pc+0x20 L4; q\" C:\test_tls\bin\Release\net10.0\TestTls.exe"
+```
+
+#### Expected Output:
+```asm
+00007fff`85244e50 52800980 mov     w0, #0x4C            ; Type/field token
+00007fff`85244e54 97fff4c7 bl      coreclr!JIT_GetNonGCThreadStaticBaseOptimized2
+00007fff`85244e58 52800541 mov     w1, #0x2A            ; 42
+00007fff`85244e5c b9001001 str     w1, [x0, #0x10]      ; Store directly into thread-local field
+```
+
+### Step 2: Disassemble the CoreCLR JIT Helper
+```bash
+prlctl exec "Windows 11 Pro (Debugger)" cmd /c \
+  "\"C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\cdb.exe\" -c \"sxe ld:coreclr.dll; g; bu coreclr!coreclr_execute_assembly; g; u coreclr!JIT_GetNonGCThreadStaticBaseOptimized2 L8; q\" C:\test_tls\bin\Release\net10.0\TestTls.exe"
+```
+
+#### Expected Output (Direct `x18 + 0x58` Hardware Access):
+```asm
+coreclr!JIT_GetNonGCThreadStaticBaseOptimized2:
+00007fff`e4dbe154 b945a109 ldr     w9, [x8, #0x5A0]     ; TLS index
+00007fff`e4dbe158 f9402e48 ldr     x8, [xpr, #0x58]     ; xpr (x18) is TEB -> TEB->ThreadLocalStoragePointer
+00007fff`e4dbe15c f8695908 ldr     x8, [x8, w9 uxtw #3] ; TLS vector dereference
+00007fff`e4dbe164 9108e108 add     x8, x8, #0x238       ; Non-GC static block pointer
+00007fff`e4dbe168 8b204100 add     x0, x8, w0, uxtw #0  ; Return target field address in x0
+00007fff`e4dbe16c d65f03c0 ret
+```
+
+---
+
+## 7. Common Gotchas & Troubleshooting
 
 | Symptom | Root Cause | Fix |
 |---|---|---|
