@@ -884,7 +884,27 @@ Process terminated. CRASH_TEST
   000000e7`d718dcd0 00007fff`e4ebb0d0     coreclr!EEPolicy::HandleFatalError+0x128
   000000e7`d718e160 00007fff`c5ce9bd0     coreclr!Environment_FailFast+0x1c0
   ```
-* Exit Code: `0x80131623` (`COR_E_FAILFAST`).
+* **Diagnostic Code vs. Exit Status:** The internal failure HRESULT passed into `TerminateProcess` is `0x80131623` (`COR_E_FAILFAST`). The process terminates with `STATUS_FAIL_FAST_EXCEPTION` (`0xC0000602`), recorded by the operating system as termination status `255` / `-1`.
+
+#### 4. Unhandled Managed Exception & Second-Chance Crash:
+When an exception is thrown without a matching `catch` block (`throw new InvalidOperationException("UNHANDLED_DEMO")`):
+1. **First-Chance Phase:** `KERNELBASE!RaiseException(0xE0434352)` is caught by CoreCLR; the stack frame iterator (`coreclr!SfiInit`) traverses the stack and finds no matching `catch` handler.
+2. **Telemetry Output:** CoreCLR outputs unhandled exception diagnostics to stderr:
+   ```text
+   Unhandled exception. System.InvalidOperationException: UNHANDLED_DEMO
+      at Program.Main() in C:\test_exceptions\Program.cs:line 5
+   ```
+3. **Second-Chance Phase:** CoreCLR invokes `coreclr!DispatchExSecondPass` $\to$ `KERNELBASE!RaiseException(0xE0434352)`. WinDbg reports:
+   ```text
+   (2b98.11d8): CLR exception - code e0434352 (!!! second chance !!!)
+   Child-SP          RetAddr               Call Site
+   000000fd`591dc820 00007fff`e4d0bdb0     KERNELBASE!RaiseException+0x74
+   000000fd`591dc8d0 00007fff`e4d0b47c     coreclr!SfiNextWorker+0x200
+   000000fd`591dca10 00007fff`e4d27ae8     coreclr!DispatchExSecondPass+0xc4
+   000000fd`591dca70 00007fff`e4dd550c     coreclr!DispatchManagedException+0x1c0
+   000000fd`591ddb50 00007fff`85234ed8     coreclr!IL_Throw+0xdc
+   ```
+4. The process terminates due to an unhandled crash, distinct from the clean return of handled exceptions or the immediate fatal termination of `FailFast`.
 
 ---
 
