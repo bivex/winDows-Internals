@@ -5,7 +5,6 @@
 **Compiler:** Microsoft (R) C/C++ Optimizing Compiler Version `19.51.36246` for ARM64 (`/clr`)  
 **Debugger:** `cdb.exe` ARM64 (DbgEng `10.0.26100.6584`)  
 **Target Binary:** `C:\test_cppcli\MixedLib.dll` (Mixed-Mode PE, ARM64)  
-**Target File:** `/Volumes/External/Code/winDows-Internals/KERNEL/RoP_CppCLI_Execution_Research.md`  
 
 ---
 
@@ -25,13 +24,14 @@ SECURITY-RELEVANT MEMORY MAP OF C++/CLI PROCESS:
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  ADDRESS RANGE           │ PROTECTION            │ CONTENTS             │
 ├─────────────────────────────────────────────────────────────────────────┤
-│  00007ff8`1a4b1000      │ PAGE_EXECUTE_READ     │ .text (Native code) │
-│  00007ff8`1a4ba000      │ PAGE_READWRITE    ◄── │ .data (VTableFixup)│
-│                         │                      │   Writable pointers │
-│  00000277`be500000      │ PAGE_EXECUTE_     ◄── │ CLR Thunk Heap      │
-│                         │   READWRITE           │   IJW stubs + data  │
-│  0000010d`30ee0000      │ PAGE_READWRITE        │ CLR Loader Data     │
-│  00007fff`8af10020      │ PAGE_EXECUTE_READWRITE│ JIT Code Heap       │
+│  00007ff8`1a4b1000      │ PAGE_EXECUTE_READ     │ .text (Native code)  │
+│  00007ff8`1a4ba000      │ PAGE_READWRITE    ◄── │ .data (VTableFixup)  │
+│                         │                      │  Writable pointers   │
+│  00000277`be500000      │ PAGE_EXECUTE_     ◄── │ CLR Thunk Heap       │
+│                         │   READWRITE          │  IJW stubs + data    │
+│  0000010d`30ee0000      │ PAGE_READWRITE       │ CLR Loader Data      │
+│  00007fff`8af10020      │ PAGE_EXECUTE_        │ JIT Code Heap        │
+│                         │   READWRITE          │                      │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -57,7 +57,7 @@ Allocation Base:        00000277`be000000
 Allocation Protect:     00000004          PAGE_READWRITE
 ```
 
-### 2.2 Security Implications of RWX Thunk Memory:
+### 2.2 Security Implications of RWX Thunk Memory
 
 | Property | Value | Security Impact |
 |---|---|---|
@@ -71,7 +71,7 @@ Allocation Protect:     00000004          PAGE_READWRITE
 - Modify the embedded 32-byte descriptor packet (handler address, module base, MethodDef token).
 - Redirect all subsequent managed-to-native crossovers through the compromised thunk.
 
-### 2.3 Thunk Layout at RWX Addresses:
+### 2.3 Thunk Layout at RWX Addresses
 
 ```asm
 ; RWX Region at 00000277`be502058:
@@ -113,6 +113,7 @@ The VTableFixup slot resides in the module's `.data` section. Although the overa
 ### 3.2 Unprotected Indirect Branch Path
 
 The native export `NativeCallsManaged` performs:
+
 ```asm
 ; MixedLib!NativeCallsManaged:
 00007ff8`1a4b1238 b0000049 adrp    x9, MixedLib+0xA000   ; Compute slot address
@@ -122,13 +123,13 @@ The native export `NativeCallsManaged` performs:
 
 **Key Observation:** The `br x9` instruction performs an **unvalidated indirect branch**. The target address is loaded from a `PAGE_READWRITE` page. If any write primitive modifies the slot value, the next call to `NativeCallsManaged` will redirect execution to the attacker-controlled address.
 
-### 3.3 Control Flow Hijack Scenario (Theoretical):
+### 3.3 Control Flow Hijack Scenario
 
 ```
 Normal Flow:
-  NativeCallsManaged() 
+  NativeCallsManaged()
     → [0x1a4ba000] = 0x00000277be502058 (IJW Thunk)
-    → br 0x00000277be502058 
+    → br 0x00000277be502058
     → mscoreei!VTableBootstrapThunkInitHelperStub
     → clr!IJWNOADThunk::FindThunkTarget
     → JIT Compile ManagedClass::Compute
@@ -146,7 +147,7 @@ Hijacked Flow (requires arbitrary write to 0x1a4ba000):
 
 ## 4. Control Flow Guard (CFG) Absence in Mixed-Mode PE
 
-### 4.1 Empirical DllCharacteristics Extraction:
+### 4.1 Empirical DllCharacteristics Extraction
 
 ```text
 DllCharacteristics: 0x0160
@@ -157,7 +158,7 @@ DllCharacteristics: 0x0160
   GUARD_CF:                False  (bit 0x8000 NOT SET)  ◄── MISSING!
 ```
 
-### 4.2 Implication of Missing CFG:
+### 4.2 Implication of Missing CFG
 
 | CFG Mechanism | Pure Native (`cl /EHsc`) | Mixed-Mode (`cl /clr`) |
 |---|---|---|
@@ -176,7 +177,7 @@ Without CFG, the `br x9` instruction at `0x1a4b1240` will branch to **any addres
 
 ## 5. ARM64 Gadget Surface in Mixed-Mode Native Sections
 
-### 5.1 Section Layout:
+### 5.1 Section Layout
 
 ```text
 Section .text: RVA 0x00001000 - 0x000032DC  (8,924 bytes of native ARM64 code)
@@ -186,7 +187,7 @@ Section .pdata: RVA 0x0000B000 - 0x0000B158 (Exception unwind info)
 Section .reloc: RVA 0x0000C000 - 0x0000C02C (Relocations)
 ```
 
-### 5.2 Function Pointer Indirection Gadgets:
+### 5.2 Function Pointer Indirection Gadgets
 
 The compiled native code within `MixedLib.dll` contains multiple instances of the `adrp + ldr + br` sequence that read targets from writable memory:
 
@@ -202,7 +203,7 @@ ldr   x8, [x8]
 br    x8
 ```
 
-### 5.3 CIL-Level Indirect Calls:
+### 5.3 CIL-Level Indirect Calls
 
 At the managed CIL level, every interface method invocation uses an indirect dispatch through the `MethodTable` vtable slot or interface dispatch map. If the `MethodTable` pointer in an object header can be corrupted, the subsequent `ldrb`/`ldr`/`blr` sequence will branch through attacker-controlled data.
 
@@ -210,7 +211,7 @@ At the managed CIL level, every interface method invocation uses an indirect dis
 
 ## 6. Mitigation Landscape for C++/CLI
 
-### 6.1 Currently Available Defenses:
+### 6.1 Currently Available Defenses
 
 | Mitigation | Status | Effectiveness for Mixed-Mode |
 |---|---|---|
@@ -220,24 +221,23 @@ At the managed CIL level, every interface method invocation uses an indirect dis
 | **XFG** | **NOT ENABLED** | Type-based CFG is not compiled in. |
 | **CET / BTI (ARM64 BTI)** | Unknown | ARM64 Branch Target Identification requires hardware and compiler support. |
 
-### 6.2 Architectural Recommendations:
+### 6.2 Architectural Recommendations
 
 1. **Enable `/guard:cf` in C++/CLI builds:** Even though the CLR's internal thunks bypass CFG, the native code within the mixed assembly can still be compiled with valid call target enumeration.
 2. **Reduce writable function pointer surface:** Consider runtime patching of VTableFixup slots to `PAGE_READONLY` after JIT resolution.
 3. **Monitor RWX allocations:** Security tools should flag the CLR's thunk heap allocation (`PAGE_EXECUTE_READWRITE`) as anomalous in processes that should not generate dynamic code.
 4. **Validate thunk descriptors:** Integrity checking of the embedded descriptor packets could detect tampering with handler addresses or MethodDef tokens.
 
-
 ---
 
-## 8. ARM64 ROP Gadget Analysis via cdb
+## 7. ARM64 ROP Gadget Analysis via cdb
 
 On ARM64, Return-Oriented Programming uses different gadget terminators than x86. Instead of a single `ret` opcode (`0xC3`), ARM64 gadgets terminate with:
-* `ret` = `D65F03C0` (bytes: `C0 03 5F D6`) — reads target from register `x30` (LR).
-* `ret xN` = `D65F03C0 | (N<<5)` — reads target from arbitrary register.
-* `br xN` = `D61F0000 | (N<<5)` — unconditional indirect branch (JOP equivalent).
+- `ret` = `D65F03C0` (bytes: `C0 03 5F D6`) — reads target from register `x30` (LR).
+- `ret xN` = `D65F03C0 \| (N<<5)` — reads target from arbitrary register.
+- `br xN` = `D61F0000 \| (N<<5)` — unconditional indirect branch (JOP equivalent).
 
-### 8.1 Gadget Scanning Methodology in cdb
+### 7.1 Gadget Scanning Methodology in cdb
 
 The `s -b` command searches raw byte patterns in memory. For the `.text` section of `MixedLib.dll` (RVA `0x1000`–`0x32DC`, 9,252 bytes):
 
@@ -252,7 +252,7 @@ The `s -b` command searches raw byte patterns in memory. For the `.text` section
 0:000> s -b MixedLib+0x1000 MixedLib+0x32DC fd 7b bf a9
 ```
 
-### 8.2 Empirical Gadget Inventory
+### 7.2 Empirical Gadget Inventory
 
 | Gadget Type | ARM64 Encoding | Instances Found | Density (per KB) |
 |---|---|---|---|
@@ -263,7 +263,7 @@ The `s -b` command searches raw byte patterns in memory. For the `.text` section
 
 **Total .text section:** 9,252 bytes contains **108 usable gadget entry points**.
 
-### 8.3 High-Value Gadget Catalog
+### 7.3 High-Value Gadget Catalog
 
 #### Category 1: VTableFixup Indirect Call Gadgets (4 instances)
 
@@ -329,7 +329,7 @@ These gadgets allow controlled data to be placed at specific stack offsets, sett
 00007ff8`1a4b1410 b94013e0 ldr   w0, [sp, #0x10]        ; w0 = [sp+0x10]
 ```
 
-### 8.4 Practical ROP Chain Construction (Theoretical Analysis)
+### 7.4 Practical ROP Chain Construction (Theoretical Analysis)
 
 Given a hypothetical stack overflow that overwrites the return address in `TestBothTls`, a minimal ROP chain leveraging only `MixedLib.dll` gadgets could be:
 
@@ -349,7 +349,7 @@ Stack Layout After Overflow:
 
 **However, a simpler attack exists:** Since the VTableFixup slots at `MixedLib+0xA000` are writable function pointers called without CFG validation, an arbitrary write primitive targeting `0x1a4ba008` (slot 1) immediately redirects `NativeCallsManaged` to any address — no ROP chain required. This is a **single-write control flow hijack**.
 
-### 8.5 Gadget Density Comparison: Native vs. Mixed-Mode
+### 7.5 Gadget Density Comparison: Native vs. Mixed-Mode
 
 | Metric | `MixedExe.exe` (Pure Native) | `MixedLib.dll` (C++/CLI Mixed) |
 |---|---|---|
@@ -365,7 +365,7 @@ Stack Layout After Overflow:
 2. RWX heap allocations by the CLR.
 3. Complete absence of CFG on indirect branches.
 
-### 8.6 cdb Gadget Hunting Command Reference
+### 7.6 cdb Gadget Hunting Command Reference
 
 ```text
 ; Find all ARM64 ret instructions in a module:
@@ -393,7 +393,7 @@ u <address> L5
 !dh module -a   (look for GUARD_CF in DllCharacteristics)
 ```
 
-### 8.7 Empirical Byte-Level Write Proof via cdb
+### 7.7 Empirical Byte-Level Write Proof via cdb
 
 Two direct memory write experiments were performed through the `eb` (edit byte) and `eq` (edit qword) commands to verify that no protection prevents arbitrary modification of the identified attack surfaces.
 
@@ -419,34 +419,51 @@ Disassembly after write:
 
 **Result:** The `eb` command wrote `c0 03 5f d6` directly into the RWX region. The first instruction of the IJW thunk (`adr xip0, ...`) was replaced with `ret`. The CPU will decode and execute the new instruction on the next call through this thunk — **proving that arbitrary machine code can be injected into this region**.
 
-#### Experiment B: Overwriting VTableFixup Function Pointer in .data
+#### Experiment B: Overwriting VTableFixup Function Pointer — Full Execution Proof
 
-**Command:** `eq MixedLib+0xA008 0xDEADBEEFDEADBEEF` (writes sentinel value to slot[1])
+**Timing is critical:** The write must occur AFTER CLR initialization and JIT back-patching.
+
+**Command sequence:**
+
 ```text
-=== STEP 1: Wait for CLR JIT initialization to complete ===
-(sxe ld:clrjit.dll; g)
+; Step 1: Wait for CLR JIT initialization to complete
+sxe ld:clrjit.dll; g
 
-=== STEP 2: Dump VTableFixup slots (now pointing to JIT code) ===
+; Step 2: Dump VTableFixup slots (now pointing to JIT code)
+dp MixedLib+0xA000 L4
+
+; Step 3: Write sentinel to slot[1]
+eq MixedLib+0xA008 0x4141414141414141
+
+; Step 4: Verify write
+dp MixedLib+0xA000 L4
+
+; Step 5: Continue execution — expect crash
+g
+
+; Step 6: Check crash state
+r pc
+k 5
+```
+
+**Observed output:**
+
+```text
+=== STEP 2: VTableFixup slots (after CLR JIT init) ===
 00007ff8`1a4ba000  00007fff`8aee0020 00007fff`8aee00a0  ← Slot[1] = JIT address
 00007ff8`1a4ba010  00007fff`8aee0120 00007fff`8aee01a0
 
-=== STEP 3: Write sentinel 0x4141414141414141 to slot[1] ===
-0:000> eq MixedLib+0xA008 0x4141414141414141
-
-=== STEP 4: Verify write ===
+=== STEP 3+4: Write sentinel and verify ===
 00007ff8`1a4ba000  00007fff`8aee0020 41414141`41414141  ← OVERWRITTEN!
 00007ff8`1a4ba010  00007fff`8aee0120 00007fff`8aee01a0
 
 === STEP 5: Continue execution ===
-0:000> g
 (1fec.1dd4): Unknown exception - code c00000aa (first chance)
 (1fec.1dd4): Unknown exception - code c00000aa (!!! second chance !!!)
 
-=== STEP 6: Check crash state ===
-0:000> r pc
+=== STEP 6: Crash state ===
 pc=4141414141414141                    ◄── PROGRAM COUNTER AT OUR VALUE!
 
-0:000> k 5
 Child-SP          RetAddr               Call Site
 00000085`29f4f910 00007ff7`39d21540     0x41414141`41414141  ← CRASHED AT SENTINEL
 00000085`29f4f930 00007ff7`39d2193c     MixedExe+0x1540     ← Called NativeCallsManaged
@@ -454,7 +471,7 @@ Child-SP          RetAddr               Call Site
 ```
 
 **Definitive proof of Single-Write Control Flow Hijack:**
-1. Slot[1] originally held `00007fff`8aee00a0` (JIT-compiled `ManagedClass::Compute` address in the CLR JIT code heap).
+1. Slot[1] originally held `00007fff'8aee00a0` (JIT-compiled `ManagedClass::Compute` address in the CLR JIT code heap).
 2. After `eq` write, slot held `0x4141414141414141`.
 3. When `NativeCallsManaged` executed `ldr x9, [x9, #8]; br x9`, it loaded our sentinel and branched to it.
 4. **`pc = 0x4141414141414141`** — the CPU jumped to EXACTLY the value we wrote.
@@ -462,6 +479,7 @@ Child-SP          RetAddr               Call Site
 6. **No CFG check, no page protection, no integrity validation prevented this redirect.**
 
 **Timeline of slot value states:**
+
 ```
 State 1 (Disk):     0x00000000`06000001     (MethodDef metadata token)
 State 2 (Loaded):   0x000001cf`66502088     (IJW Thunk in RWX heap — also hijackable)
@@ -469,7 +487,7 @@ State 3 (JIT):      0x00007fff`8aee00a0     (JIT compiled code — also hijackab
 State 4 (Hijacked): 0x41414141`41414141     (Attacker-controlled — CRASHED HERE)
 ```
 
-**Note on timing:** The first attempt to write `0xDEADBEEFDEADBEEF` too early (before CLR JIT loaded) did not produce a crash because execution hadn't reached the call site yet — the CLR was still mapping modules via `NtMapViewOfSection`. The write itself succeeded in memory both times; the difference is that the second attempt allowed execution to proceed to the actual `br x9` instruction.
+**Note on timing:** An earlier attempt to write `0xDEADBEEFDEADBEEF` before CLR JIT had loaded did not produce a crash — the write succeeded in memory, but execution hadn't reached the call site yet (the CLR was still mapping modules via `NtMapViewOfSection`). The write itself succeeded both times; the difference is that waiting for `clrjit.dll` load allowed execution to proceed to the actual `br x9` instruction.
 
 #### Write Protection Summary
 
@@ -485,6 +503,7 @@ Neither write triggered:
 - No kernel callback (ObRegisterCallbacks / PsSetCreateProcessNotifyRoutine)
 
 #### cdb Write Command Reference
+
 ```text
 ; Write bytes to arbitrary address:
 eb <address> <byte1> <byte2> <byte3> <byte4> ...
@@ -505,9 +524,7 @@ u <address> L2      ; Disassemble to verify instruction decode
 
 ---
 
-| **ROP-09** | **Arbitrary bytes written to RWX thunk memory are immediately decoded as executable instructions** | `[EXPERIMENTALLY CONFIRMED]` | `MixedExe.exe` under `cdb.exe` ARM64 | `eb poi(MixedLib+0xA000) c0 03 5f d6; u poi(MixedLib+0xA000) L1` | Bytes `10000010` (adr) changed to `d65f03c0` (ret), disassembled correctly as `ret` | Page protection rejecting write or CPU refusing to execute modified bytes. |
-| **ROP-10** | **Single 8-byte write to VTableFixup slot causes `pc` to jump to written value (execution crash proof)** | `[EXPERIMENTALLY CONFIRMED]` | `MixedExe.exe` after CLR JIT init, under `cdb.exe` ARM64 | `sxe ld:clrjit.dll; g; eq MixedLib+0xA008 0x4141414141414141; g; r pc` | `pc=4141414141414141`, exception `0xC00000AA` (misalignment), stack: `0x41414141`41414141` ← `MixedExe+0x1540` | Page protection rejecting write, CFG validating target, or `pc` remaining at legitimate address. |
-## 7. Reproducibility & Falsification Matrix
+## 8. Reproducibility & Falsification Matrix
 
 | Claim ID | Technical Claim | Status | Target Configuration | Verification Command | Raw Empirical Observation | Falsification Condition |
 |---|---|---|---|---|---|---|
@@ -519,3 +536,5 @@ u <address> L2      ; Disassemble to verify instruction decode
 | **ROP-06** | **56 ARM64 `ret` gadgets found in 9,252 bytes of MixedLib.dll .text section** | `[EXPERIMENTALLY CONFIRMED]` | `MixedLib.dll` under `cdb.exe` ARM64 | `s -b MixedLib+0x1000 MixedLib+0x32DC c0 03 5f d6` | 56 hits at addresses from `0x1a4b1014` to `0x1a4b25e8` | Zero `ret` instructions in the .text section. |
 | **ROP-07** | **4 VTableFixup slots form a contiguous writable function pointer array at `MixedLib+0xA000`** | `[EXPERIMENTALLY CONFIRMED]` | Disassembly of all 4 exported functions | `u MixedLib!NativeHelper L3; u MixedLib!NativeCallsManaged L3; u MixedLib!TestMixedSeh L3; u MixedLib!TestBothTls L3` | All read from `[0xA000 + 0/8/0x10/0x18]` and branch via `br x9` | Function pointers stored in read-only memory or validated by CFG. |
 | **ROP-08** | **30 epilogue gadgets (`ldp x29,x30,[sp],#0x30`) provide stack cleanup + return** | `[EXPERIMENTALLY CONFIRMED]` | `MixedLib.dll` under `cdb.exe` ARM64 | `s -b MixedLib+0x1000 MixedLib+0x32DC fd 7b c1 a8` | 30 hits, each followed by `autiasp` (PAC) and `ret` | Absence of standard ARM64 epilogue patterns in the .text section. |
+| **ROP-09** | **Arbitrary bytes written to RWX thunk memory are immediately decoded as executable instructions** | `[EXPERIMENTALLY CONFIRMED]` | `MixedExe.exe` under `cdb.exe` ARM64 | `eb poi(MixedLib+0xA000) c0 03 5f d6; u poi(MixedLib+0xA000) L1` | Bytes `10000010` (adr) changed to `d65f03c0` (ret), disassembled correctly as `ret` | Page protection rejecting write or CPU refusing to execute modified bytes. |
+| **ROP-10** | **Single 8-byte write to VTableFixup slot causes `pc` to jump to written value (execution crash proof)** | `[EXPERIMENTALLY CONFIRMED]` | `MixedExe.exe` after CLR JIT init, under `cdb.exe` ARM64 | `sxe ld:clrjit.dll; g; eq MixedLib+0xA008 0x4141414141414141; g; r pc` | `pc=4141414141414141`, exception `0xC00000AA` (misalignment), stack shows crash at sentinel ← `MixedExe+0x1540` | Page protection rejecting write, CFG validating target, or `pc` remaining at legitimate address. |
