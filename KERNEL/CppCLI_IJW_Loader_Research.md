@@ -137,6 +137,66 @@ By monitoring the virtual address `MixedLib.dll + 0xA000` through three phases, 
   ```
   The slot was **overwritten in place** with `0x00007fff8af10020`—the exact ARM64 JIT-compiled address of `ManagedClass::Compute`!
 
+### 3.3 Anatomy & Disassembly of the IJW Transition Thunk (`State 2`)
+
+Disassembling the heap address stored in the slot prior to the first crossover call (`0x000001d3ce502058`):
+
+```asm
+; Heap-Allocated IJW Transition Thunk on ARM64:
+000001d3`ce502058 10000010 adr         xip0, 000001d3`ce502058 ; xip0 (x16) = pointer to this thunk
+000001d3`ce50205c 58000071 ldr         xip1, 000001d3`ce502068 ; xip1 (x17) = target bootstrap handler
+000001d3`ce502060 d61f0220 br          xip1                    ; Indirect branch to handler
+000001d3`ce502064 d503201f nop
+```
+
+Directly appended to the 16-byte machine code sequence is an **embedded 32-byte descriptor packet**:
+
+```text
+; Heap Memory directly following the thunk:
+000001d3`ce502068: 00007ff8`0ecf10c0  ; Handler: mscoreei!VTableBootstrapThunkInitHelperStub
+000001d3`ce502070: 00007ff8`1ff30000  ; Module Base Address: MixedLib.dll
+000001d3`ce502078: 00007ff8`1ff3a000  ; Slot Address: Target VTableFixup slot to back-patch
+000001d3`ce502080: 00000000`06000002  ; Target Metadata Token: MethodDef #2
+```
+
+#### 3.3.1 Bootstrap Dispatcher: `mscoreei!VTableBootstrapThunkInitHelperStub`
+
+Disassembly of the target handler (`0x00007ff80ecf10c0`):
+```asm
+mscoreei!VTableBootstrapThunkInitHelperStub:
+00007ff8`0ecf10c0 a9b67bfd stp         fp,lr,[sp,#-0xA0]!  ; Allocate 160-byte register save frame
+00007ff8`0ecf10c4 910003fd mov         fp,sp
+00007ff8`0ecf10c8 6d0107e0 stp         d0,d1,[sp,#0x10]    ; Preserve floating point arguments d0-d7
+00007ff8`0ecf10cc 6d020fe2 stp         d2,d3,[sp,#0x20]
+00007ff8`0ecf10d0 6d0317e4 stp         d4,d5,[sp,#0x30]
+00007ff8`0ecf10d4 6d041fe6 stp         d6,d7,[sp,#0x40]
+00007ff8`0ecf10d8 a90507e0 stp         x0,x1,[sp,#0x50]    ; Preserve integer arguments x0-x7
+00007ff8`0ecf10dc a9060fe2 stp         x2,x3,[sp,#0x60]
+00007ff8`0ecf10e0 a90717e4 stp         x4,x5,[sp,#0x70]
+00007ff8`0ecf10e4 a9081fe6 stp         x6,x7,[sp,#0x80]
+00007ff8`0ecf10e8 f9004be8 str         x8,[sp,#0x90]       ; Preserve struct return buffer pointer
+00007ff8`0ecf10ec aa1003e0 mov         x0,xip0             ; Arg0 = pointer to thunk descriptor
+00007ff8`0ecf10f0 94009b26 bl          mscoreei!VTableBootstrapThunkInitHelper
+00007ff8`0ecf10f4 aa0003f0 mov         xip0,x0             ; Target address returned in x0 -> move to xip0
+00007ff8`0ecf10f8 6d4107e0 ldp         d0,d1,[sp,#0x10]    ; Restore all argument registers intact
+00007ff8`0ecf10fc 6d420fe2 ldp         d2,d3,[sp,#0x20]
+...
+```
+
+#### 3.3.2 Execution Engine Hand-off: `clr!IJWNOADThunk::MakeCall` & `FindThunkTarget`
+
+Inside `clr.dll`, the call routes into `clr!IJWNOADThunk::MakeCall` and `clr!IJWNOADThunk::FindThunkTarget`:
+```asm
+clr!IJWNOADThunk::FindThunkTarget:
+00007fff`ea6f6c6c aa0003f7 mov         x23,x0              ; x23 = descriptor packet
+00007fff`ea6f6c70 52800000 mov         w0,#0
+00007fff`ea6f6c74 97eae669 bl          clr!SetupThread     ; Ensure managed Thread object initialized
+...
+00007fff`ea6f6cbc 97f0ed33 bl          clr!Thread::RareEnablePreemptiveGC ; Handle GC mode transition
+```
+
+`FindThunkTarget` performs the JIT compilation of the `MethodDef` token specified in the descriptor, patches the slot at `MixedLib.dll + 0xA000` with the resulting JIT code pointer, and returns the target pointer so the initial call executes without loss of arguments.
+
 ---
 
 ## 4. Module Load & CLR Bootstrap via Native `_DllMainCRTStartup`
@@ -161,6 +221,34 @@ Child-SP          RetAddr               Call Site
 ```
 
 *Observation:* The initialization of `clr.dll` roots in `mscoreei!CorDllMainWorkerForThunk`, called during native CRT startup when processing VTable fixups.
+
+### 4.2 Complete Execution Stack from CRT Entry Point to CLR Module Mapping
+
+Tracing further down into `clr.dll` shows the exact attachment sequence where the CLR initializes its internal AppDomain and parses the mixed assembly's CLI metadata:
+```text
+Child-SP          RetAddr               Call Site
+000000ae`9fb0e020 00007ff8`2051c4c4     ntdll!NtMapViewOfSection+0x4
+000000ae`9fb0e020 00007fff`ea3699d4     KERNELBASE!MapViewOfFileEx+0xa4
+000000ae`9fb0e060 00007fff`ea1aed5c     clr!CLRMapViewOfFileEx+0x3c
+000000ae`9fb0e0e0 00007fff`ea1aeb70     clr!MappedImageLayout::MappedImageLayout+0x194
+000000ae`9fb0e3d0 00007fff`ea226024     clr!PEImageLayout::Map+0x38
+000000ae`9fb0e420 00007fff`ea225ef8     clr!PEImage::GetLayoutInternal+0xcc
+000000ae`9fb0e470 00007fff`ea223348     clr!PEImage::GetLayout+0x110
+000000ae`9fb0e510 00007fff`ea1f9910     clr!RuntimeOpenImageInternal+0xf8
+000000ae`9fb0e620 00007fff`ea220040     clr!GetAssemblyMDInternalImportEx+0xd8
+000000ae`9fb0e6b0 00007fff`ea31f238     clr!CreateMetaDataImport+0x20
+000000ae`9fb0e6c0 00007fff`ea31f130     clr!CAssemblyManifestImport::InitAndLoadMetaData+0x98
+000000ae`9fb0e730 00007fff`ea31dcd0     clr!CreateAssemblyManifestImport+0x78
+000000ae`9fb0e7a0 00007fff`ea2cea0c     clr!ExplicitBind+0x178
+000000ae`9fb0efb0 00007fff`ea534544     clr!AppDomain::BindExplicitAssembly+0x114
+000000ae`9fb0f270 00007fff`ea4e77f8     clr!AppDomain::LoadExplicitAssembly+0x1c
+000000ae`9fb0f2b0 00007fff`ea4e73a8     clr!ExecuteDLLForAttach+0x160
+000000ae`9fb0f5c0 00007fff`ea4e70b4     clr!ExecuteDLL+0x218
+000000ae`9fb0f6d0 00007ff8`0ecfdc60     clr!CorDllMainForThunk+0xb4
+000000ae`9fb0f720 00007ff8`0ed17da0     mscoreei!CorDllMainWorkerForThunk+0x130
+000000ae`9fb0f7a0 00007ff8`0ecf10f4     mscoreei!VTableBootstrapThunkInitHelper+0x18
+000000ae`9fb0f7c0 00007ff6`0ed014d4     mscoreei!VTableBootstrapThunkInitHelperStub+0x34
+```
 
 ---
 
@@ -190,9 +278,73 @@ Disassembly of `MixedLib!NativeCallsManaged` on ARM64:
    - `br x9` branches **directly to the compiled machine code**.
    - **Cost:** Exactly 3 machine instructions (`adrp + ldr + br`), matching the speed of a standard C++ DLL export thunk.
 
+
+### 5.2 Reverse Crossover: Managed Calling Native Function (`ManagedClass::Compute` $\to$ `NativeHelper`)
+
+Unlike pure C# P/Invoke which requires an explicit `[DllImport]` attribute and generates an intermediate IL stub (`IL_STUB_PInvoke`), C++/CLI allows direct calls from managed methods to native functions:
+
+```cpp
+extern "C" __declspec(dllexport) int NativeHelper(int x) {
+    return x * 2;
+}
+
+public ref class ManagedClass {
+public:
+    static int Compute(int x) {
+        int res = NativeHelper(x); // Direct call to unmanaged native function!
+        return res;
+    }
+};
+```
+
+The JIT compiler emits inline transitions between cooperative and preemptive GC modes:
+1. Prior to entering native code, the thread state is transitioned to **preemptive mode** (`m_fPreemptiveGCDisabled = 0`), allowing GC runs while the thread executes native instructions.
+2. Upon returning to managed code, the thread switches back to **cooperative mode** (`m_fPreemptiveGCDisabled = 1`). If a GC is in progress, the thread halts at a rendezvous point before accessing managed objects.
+
 ---
 
-## 6. The Loader Lock Deadlock Hazard in C++/CLI
+## 6. Mixed-Mode SEH Exception Unwinding across Architectural Boundaries
+
+When a managed method throws an exception across an IJW boundary into a native C++ catch block:
+```cpp
+public ref class ManagedClass {
+public:
+    static int Compute(int x) {
+        throw gcnew System::InvalidOperationException("CROSSOVER_EXCEPTION");
+    }
+};
+
+extern "C" __declspec(dllexport) int NativeCallsManaged(int x) {
+    try {
+        return ManagedClass::Compute(x);
+    } catch (System::InvalidOperationException^ e) {
+        printf("[NativeCallsManaged] CAUGHT managed exception in C++/CLI handler!\n");
+        return 999;
+    }
+}
+```
+
+### 6.1 Empirical Exception Stack Trace (`sxe 0xe0434352`):
+```text
+Child-SP          RetAddr               Call Site
+00000003`63dbfa80 00007fff`ea365690     KERNELBASE!RaiseException+0x74
+00000003`63dbfb30 00007fff`ea3654d8     clr!RaiseTheExceptionInternalOnly+0x1b0
+00000003`63dbfc30 00007fff`8ae82be8     clr!IL_Throw+0x108
+00000003`63dbfe20 00000000`00000000     0x00007fff`8ae82be8
+00000003`63dbfe40 00007fff`ea1a185c     0x00007fff`8ae82a10
+00000003`63dbfe60 00007ff6`a44814d4     clr!UMThunkStub+0xb0  ◄── Unmanaged-to-Managed Thunk Bridge
+00000003`63dbfed0 00007ff6`a44817cc     MixedExe+0x14d4
+```
+
+### 6.2 The Role of `clr!UMThunkStub` in Exception Bridging:
+1. The managed `throw` translates to `clr!IL_Throw` $\to$ `KERNELBASE!RaiseException(0xE0434352)`.
+2. Win32 Structured Exception Handling unwinds frames until it hits `clr!UMThunkStub`.
+3. `UMThunkStub` identifies that the calling native frame belongs to a C++/CLI module capable of catching managed references (`catch (T^)`).
+4. It preserves the managed exception object, translates the SEH record into the C++ EH model (`__CxxFrameHandler3` / `__CxxFrameHandler4`), and passes control directly to the native `catch` block, preventing unhandled exception process termination.
+
+---
+
+## 7. The Loader Lock Deadlock Hazard in C++/CLI
 
 Because C++/CLI mixed assemblies execute managed initialization code within `DllMain`, they are vulnerable to the notorious **Loader Lock Deadlock**:
 1. When the OS loader maps `MixedLib.dll`, it acquires the exclusive process loader lock:
@@ -206,7 +358,7 @@ Because C++/CLI mixed assemblies execute managed initialization code within `Dll
 
 ---
 
-## 7. Calling Conventions: `__clrcall` vs. `__cdecl`
+## 8. Calling Conventions: `__clrcall` vs. `__cdecl`
 
 | Characteristic | `__cdecl` (Native ARM64 / x64) | `__clrcall` (Managed C++/CLI) |
 |---|---|---|
@@ -218,7 +370,7 @@ Because C++/CLI mixed assemblies execute managed initialization code within `Dll
 
 ---
 
-## 8. Tripartite Architectural Comparison
+## 9. Tripartite Architectural Comparison
 
 | Loading Property | Classic .NET Framework (4.8) | Modern .NET (.NET 10) | C++/CLI Mixed Mode (IJW) |
 |---|---|---|---|
@@ -232,7 +384,7 @@ Because C++/CLI mixed assemblies execute managed initialization code within `Dll
 
 ---
 
-## 9. Reproducibility & Falsification Matrix
+## 10. Reproducibility & Falsification Matrix
 
 | Claim ID | Technical Claim | Status | Target Configuration | Verification Command | Raw Empirical Observation | Falsification Condition |
 |---|---|---|---|---|---|---|
@@ -242,3 +394,5 @@ Because C++/CLI mixed assemblies execute managed initialization code within `Dll
 | **CPP-04** | **CLR bootstraps from `mscoreei!CorDllMainWorkerForThunk`** | `[EXPERIMENTALLY CONFIRMED]` | `MixedExe.exe` running under `cdb.exe` ARM64 | `sxe ld:clr.dll; g; k 10; q` | Stack roots in `CorDllMainWorkerForThunk` $\to$ `LoadLibraryExW` | CLR initialized from `ntdll!LdrpInitializeProcess` directly. |
 | **CPP-05** | **VTable slot back-patched from IJW Thunk to JITted code address** | `[EXPERIMENTALLY CONFIRMED]` | `MixedExe.exe` running under `cdb.exe` ARM64 | `dp MixedLib+0xA000 L2` before and after call | `0x000001f175502058` $\longrightarrow$ `0x00007fff8af10020` | Slot value remaining unchanged after crossover call. |
 | **CPP-06** | **Call site uses direct indirect jump (`adrp + ldr + br`) without P/Invoke** | `[EXPERIMENTALLY CONFIRMED]` | Disassembly of `MixedLib!NativeCallsManaged` | `u MixedLib!NativeCallsManaged L3` | `adrp x9, MixedLib+0xA000; ldr x9, [x9]; br x9` | Compiler generating P/Invoke marshaling IL stub. |
+| **CPP-07** | **IJW Transition Thunk consists of `adr + ldr + br` followed by 32-byte descriptor** | `[EXPERIMENTALLY CONFIRMED]` | `MixedExe.exe` under `cdb.exe` ARM64 | `u poi(MixedLib+0xA000) L4` | `adr xip0; ldr xip1; br xip1` followed by handler, base, slot, and MethodDef token | Complex multi-instruction stub without embedded descriptor packet. |
+| **CPP-08** | **Managed exception caught by native C++ frame through `clr!UMThunkStub`** | `[EXPERIMENTALLY CONFIRMED]` | `MixedExe.exe` throwing managed exception | `sxe 0xe0434352; g; k 20; q` | Stack reveals `clr!IL_Throw` $\to$ `clr!UMThunkStub` $\to$ native `catch` block | Unhandled 0xE0434352 crash or termination without hitting native catch. |
