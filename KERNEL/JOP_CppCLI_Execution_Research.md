@@ -88,6 +88,52 @@ All 4 exports share the identical terminal instruction:
 - A binary search across `MixedLib.dll` identified **7 occurrences of `br x9`** in just 36 KB of compiled code.
 - Notice that unlike NativeAOT which uses `blr xip0` (subroutine call with link), C++/CLI uses `br x9` (tail branch), meaning `lr` remains unchanged, further isolating the branch from return-address tracing.
 
+### 3.3 Empirical Byte-Level Memory Dump via cdb
+
+Direct memory dumps from `cdb` reveal the exact machine code bytes for the architectural stubs and the two runtime states of the VTableFixup table:
+
+#### A. Machine Code Opcode Bytes of `NativeHelper` (`MixedLib+0x12b8`):
+```text
+0:000> db MixedLib+0x12b8 L10
+00007ff9`33b312b8  49 00 00 b0 29 01 40 f9-20 01 1f d6 03 30 02 00  I...).@. ....0..
+```
+| Byte Sequence (Little-Endian) | ARM64 Instruction | Disassembly Semantics |
+|---|---|---|
+| `49 00 00 b0` | `b0000049` | `adrp x9, MixedLib+0xa000` (Compute page base) |
+| `29 01 40 f9` | `f9400129` | `ldr  x9, [x9]` (Read slot 0 pointer from `.data`) |
+| `20 01 1f d6` | `d61f0120` | `br   x9` (Indirect tail jump without link) |
+
+#### B. Machine Code Opcode Bytes of `NativeCallsManaged` (`MixedLib+0x1390`):
+```text
+0:000> db MixedLib+0x1390 L10
+00007ff9`33b31390  49 00 00 b0 29 05 40 f9-20 01 1f d6 00 00 00 00  I...).@. .......
+```
+| Byte Sequence | ARM64 Instruction | Disassembly Semantics |
+|---|---|---|
+| `49 00 00 b0` | `b0000049` | `adrp x9, MixedLib+0xa000` |
+| `29 05 40 f9` | `f9400529` | `ldr  x9, [x9, #8]` (Read slot 1 pointer) |
+| `20 01 1f d6` | `d61f0120` | `br   x9` |
+
+#### C. VTableFixup Bytes in `.data` (State 1: On-Disk / Pre-Fixup Metadata Tokens):
+```text
+0:000> db MixedLib+0xa000 L20
+00007ff9`33b3a000  01 00 00 06 00 00 00 00-02 00 00 06 00 00 00 00  ................
+00007ff9`33b3a010  03 00 00 06 00 00 00 00-04 00 00 06 00 00 00 00  ................
+```
+Before CLR initialization, the 64-bit slots store the 32-bit CLI MethodDef metadata tokens (`0x06000001`, `0x06000002`, `0x06000003`, `0x06000004`).
+
+#### D. VTableFixup Bytes in `.data` (State 3: Post-JIT Back-Patched Function Pointers):
+```text
+0:000> db MixedLib+0xa000 L20
+00007ff9`33b3a000  20 00 26 69 f8 7f 00 00-a0 00 26 69 f8 7f 00 00   .&i......&i....
+00007ff9`33b3a010  20 01 26 69 f8 7f 00 00-a0 01 26 69 f8 7f 00 00   .&i......&i....
+
+0:000> dp MixedLib+0xa000 L4
+00007ff9`33b3a000  00007ff8`69260020 00007ff8`692600a0
+00007ff9`33b3a010  00007ff8`69260120 00007ff8`692601a0
+```
+After JIT compilation, the `.data` memory is overwritten in-place with resolved 64-bit pointers to executable JIT code without transitioning to read-only, maintaining a permanently writable dispatch table.
+
 ---
 
 ## 4. The Triple Primitive: C++/CLI's Unique Vulnerability Profile
