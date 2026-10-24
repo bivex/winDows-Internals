@@ -342,9 +342,104 @@ Child-SP          RetAddr               Call Site
 3. `UMThunkStub` identifies that the calling native frame belongs to a C++/CLI module capable of catching managed references (`catch (T^)`).
 4. It preserves the managed exception object, translates the SEH record into the C++ EH model (`__CxxFrameHandler3` / `__CxxFrameHandler4`), and passes control directly to the native `catch` block, preventing unhandled exception process termination.
 
+
 ---
 
-## 7. The Loader Lock Deadlock Hazard in C++/CLI
+## 7. Thread Local Storage (TLS) in C++/CLI: Native `__declspec(thread)` vs. Managed `[ThreadStatic]`
+
+C++/CLI exhibits a unique **Dual-TLS architecture** because a mixed assembly may declare both unmanaged Win32 thread-local variables and managed CLR thread-static fields within the same compilation unit:
+
+```cpp
+// 1. Native Win32 TLS:
+__declspec(thread) int g_nativeThreadLocal = 1234;
+
+// 2. Managed CLR TLS:
+public ref class ManagedTlsClass {
+public:
+    [ThreadStatic]
+    static int s_managedThreadLocal = 5678;
+};
+```
+
+### 7.1 PE Binary Manifestation: `IMAGE_TLS_DIRECTORY64`
+
+When `__declspec(thread)` is declared, MSVC automatically populates **`DataDirectory[9] (TLS)`** in the mixed PE header:
+```text
+MixedLib.dll DataDirectory[9] TLS: RVA=0x00008800, Size=0x00000028 (40 bytes)
+
+IMAGE_TLS_DIRECTORY64:
+  StartAddressOfRawData: 0x0000000180008BA0  ; Template start address in .rdata
+  EndAddressOfRawData:   0x0000000180008BA8  ; Template end address
+  AddressOfIndex:        0x000000018000A0B8  ; TLS index allocated by OS loader (_tls_index)
+  AddressOfCallBacks:    0x0000000180004140  ; TLS Callback table pointer
+  SizeOfZeroFill:        0x00000000
+```
+
+In ECMA-335 metadata, the compiler represents `g_nativeThreadLocal` as an **RVA-mapped field**:
+```cil
+.field static assembly int32 g_nativeThreadLocal at D_00008BA4
+```
+`D_00008BA4` points directly into the PE image's TLS template range (`0x8BA0`–`0x8BA8`).
+
+### 7.2 Empirical Multi-Thread Behavior & Initialization Divergence
+
+Executing a multi-threaded test across Main Thread (`0x1A28`) and Worker Thread (`0x20D8`) reveals a critical behavioral contrast:
+
+```text
+=== C++/CLI TLS (Native __declspec(thread) vs Managed [ThreadStatic]) ===
+
+--- Main Thread (ID 1) ---
+[MixedLib!TestBothTls] OS Thread 0x1A28 (ID 1): g_nativeThreadLocal = 1235 (&g_native = 000001686110A094)
+  [ManagedTlsClass] Thread 1: s_managedThreadLocal = 5679
+
+--- Starting Worker Thread 2 ---
+[MixedLib!TestBothTls] OS Thread 0x20D8 (ID 2): g_nativeThreadLocal = 1236 (&g_native = 000001686119AF74)
+  [ManagedTlsClass] Thread 2: s_managedThreadLocal = 2   ◄── DIVERGENCE!
+
+--- Main Thread Revisited (ID 1) ---
+[MixedLib!TestBothTls] OS Thread 0x1A28 (ID 1): g_nativeThreadLocal = 1236 (&g_native = 000001686110A094)
+  [ManagedTlsClass] Thread 1: s_managedThreadLocal = 5680
+```
+
+#### Why `s_managedThreadLocal` Equals `2` on Worker Thread (Not `5680`):
+1. **Native TLS (`__declspec(thread)`):**
+   - Handled directly by the Windows kernel and OS loader (`ntdll!LdrpInitializeTls`).
+   - When a new thread is spawned, the OS allocates a TLS slot and **copies the entire template memory block** (`StartAddressOfRawData` to `EndAddressOfRawData`) into the thread's TLS array (`TEB + 0x58`).
+   - Therefore, on Worker Thread 2, `g_nativeThreadLocal` begins with the fully initialized template value `1234`, resulting in `1234 + 2 = 1236`.
+
+2. **Managed TLS (`[ThreadStatic]`):**
+   - Handled by the CLR execution engine via `clr!JIT_GetSharedNonGCThreadStaticBase` $\to$ `clr!JIT_GetNonGCThreadStaticBase_Helper`.
+   - The static field initialization (`5678`) resides inside the static class constructor:
+     ```cil
+     .method private static void .cctor() cil managed {
+       IL_0000: ldc.i4 0x162e ; 5678
+       IL_0005: stsfld int32 ManagedTlsClass::s_managedThreadLocal
+       IL_000a: ret
+     }
+     ```
+   - In the CLI specification, **`.cctor` executes exactly once per AppDomain**, triggered by the *first thread* that accesses the class.
+   - When Worker Thread 2 accesses `s_managedThreadLocal`, `.cctor` **does NOT re-run**. The CLR allocates a fresh zero-initialized slot in the thread's `ThreadLocalBlock`.
+   - Thus, on Worker Thread 2, `s_managedThreadLocal` starts at default `0`, resulting in `0 + 2 = 2`!
+
+### 7.3 JIT Runtime Stack for Managed Thread Statics
+
+Tracing `s_managedThreadLocal` access under `cdb.exe` captures the exact CLR runtime dispatch:
+```text
+Child-SP          RetAddr               Call Site
+00000041`bcbff810 00007fff`ea319a30     clr!JIT_GetNonGCThreadStaticBase_Helper
+00000041`bcbff810 00007fff`8ae92cd8     clr!JIT_GetSharedNonGCThreadStaticBase+0xe0
+00000041`bcbff850 00000000`00000000     0x00007fff`8ae92cd8
+00000041`bcbff880 00007ff7`59f51528     clr!UMThunkStub+0xb0
+00000041`bcbff8f0 00007ff7`59f51894     MixedExe+0x1528
+```
+Inside `clr!JIT_GetNonGCThreadStaticBase_Helper`:
+1. The CLR resolves the current thread's `ThreadLocalBlock` (`ThreadStatics::GetTLM`).
+2. If the module has not yet allocated TLS for this thread, `clr!ThreadStatics::AllocateAndInitTLM` dynamically provisions the thread-local module block.
+3. The base address of the non-GC static block is returned in `x0`, allowing field dereferencing.
+
+---
+
+## 8. The Loader Lock Deadlock Hazard in C++/CLI
 
 Because C++/CLI mixed assemblies execute managed initialization code within `DllMain`, they are vulnerable to the notorious **Loader Lock Deadlock**:
 1. When the OS loader maps `MixedLib.dll`, it acquires the exclusive process loader lock:
@@ -358,7 +453,7 @@ Because C++/CLI mixed assemblies execute managed initialization code within `Dll
 
 ---
 
-## 8. Calling Conventions: `__clrcall` vs. `__cdecl`
+## 9. Calling Conventions: `__clrcall` vs. `__cdecl`
 
 | Characteristic | `__cdecl` (Native ARM64 / x64) | `__clrcall` (Managed C++/CLI) |
 |---|---|---|
@@ -370,7 +465,7 @@ Because C++/CLI mixed assemblies execute managed initialization code within `Dll
 
 ---
 
-## 9. Tripartite Architectural Comparison
+## 10. Tripartite Architectural Comparison
 
 | Loading Property | Classic .NET Framework (4.8) | Modern .NET (.NET 10) | C++/CLI Mixed Mode (IJW) |
 |---|---|---|---|
@@ -384,7 +479,7 @@ Because C++/CLI mixed assemblies execute managed initialization code within `Dll
 
 ---
 
-## 10. Reproducibility & Falsification Matrix
+## 11. Reproducibility & Falsification Matrix
 
 | Claim ID | Technical Claim | Status | Target Configuration | Verification Command | Raw Empirical Observation | Falsification Condition |
 |---|---|---|---|---|---|---|
@@ -396,3 +491,4 @@ Because C++/CLI mixed assemblies execute managed initialization code within `Dll
 | **CPP-06** | **Call site uses direct indirect jump (`adrp + ldr + br`) without P/Invoke** | `[EXPERIMENTALLY CONFIRMED]` | Disassembly of `MixedLib!NativeCallsManaged` | `u MixedLib!NativeCallsManaged L3` | `adrp x9, MixedLib+0xA000; ldr x9, [x9]; br x9` | Compiler generating P/Invoke marshaling IL stub. |
 | **CPP-07** | **IJW Transition Thunk consists of `adr + ldr + br` followed by 32-byte descriptor** | `[EXPERIMENTALLY CONFIRMED]` | `MixedExe.exe` under `cdb.exe` ARM64 | `u poi(MixedLib+0xA000) L4` | `adr xip0; ldr xip1; br xip1` followed by handler, base, slot, and MethodDef token | Complex multi-instruction stub without embedded descriptor packet. |
 | **CPP-08** | **Managed exception caught by native C++ frame through `clr!UMThunkStub`** | `[EXPERIMENTALLY CONFIRMED]` | `MixedExe.exe` throwing managed exception | `sxe 0xe0434352; g; k 20; q` | Stack reveals `clr!IL_Throw` $\to$ `clr!UMThunkStub` $\to$ native `catch` block | Unhandled 0xE0434352 crash or termination without hitting native catch. |
+| **CPP-09** | **C++/CLI `__declspec(thread)` uses Win32 TLS template (`DataDirectory[9]`), while `[ThreadStatic]` delegates to `clr!JIT_GetNonGCThreadStaticBase_Helper`** | `[EXPERIMENTALLY CONFIRMED]` | `MixedExe.exe` running multi-threaded TLS test | PowerShell PE parser + CDB breakpoint on `clr!JIT_GetNonGCThreadStaticBase_Helper` | `DataDirectory[9] RVA=0x8800`, Worker Thread `__declspec(thread)` initializes to 1234, while `[ThreadStatic]` defaults to 0 (cctor runs once). | Native TLS omitting `IMAGE_TLS_DIRECTORY64` or `[ThreadStatic]` re-running `.cctor` on secondary threads. |
