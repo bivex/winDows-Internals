@@ -162,6 +162,48 @@ TestAot!S_P_CoreLib_System_AppContextConfigHelper__GetInt16Config+0x120:
 3. **No validation wrapper:** There is no call to `__guard_check_icall_fptr` or `ntdll!LdrpValidateUserCallTarget`.
 4. **Immediate branch:** `blr xip0` executes immediately.
 
+### 4.4 Empirical Byte-Level Memory Dump via cdb
+
+Direct memory dumps from `cdb` reveal the exact machine code bytes for the NativeAOT indirect call site, the dispatch cell, and the runtime target:
+
+#### A. Call Site Machine Code Bytes (`TestAot+0xa238`):
+```text
+0:000> db TestAot+0xa238 L14
+00007ff6`bef6a238  cb 07 00 d0 6b 81 26 91-70 01 40 f9 00 02 3f d6  ....k.&.p.@...?.
+00007ff6`bef6a248  16 7c 00 13                                      .|..
+```
+| Byte Sequence (Little-Endian) | ARM64 Instruction | Disassembly Semantics |
+|---|---|---|
+| `cb 07 00 d0` | `d00007cb` | `adrp x11, TestAot!_InterfaceDispatchCellSection_Start` |
+| `6b 81 26 91` | `9126816b` | `add  x11, x11, #0x9A0` (Compute cell address `0x...649A0`) |
+| `70 01 40 f9` | `f9400170` | `ldr  xip0, [x11]` (Read target pointer from `.data`) |
+| `00 02 3f d6` | `d63f0200` | `blr  xip0` (Indirect call without CFG or BTI check) |
+
+#### B. Interface Dispatch Cell Bytes in `.data` (`0x00007ff6bf0649a0`):
+```text
+0:000> db TestAot!_InterfaceDispatchCellSection_Start L20
+00007ff6`bf0649a0  b0 d3 fb be f6 7f 00 00-ab cf fc ff 00 00 00 00  ................
+00007ff6`bf0649b0  b0 d3 fb be f6 7f 00 00-bb cf fc ff 00 00 00 00  ................
+
+0:000> dp TestAot!_InterfaceDispatchCellSection_Start L4
+00007ff6`bf0649a0  00007ff6`befbd3b0 00000000`fffccfab
+00007ff6`bf0649b0  00007ff6`befbd3b0 00000000`fffccfbb
+```
+- **First 8 bytes (`b0 d3 fb be f6 7f 00 00`):** Target function pointer `0x00007ff6befbd3b0` (`TestAot!RhpInitialInterfaceDispatch`).
+- **Next 8 bytes (`ab cf fc ff 00 00 00 00`):** Interface metadata token (`0x00000000fffccfab`).
+- Resides in `PAGE_READWRITE` memory for the entire life of the process.
+
+#### C. Initial Dispatch Stub Target (`TestAot!RhpInitialInterfaceDispatch`):
+```text
+0:000> db TestAot!RhpInitialInterfaceDispatch L10
+00007ff6`befbd3b0  1f 00 40 f9 03 00 00 14-00 00 00 00 00 00 00 00  ..@.............
+```
+| Byte Sequence | ARM64 Instruction | Disassembly Semantics |
+|---|---|---|
+| `1f 00 40 f9` | `f940001f` | `ldr xzr, [x0]` (Null-pointer check on `this`) |
+| `03 00 00 14` | `14000003` | `b   TestAot!RhpInterfaceDispatchSlow` |
+
+
 ---
 
 ## 5. ARM64 Hardware Defense Matrix: BTI, PAC, and CFG
