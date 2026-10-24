@@ -101,3 +101,38 @@ extern "C" __declspec(dllexport) void TestBothTls(int threadId) {
            GetCurrentThreadId(), threadId, g_nativeThreadLocal, &g_nativeThreadLocal);
     ManagedClass::TestManagedTls(threadId);
 }
+
+// ----------------------------------------------------------------------------
+// 5. Pointer Anatomy: gcroot, pin_ptr, and interior_ptr
+// ----------------------------------------------------------------------------
+struct NativeHolder {
+    msclr::gcroot<String^> m_managedStr;
+    int m_nativeId;
+};
+
+extern "C" __declspec(dllexport) int TestPointerAnatomy() {
+    printf("[MixedLib!TestPointerAnatomy] Starting Pointer Anatomy Test...\n");
+    
+    // 1. gcroot<T>: Allocate native struct on C++ heap holding managed string
+    NativeHolder* pHolder = new NativeHolder();
+    pHolder->m_managedStr = gcnew String("Hello from Managed Heap via gcroot!");
+    pHolder->m_nativeId = 42;
+    
+    printf("  [gcroot] NativeHolder at %p, sizeof(gcroot) = %zu, nativeId = %d\n", 
+           pHolder, sizeof(pHolder->m_managedStr), pHolder->m_nativeId);
+    
+    // 2. pin_ptr<T>: Pin managed array in memory
+    array<int>^ arr = gcnew array<int>(10);
+    arr[0] = 12345;
+    pin_ptr<int> pinnedPtr = &arr[0];
+    int* pRaw = pinnedPtr;
+    printf("  [pin_ptr] Managed array pinned at %p, raw value = %d\n", pRaw, *pRaw);
+    
+    // 3. interior_ptr<T>: Managed byref pointer inside array
+    cli::interior_ptr<int> interiorPtr = &arr[1];
+    *interiorPtr = 67890;
+    printf("  [interior_ptr] Interior pointer at %p, value = %d\n", interiorPtr, *interiorPtr);
+    
+    delete pHolder;
+    return 1;
+}

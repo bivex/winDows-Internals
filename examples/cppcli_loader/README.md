@@ -107,6 +107,13 @@ MixedExe.exe
 [MixedLib!TestBothTls] OS Thread 0x1A28 (ID 1): g_nativeThreadLocal = 1236 (&g_native = 000001686110A094)
   [ManagedClass] Thread 1: s_managedThreadLocal = 5680
 
+>>> EXPERIMENT 4: Pointer Anatomy (gcroot, pin_ptr, interior_ptr) <<<
+[MixedLib!TestPointerAnatomy] Starting Pointer Anatomy Test...
+  [gcroot] NativeHolder at 0000027E8A12ACE0, sizeof(gcroot) = 8, nativeId = 42
+  [pin_ptr] Managed array pinned at 0000027E8B046988, raw value = 12345
+  [interior_ptr] Interior pointer at 0000027E8B04698C, value = 67890
+>>> Pointer Anatomy Result: 1 (Expected: 1) <<<
+
 ====================================================================
   All C++/CLI IJW Loader Scenarios Verified Successfully
 ====================================================================

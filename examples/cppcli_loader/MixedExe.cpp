@@ -18,6 +18,7 @@ extern "C" {
     __declspec(dllimport) int  NativeCallsManaged(int x);
     __declspec(dllimport) int  TestMixedSeh(int x);
     __declspec(dllimport) void TestBothTls(int threadId);
+    __declspec(dllimport) int  TestPointerAnatomy();
 }
 
 DWORD WINAPI WorkerThreadProc(LPVOID lpParam) {
@@ -63,6 +64,13 @@ int main() {
     printf("\n[Main Thread - Pass 2 (Revisit)]\n");
     TestBothTls(1);
 
+
+    // ------------------------------------------------------------------------
+    // Experiment 4: Pointer Anatomy (gcroot, pin_ptr, interior_ptr)
+    // ------------------------------------------------------------------------
+    printf("\n>>> EXPERIMENT 4: Pointer Anatomy (gcroot, pin_ptr, interior_ptr) <<<\n");
+    int ptrResult = TestPointerAnatomy();
+    printf(">>> Pointer Anatomy Result: %d (Expected: 1) <<<\n", ptrResult);
     printf("\n====================================================================\n");
     printf("  All C++/CLI IJW Loader Scenarios Verified Successfully\n");
     printf("====================================================================\n");
