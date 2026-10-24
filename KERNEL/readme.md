@@ -103,6 +103,7 @@ For a detailed from-scratch checklist, see [ColdStart.md](ColdStart.md).
 - [C++/CLI Mixed-Mode (IJW) Loader Research](CppCLI_IJW_Loader_Research.md) — Hybrid native/managed PE, VTable fixups, lazy IJW thunk back-patching, and loader lock deadlocks.
 - [NativeAOT Loader & Execution Internals Research](NativeAOT_Loader_Internals_Research.md) — The 4th loading architecture: zero external CLR modules, statically linked Workstation GC, RhpNewFast bump allocator, and IEEType layout.
 - [CLR GC Collection Algorithm & Compaction Research](GC_Collection_Algorithm_Research.md) — The closing arch: gc1 phase sequence (mark, plan, relocate, compact), card table scanning, physical memory sliding, finalization queues, and NativeAOT GC identity.
+- [C++/CLI Execution Security Surface Research](RoP_CppCLI_Execution_Research.md) — RWX thunk heap, writable VTableFixup indirect branch targets, and missing Control Flow Guard in mixed-mode assemblies.
 
 ### Option B — manual steps
 
