@@ -422,21 +422,54 @@ Disassembly after write:
 #### Experiment B: Overwriting VTableFixup Function Pointer in .data
 
 **Command:** `eq MixedLib+0xA008 0xDEADBEEFDEADBEEF` (writes sentinel value to slot[1])
-
 ```text
-=== VTableFixup SLOT ARRAY BEFORE ===
-00007ff8`1a4ba000  000001cf`66502058 000001cf`66502088
-00007ff8`1a4ba010  000001cf`665020b8 000001cf`665020e8
-                    ─── Slot[0] ───  ─── Slot[1] ───
+=== STEP 1: Wait for CLR JIT initialization to complete ===
+(sxe ld:clrjit.dll; g)
 
-=== WRITING 0xDEADBEEFDEADBEEF TO SLOT[1] ===
+=== STEP 2: Dump VTableFixup slots (now pointing to JIT code) ===
+00007ff8`1a4ba000  00007fff`8aee0020 00007fff`8aee00a0  ← Slot[1] = JIT address
+00007ff8`1a4ba010  00007fff`8aee0120 00007fff`8aee01a0
 
-=== VTableFixup SLOT ARRAY AFTER ===
-00007ff8`1a4ba000  000001cf`66502058 deadbeef`deadbeef  ◄── SLOT HIJACKED!
-00007ff8`1a4ba010  000001cf`665020b8 000001cf`665020e8
+=== STEP 3: Write sentinel 0x4141414141414141 to slot[1] ===
+0:000> eq MixedLib+0xA008 0x4141414141414141
+
+=== STEP 4: Verify write ===
+00007ff8`1a4ba000  00007fff`8aee0020 41414141`41414141  ← OVERWRITTEN!
+00007ff8`1a4ba010  00007fff`8aee0120 00007fff`8aee01a0
+
+=== STEP 5: Continue execution ===
+0:000> g
+(1fec.1dd4): Unknown exception - code c00000aa (first chance)
+(1fec.1dd4): Unknown exception - code c00000aa (!!! second chance !!!)
+
+=== STEP 6: Check crash state ===
+0:000> r pc
+pc=4141414141414141                    ◄── PROGRAM COUNTER AT OUR VALUE!
+
+0:000> k 5
+Child-SP          RetAddr               Call Site
+00000085`29f4f910 00007ff7`39d21540     0x41414141`41414141  ← CRASHED AT SENTINEL
+00000085`29f4f930 00007ff7`39d2193c     MixedExe+0x1540     ← Called NativeCallsManaged
+00000085`29f4f970 00007ff7`39d219d4     MixedExe+0x19d4
 ```
 
-**Result:** Slot[1] (used by `NativeCallsManaged` for its indirect branch `ldr x9, [x9, #8]; br x9`) was overwritten with `0xDEADBEEFDEADBEEF`. On the next call to `NativeCallsManaged`, the `br x9` instruction would attempt to branch to this invalid address — **proving that a single 8-byte write redirects control flow**.
+**Definitive proof of Single-Write Control Flow Hijack:**
+1. Slot[1] originally held `00007fff`8aee00a0` (JIT-compiled `ManagedClass::Compute` address in the CLR JIT code heap).
+2. After `eq` write, slot held `0x4141414141414141`.
+3. When `NativeCallsManaged` executed `ldr x9, [x9, #8]; br x9`, it loaded our sentinel and branched to it.
+4. **`pc = 0x4141414141414141`** — the CPU jumped to EXACTLY the value we wrote.
+5. Exception `0xC00000AA` (`STATUS_INSTRUCTION_MISALIGNMENT`) because `0x41...41` is odd (not 4-byte aligned for ARM64).
+6. **No CFG check, no page protection, no integrity validation prevented this redirect.**
+
+**Timeline of slot value states:**
+```
+State 1 (Disk):     0x00000000`06000001     (MethodDef metadata token)
+State 2 (Loaded):   0x000001cf`66502088     (IJW Thunk in RWX heap — also hijackable)
+State 3 (JIT):      0x00007fff`8aee00a0     (JIT compiled code — also hijackable)
+State 4 (Hijacked): 0x41414141`41414141     (Attacker-controlled — CRASHED HERE)
+```
+
+**Note on timing:** The first attempt to write `0xDEADBEEFDEADBEEF` too early (before CLR JIT loaded) did not produce a crash because execution hadn't reached the call site yet — the CLR was still mapping modules via `NtMapViewOfSection`. The write itself succeeded in memory both times; the difference is that the second attempt allowed execution to proceed to the actual `br x9` instruction.
 
 #### Write Protection Summary
 
@@ -473,7 +506,7 @@ u <address> L2      ; Disassemble to verify instruction decode
 ---
 
 | **ROP-09** | **Arbitrary bytes written to RWX thunk memory are immediately decoded as executable instructions** | `[EXPERIMENTALLY CONFIRMED]` | `MixedExe.exe` under `cdb.exe` ARM64 | `eb poi(MixedLib+0xA000) c0 03 5f d6; u poi(MixedLib+0xA000) L1` | Bytes `10000010` (adr) changed to `d65f03c0` (ret), disassembled correctly as `ret` | Page protection rejecting write or CPU refusing to execute modified bytes. |
-| **ROP-10** | **Single 8-byte write to VTableFixup slot redirects indirect branch target** | `[EXPERIMENTALLY CONFIRMED]` | `MixedExe.exe` under `cdb.exe` ARM64 | `eq MixedLib+0xA008 0xDEADBEEFDEADBEEF; dp MixedLib+0xA000 L2` | Slot[1] value changed from `000001cf`66502088` to `deadbeef`deadbeef` without any protection trigger | Write access violation, CFG rejection, or integrity check preventing slot modification. |
+| **ROP-10** | **Single 8-byte write to VTableFixup slot causes `pc` to jump to written value (execution crash proof)** | `[EXPERIMENTALLY CONFIRMED]` | `MixedExe.exe` after CLR JIT init, under `cdb.exe` ARM64 | `sxe ld:clrjit.dll; g; eq MixedLib+0xA008 0x4141414141414141; g; r pc` | `pc=4141414141414141`, exception `0xC00000AA` (misalignment), stack: `0x41414141`41414141` ← `MixedExe+0x1540` | Page protection rejecting write, CFG validating target, or `pc` remaining at legitimate address. |
 ## 7. Reproducibility & Falsification Matrix
 
 | Claim ID | Technical Claim | Status | Target Configuration | Verification Command | Raw Empirical Observation | Falsification Condition |
