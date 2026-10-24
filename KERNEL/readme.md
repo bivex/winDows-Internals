@@ -99,6 +99,7 @@ For a detailed from-scratch checklist, see [ColdStart.md](ColdStart.md).
 ### Related Documentation & Guides
 - [CDB.EXE User-Mode Debugging Guide](cdb_debugging_guide.md) — Headless scriptable debugging, SOS extension, and reproduction recipes for .NET.
 - [C# / .NET Loader Internals Research](CSharp_Loader_Internals_Research.md) — Comprehensive PE, kernel, and runtime execution pipeline analysis.
+- [CoreCLR Runtime Internals Research](CLR_Runtime_Internals_Research.md) — Object layout, MethodTable, virtual dispatch (VSD), GC write barriers, and card tables.
 
 ### Option B — manual steps
 
