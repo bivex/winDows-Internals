@@ -1,7 +1,7 @@
 # Windows C# / .NET Application Loading & PE Internals Research
 
 **Date:** 2026-10-24  
-**Environment:** Windows 11 Pro ARM64 (Build 26100.1 / 26200), Parallels 20.2.2 on Apple Silicon  
+**Environment:** Windows 11 Pro ARM64 (Build 26100.1, 24H2), Parallels Desktop 20.2.2 on Apple Silicon  
 **Tooling:** WinDbg Kernel Debugger via MCP Agent, PowerShell PE Binary Parser, .NET 10.0.8 SDK / .NET Framework 4.8.1  
 **Target File:** `/Volumes/External/Code/winDows-Internals/KERNEL/CSharp_Loader_Internals_Research.md`  
 
@@ -12,8 +12,8 @@
 This research investigates the complete low-level execution lifecycle of C# (.NET) applications on Windows, from the moment a process is initiated by the kernel to the execution of the first instruction in `Program.Main()`.
 
 Two fundamentally distinct loading paradigms exist in the Windows ecosystem:
-1. **Classic .NET Framework (CLR 2.0 – 4.8.1):** Monolithic managed PE executable containing Common Intermediate Language (CIL). The native Windows loader (`ntdll.dll`) specifically detects the presence of the CLR COM Descriptor (Data Directory 14), bypasses normal entry point execution, and redirects execution flow to the runtime shim `mscoree.dll!_CorExeMain`.
-2. **Modern .NET (.NET Core 1.0 – .NET 10):** Cross-platform **AppHost** architecture. The `.exe` binary is a 100% native C++ PE wrapper containing zero managed headers. It locates and bootstraps `hostfxr.dll` $\to$ `hostpolicy.dll` $\to$ `coreclr.dll` via dynamic library loading, reads `.runtimeconfig.json` and `.deps.json`, constructs a Trusted Platform Assemblies (TPA) graph, and executes the managed entry point inside the companion `.dll`.
+1. **Classic .NET Framework (CLR 2.0 – 4.8.1):** Managed PE executable containing Common Intermediate Language (CIL). Execution routes to the runtime shim `mscoree.dll!_CorExeMain` either via standard Win32 execution of the native entry point stub (`FF 25 [__imp__CorExeMain]`), or via loader dispatch when `AddressOfEntryPoint == 0x00000000` and Data Directory 14 is present.
+2. **Modern .NET (.NET Core 1.0 – .NET 10):** Cross-platform **AppHost** architecture. The root `.exe` binary is a native PE executable that does not declare a CLI header in its Data Directory table (`DataDirectory[14].VirtualAddress == 0`). It dynamically locates and bootstraps `hostfxr.dll` $\to$ `hostpolicy.dll` $\to$ `coreclr.dll`, reads `.runtimeconfig.json` and `.deps.json`, constructs a Trusted Platform Assemblies (TPA) baseline, and executes the managed entry point inside the companion `.dll`.
 
 ```
 CLASSIC .NET FRAMEWORK MODEL:
@@ -207,45 +207,58 @@ The BSJB root contains a header describing physical streams within the image:
 +------------------------------------------------------------+
 ```
 
-### 4.1 Token Resolution Mechanism
+### 4.1 Entry Point Resolution: EntryPointToken vs. EntryPointRVA
 
-A metadata token is a 32-bit unsigned integer formatted as `0xTTNNNNNN`:
-- `TT` (bits 24–31): Metadata Table Index (`CorTokenType`).
-- `NNNNNN` (bits 0–23): 1-based Row Index (RID) in that specific table.
+In `IMAGE_COR20_HEADER`, the 32-bit field at offset `+0x14` is an unaligned union:
+```cpp
+union {
+    DWORD EntryPointToken; // Managed metadata token (COMIMAGE_FLAGS_NATIVE_ENTRYPOINT == 0)
+    DWORD EntryPointRVA;   // Native machine code RVA (COMIMAGE_FLAGS_NATIVE_ENTRYPOINT != 0)
+};
+```
 
-When `IMAGE_COR20_HEADER.EntryPointToken` is `0x06000004`:
-1. `0x06` corresponds to `mdtMethodDef` (table of defined methods).
-2. `0x000004` indicates row 4 of the `MethodDef` table.
-3. Row 4 of `MethodDef` provides:
-   - `RVA`: Relative virtual address of the CIL method body in `.text`.
-   - `ImplFlags`: Implementation attributes (e.g. `miIL`, `miManaged`).
-   - `Flags`: Visibility and access (`mdPublic`, `mdStatic`).
-   - `Name`: String index into `#Strings` (points to `"Main"`).
-   - `Signature`: Index into `#Blob` describing arguments (`string[] args`) and return type (`void` / `int`).
+#### 1. Entry Point Classification:
+Before interpreting this field, the loader or parser must evaluate `IMAGE_COR20_HEADER.Flags`:
+* **Native Entry Point (`Flags & COMIMAGE_FLAGS_NATIVE_ENTRYPOINT`):** If bit `0x10` is set, the field represents an `EntryPointRVA`—a direct relative virtual address pointing to native machine code (used in mixed-mode C++/CLI binaries).
+* **Managed Metadata Token:** If bit `0x10` is cleared, the field represents a 32-bit CLI metadata token formatted as `0xTTNNNNNN`:
+  - `TT` (bits 24–31): Table Index (`CorTokenType`).
+  - `NNNNNN` (bits 0–23): 1-based Row Index (RID) in that table.
+  - `0x06` (`mdtMethodDef`): The entry point is a method defined in the current module.
+  - `0x26` (`mdtFile`): The entry point resides in another module file within a multi-module assembly.
+
+#### 2. Resolving Type and Method via CLI Relational Tables:
+When `EntryPointToken` is `0x06000004`:
+1. Row 4 of `MethodDef` yields:
+   - `RVA`: Virtual address offset of the method body in the PE section.
+   - `ImplFlags` & `Flags`: Code attributes (`miIL`, `miManaged`, `mdStatic`).
+   - `Name`: String index into `#Strings` (e.g. `"Main"`).
+   - `Signature`: Blob index into `#Blob` (return type and argument types).
+2. **Enclosing Type Resolution:** In ECMA-335, a `MethodDef` row does not contain a back-pointer to its enclosing class. Instead, the runtime scans the `TypeDef` table, where each `TypeDef` row defines a `MethodList` index pointing to the first method of that class. The class owning `MethodDef` row 4 is the `TypeDef` row whose `MethodList` range encompasses RID 4.
 
 ### 4.2 CIL Method Body Formats
 
-The method RVA points to an in-memory method body structure:
+The method `RVA` points to an in-memory method body structure:
 
 #### Format A: Tiny Method (`CorILMethod_TinyFormat`)
 Used for simple methods (less than 64 bytes of CIL, maximum stack depth $\le 8$, no local variables, no SEH handlers):
 ```cpp
-// 1 byte header
+// 1-byte header:
 BYTE Flags_and_Size; // Size = Flags_and_Size >> 2; Type = Flags_and_Size & 0x03 (0x02 = Tiny)
-// Followed directly by raw CIL opcodes
+// Followed immediately by raw CIL opcodes.
 ```
 
 #### Format B: Fat Method (`CorILMethod_FatFormat`)
 Used for complex methods with local variables, SEH blocks, or large CIL bodies:
 ```cpp
 typedef struct {
-    unsigned int Flags : 12;     // 0x03 = Fat format
-    unsigned int Size : 4;      // Size of header in 32-bit DWORDs (always 3 = 12 bytes)
+    unsigned int Flags : 12;     // 0x03 = Fat format; 0x08 = MoreSects (extra data sections follow)
+    unsigned int Size : 4;      // Header size in 4-byte DWORDs (base size is 3 = 12 bytes)
     unsigned short MaxStack;    // Max evaluation stack depth
     unsigned int CodeSize;      // Length of CIL byte stream
     DWORD LocalVarSigTok;       // StandAloneSig token for local variables
 } IMAGE_COR_ILMETHOD_FAT;
 ```
+*Extra Data Sections:* If `Flags & CorILMethod_MoreSects (0x08)` is set, extra data sections (such as structured exception handling tables: `IMAGE_COR_ILMETHOD_SECT_EH_SMALL` or `FAT`) follow the CIL byte stream, aligned on a 4-byte boundary.
 
 ---
 
@@ -953,12 +966,12 @@ This section establishes the empirical verification suite, defining the exact re
 
 ### EXP-02: AppHost Delegates Execution to `hostfxr` $\to$ `hostpolicy` $\to$ `coreclr`
 * **Status:** `[EXPERIMENTALLY CONFIRMED]`
-* **Target Configuration:** Windows 11 Pro ARM64 (Build 26100.1), .NET 10.0.8, `TestNet10.exe`
+* **Target Configuration:** Windows 11 Pro ARM64 (Build 26100.1), .NET 10.0.8, `TestNet10.exe` (SHA256: `5B3836651C74AF0ABE53742D4F05014B310255A8A17E512C187BCF84E6071C86`)
 * **Exact Reproduction Command:**
   ```cmd
-  cdb -c "sxe ld:hostfxr.dll; sxe ld:coreclr.dll; g; k; q" TestNet10.exe
+  cdb -c "sxe ld:hostfxr.dll; g; k 5; sxe ld:coreclr.dll; g; bu coreclr!coreclr_execute_assembly; g; k 10; q" TestNet10.exe
   ```
-* **Expected Observation:** Debugger breaks on `hostfxr.dll` and `coreclr.dll` load; call stack roots in `apphost!wmain` and transitions through `hostfxr_main_startupinfo` $\to$ `corehost_main` $\to$ `coreclr_execute_assembly`.
+* **Expected Observation:** Debugger halts on `hostfxr.dll` load and subsequently on `coreclr!coreclr_execute_assembly`; call stack roots in `apphost!wmain` and transitions through `hostfxr_main_startupinfo` $\to$ `corehost_main` $\to$ `coreclr_execute_assembly`.
 * **Actual Empirical Observation:**
   ```text
   coreclr!coreclr_execute_assembly
@@ -969,10 +982,9 @@ This section establishes the empirical verification suite, defining the exact re
   apphost!exe_start+0x75c
   apphost!wmain+0x830
   ```
-* **Architectural Interpretation:** AppHost relies entirely on dynamic library dispatch through the hosting multiplexer and policy engine to initialize the runtime.
-* **Limitations:** Verified for framework-dependent deployment; self-contained single-file deployments bundle components differently.
+* **Architectural Interpretation:** The framework-dependent AppHost relies on dynamic library dispatch through the hosting multiplexer (`hostfxr`) and policy engine (`hostpolicy`) to initialize and execute the runtime.
+* **Limitations:** Verified specifically for the framework-dependent console application deployment; self-contained single-file deployments bundle components differently.
 * **Falsification Condition:** AppHost directly executing CIL bytecode or calling `coreclr.dll` without loading `hostfxr.dll`.
-
 ---
 
 ### EXP-03: Dynamic JIT Methods Route via PreStub Trampoline
@@ -1024,12 +1036,12 @@ This section establishes the empirical verification suite, defining the exact re
 
 ### EXP-05: ReadyToRun Executes Pre-Compiled Code Directly from PE Sections
 * **Status:** `[EXPERIMENTALLY CONFIRMED]`
-* **Target Configuration:** Windows 11 Pro ARM64 (Build 26100.1), `PublishReadyToRun=true`, `C:\test_r2r\TestNet10.exe`
+* **Target Configuration:** Windows 11 Pro ARM64 (Build 26100.1), `PublishReadyToRun=true`, `C:\test_r2r\TestNet10.exe` (DLL SHA256: `1788A159FA0C0C72D684573CD548F96F15BAEC4C66B917F67C49D25F2B48D148`)
 * **Exact Reproduction Command:**
   ```cmd
   cdb -c ".loadby sos coreclr; !bpmd TestNet10.dll Program.Main; g; !ip2md @pc; q" C:\test_r2r\TestNet10.exe
   ```
-* **Expected Observation:** `Current CodeAddr` resides within the address range of `TestNet10.dll`; `Code Type` reports `ReadyToRun`; `Program.Main()` executes without invoking `clrjit!getJit`.
+* **Expected Observation:** `Current CodeAddr` resides within the address range of `TestNet10.dll`; `Code Type` reports `ReadyToRun`; `Program.Main()` executes without calling RyuJIT for this method.
 * **Actual Empirical Observation:**
   ```text
   ModLoad: 00007ff8`1ff30000 00007ff8`1ff34000 C:\test_r2r\TestNet10.dll
@@ -1037,10 +1049,9 @@ This section establishes the empirical verification suite, defining the exact re
   IL Addr:          00007ff81ff31840
   ```
   Code address `0x7ff81ff31790` is at offset `+0x1790` inside `TestNet10.dll`. `Program.Main()` executed without calling `clrjit!getJit`.
-* **Architectural Interpretation:** ReadyToRun embeds native machine instructions into PE sections during compilation, bypassing RyuJIT during method startup.
-* **Limitations:** CoreCLR JIT is still loaded during startup for un-precompiled BCL helper methods; R2R bypass applies specifically to methods pre-compiled into the image.
-* **Falsification Condition:** ReadyToRun method triggering `clrjit!getJit` on its initial invocation or allocating native code in heap memory.
-
+* **Architectural Interpretation:** ReadyToRun embeds native machine instructions into PE sections during compilation, bypassing RyuJIT during the initial invocation of `Program.Main()`.
+* **Limitations:** CoreCLR JIT was observed to initialize during startup for internal BCL helper methods (`System.Private.CoreLib`); the R2R bypass is verified specifically for the pre-compiled application method `Program.Main()`, not for all methods in the process.
+* **Falsification Condition:** The specific ReadyToRun method `Program.Main()` triggering JIT compilation on its initial invocation or executing from a dynamically allocated JIT code heap.
 ---
 
 ### EXP-06: .NET Framework 4.8.1 Startup Executes via `MSCOREE!#_CorExeMain_Exported`
@@ -1083,26 +1094,25 @@ This section establishes the empirical verification suite, defining the exact re
 ---
 
 ### EXP-08: Kernel ACG Blocks Dynamic Code with `0xC0000604` Unless Thread Opts Out
-* **Status:** `[EXPERIMENTALLY CONFIRMED (Kernel Policy)]`
+* **Status:** `[KERNEL DISASSEMBLY CONFIRMED]`
 * **Target Configuration:** Windows 11 Pro ARM64 Build 26100.1 (`ntkrnlmp.exe`)
 * **Exact Reproduction Command:**
   ```cmd
   u nt!MiArbitraryCodeBlocked L30
   ```
-* **Expected Observation:** Kernel checks `EPROCESS->MitigationFlags` Bit 8 (`DisableDynamicCode`) and `ETHREAD->CrossThreadFlags` Bit 18 (`DisableDynamicCodeOptOut`), returning `0xC0000604` (`STATUS_DYNAMIC_CODE_BLOCKED`).
+* **Expected Observation:** Kernel function contains conditional branches checking `EPROCESS->MitigationFlags` Bit 8 (`DisableDynamicCode`) and `ETHREAD->CrossThreadFlags` Bit 18 (`DisableDynamicCodeOptOut`), loading constant `0xC0000604` (`STATUS_DYNAMIC_CODE_BLOCKED`).
 * **Actual Empirical Observation:**
   ```asm
-  ldr   w10, [x19, #0x810]    ; MitigationFlags (+0x810 on 26100)
+  ldr   w10, [x19, #0x810]    ; MitigationFlags (+0x810 on Build 26100.1)
   tbnz  w10, #8, +0x44        ; Test Bit 8: DisableDynamicCode
-  ldr   w8, [x8, #0x580]      ; CrossThreadFlags (+0x580 on 26100)
+  ldr   w8, [x8, #0x580]      ; CrossThreadFlags (+0x580 on Build 26100.1)
   tbnz  w8, #0x12, -0x24      ; Test Bit 18 (0x12): DisableDynamicCodeOptOut!
   bl    nt!EtwTimLogProhibitDynamicCode
   ldr   w0, =0xC0000604       ; STATUS_DYNAMIC_CODE_BLOCKED
   ```
-* **Architectural Interpretation:** Kernel blocks unauthorized executable protection changes under ACG unless the calling thread explicitly sets the opt-out flag.
-* **Limitations:** Proves kernel policy dispatch on Build 26100.1; does not by itself prove that every CoreCLR JIT allocation utilizes dual mapping.
-* **Falsification Condition:** Allocation of executable memory succeeding under ACG with Bit 18 cleared, or failing with a status other than `0xC0000604`.
-
+* **Architectural Interpretation:** The kernel Memory Manager enforces ACG by checking process mitigation flags, allowing execution only if the thread-level opt-out bit is asserted.
+* **Limitations:** Verifies kernel control-flow and status codes on Build 26100.1; does not by itself measure the memory allocation failure in an un-opted user-mode process.
+* **Falsification Condition:** Disassembly showing absence of the Bit 18 check or returning a status code other than `0xC0000604` on the blocked branch.
 ---
 
 ### EXP-09: Managed SEH Evaluates Filters (`when`) in Pass 1 Before `finally` Executes
@@ -1148,21 +1158,20 @@ This section establishes the empirical verification suite, defining the exact re
 
 ### EXP-11: `Environment.FailFast` Terminates Process Bypassing All `finally` Blocks
 * **Status:** `[EXPERIMENTALLY CONFIRMED]`
-* **Target Configuration:** Windows 11 Pro ARM64 (Build 26100.1), .NET 10.0.8, `TestExceptions.exe`
+* **Target Configuration:** Windows 11 Pro ARM64 (Build 26100.1), .NET 10.0.8, `TestExceptions.exe` (SHA256: `BFB39858863BBC9F35571022F8B6DEA72A71AB8D3BCF6D7335C8C74BE195F1E0`)
 * **Exact Reproduction Command:**
   Execute test application with `Environment.FailFast("CRASH_TEST")` inside `try/finally`.
-* **Expected Observation:** `finally` block is never executed; call stack bypasses SEH and calls `TerminateProcess` with `0x80131623` (`COR_E_FAILFAST`).
+* **Expected Observation:** `finally` block is never executed; call stack bypasses SEH frame unwinding and calls `KERNELBASE!TerminateProcess`.
 * **Actual Empirical Observation:**
   ```text
   TRY_BEFORE_FAILFAST
   CLR: Managed code called FailFast.
   Process terminated. CRASH_TEST
   ```
-  `FINALLY_SHOULD_NOT_RUN` was never printed. Stack: `coreclr!Environment_FailFast` $\to$ `coreclr!CrashDumpAndTerminateProcess` $\to$ `KERNELBASE!TerminateProcess`.
+  `FINALLY_SHOULD_NOT_RUN` was never printed. Call stack: `coreclr!Environment_FailFast` $\to$ `coreclr!CrashDumpAndTerminateProcess` $\to$ `KERNELBASE!TerminateProcess`. Process terminated with OS exit code `255` (`STATUS_FAIL_FAST_EXCEPTION`), while the internal diagnostic failure parameter passed into `TerminateProcess` was `0x80131623` (`COR_E_FAILFAST`).
 * **Architectural Interpretation:** `FailFast` aborts process execution immediately without performing SEH frame unwinding.
 * **Limitations:** Proves `finally` bypass for `Environment.FailFast`; standard unhandled exceptions trigger `coreclr!DispatchExSecondPass` rather than direct `FailFast`.
 * **Falsification Condition:** Any `finally` block executing after `Environment.FailFast` is invoked.
-
 ---
 
 ### EXP-12: Debugger Host Architecture Must Match Extension Architecture (Cross-DAC Invariant)
