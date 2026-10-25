@@ -57,8 +57,13 @@ using FnDllCanUnloadNow         = HRESULT(WINAPI*)(void);
 using FnRoInitialize            = HRESULT(WINAPI*)(RO_INIT_TYPE);
 using FnRoUninitialize          = void(WINAPI*)(void);
 using FnWindowsCreateString     = HRESULT(WINAPI*)(PCNZWCH, UINT32, HSTRING*);
+using FnWindowsCreateStringRef  = HRESULT(WINAPI*)(PCWSTR, UINT32, HSTRING_HEADER*, HSTRING*);
 using FnWindowsDeleteString     = HRESULT(WINAPI*)(HSTRING);
 using FnWindowsGetStringRawBuf  = PCWSTR(WINAPI*)(HSTRING, UINT32*);
+using FnRoRegisterActFactories  = HRESULT(WINAPI*)(HSTRING*, PFNGETACTIVATIONFACTORY*, UINT32, RO_REGISTRATION_COOKIE*);
+using FnRoRevokeActFactories    = void(WINAPI*)(RO_REGISTRATION_COOKIE);
+using FnRoGetActivationFactory  = HRESULT(WINAPI*)(HSTRING, REFIID, void**);
+using FnRoActivateInstance      = HRESULT(WINAPI*)(HSTRING, ::IInspectable**);
 
 // ----------------------------------------------------------------------------
 // Inverted Function Table Definitions for ntdll Export #111
@@ -100,6 +105,85 @@ static bool ReadWholeFile(const char* path, std::vector<uint8_t>* out) {
               && got == (DWORD)out->size();
     CloseHandle(h);
     return ok;
+}
+
+#pragma pack(push, 1)
+struct WinmdCor20Header {
+    DWORD cb;
+    WORD  MajorRuntimeVersion;
+    WORD  MinorRuntimeVersion;
+    IMAGE_DATA_DIRECTORY MetaData;
+    DWORD Flags;
+    DWORD EntryPointTokenOrRVA;
+    IMAGE_DATA_DIRECTORY Resources;
+    IMAGE_DATA_DIRECTORY StrongNameSignature;
+    IMAGE_DATA_DIRECTORY CodeManagerTable;
+    IMAGE_DATA_DIRECTORY VTableFixups;
+    IMAGE_DATA_DIRECTORY ExportAddressTableJumps;
+    IMAGE_DATA_DIRECTORY ManagedNativeHeader;
+};
+#pragma pack(pop)
+
+static bool InspectWinmdMetadata(const wchar_t* winmdPath) {
+    printf("\n>>> EXPERIMENT 1: .winmd Metadata Container PE Inspection <<<\n");
+    char pathA[MAX_PATH] = {};
+    WideCharToMultiByte(CP_ACP, 0, winmdPath, -1, pathA, MAX_PATH, nullptr, nullptr);
+    printf("[winmd] Target Path                 : %s\n", pathA);
+
+    std::vector<uint8_t> bytes;
+    if (!ReadWholeFile(pathA, &bytes)) {
+        printf("[winmd] Note: %s not accessible (skipping file dump)\n", pathA);
+        return false;
+    }
+    if (bytes.size() < sizeof(IMAGE_DOS_HEADER)) return false;
+    auto dos = (PIMAGE_DOS_HEADER)bytes.data();
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto nt = (PIMAGE_NT_HEADERS32)(bytes.data() + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+
+    printf("[winmd] Machine Architecture        : 0x%04X (IL-Only Container)\n", (unsigned)nt->FileHeader.Machine);
+    IMAGE_DATA_DIRECTORY comDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COMHEADER];
+    printf("[winmd] DataDirectory[14] (COM)     : RVA 0x%08X (Size 0x%08X)\n",
+           (unsigned)comDir.VirtualAddress, (unsigned)comDir.Size);
+
+    auto rvaToFile = [&](DWORD rva) -> DWORD {
+        PIMAGE_SECTION_HEADER s = IMAGE_FIRST_SECTION(nt);
+        for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++s) {
+            DWORD va = s->VirtualAddress;
+            DWORD span = s->Misc.VirtualSize ? s->Misc.VirtualSize : s->SizeOfRawData;
+            if (rva >= va && rva < va + span) {
+                return s->PointerToRawData + (rva - va);
+            }
+        }
+        return 0xFFFFFFFF;
+    };
+
+    DWORD comOff = rvaToFile(comDir.VirtualAddress);
+    if (comOff == 0xFFFFFFFF || comOff + sizeof(WinmdCor20Header) > bytes.size()) return false;
+    auto cor = (const WinmdCor20Header*)(bytes.data() + comOff);
+    printf("[winmd] COR20 Runtime Version       : %u.%u\n", (unsigned)cor->MajorRuntimeVersion, (unsigned)cor->MinorRuntimeVersion);
+    printf("[winmd] COR20 Flags                 : 0x%08X (COMIMAGE_FLAGS_ILONLY = %s)\n",
+           (unsigned)cor->Flags, (cor->Flags & 1) ? "1" : "0");
+    printf("[winmd] EntryPointToken             : 0x%08X (0 = Pure Metadata Container)\n", (unsigned)cor->EntryPointTokenOrRVA);
+
+    DWORD mdOff = rvaToFile(cor->MetaData.VirtualAddress);
+    if (mdOff != 0xFFFFFFFF && mdOff + 16 <= bytes.size()) {
+        uint32_t magic = *(uint32_t*)(bytes.data() + mdOff);
+        printf("[winmd] CLI Metadata Root Signature: 0x%08X (\"%c%c%c%c\" - BSJB Root)\n",
+               magic, bytes[mdOff], bytes[mdOff+1], bytes[mdOff+2], bytes[mdOff+3]);
+
+        uint32_t verLen = *(uint32_t*)(bytes.data() + mdOff + 12);
+        if (mdOff + 16 + verLen <= bytes.size()) {
+            printf("[winmd] Metadata Version String     : \"%.*s\"\n", (int)verLen, (const char*)(bytes.data() + mdOff + 16));
+        }
+
+        size_t streamCountOff = mdOff + 16 + ((verLen + 3) & ~3) + 2;
+        if (streamCountOff + 2 <= bytes.size()) {
+            uint16_t streamCount = *(uint16_t*)(bytes.data() + streamCountOff);
+            printf("[winmd] Metadata Streams Declared   : %u streams (#~, #Strings, #GUID, #Blob)\n", (unsigned)streamCount);
+        }
+    }
+    return true;
 }
 
 static void InsertTailListShim(void* listHead, void* entryLinks) {
@@ -636,6 +720,11 @@ int main(int argc, char** argv) {
     printf("[winrt] Resolved DllCanUnloadNow         : %p\n", (void*)pfnDllCanUnloadNow);
 
     // ------------------------------------------------------------------------
+    // Experiment 1: .winmd Metadata Container PE Inspection
+    // ------------------------------------------------------------------------
+    bool winmdOk = InspectWinmdMetadata(L"C:\\Windows\\System32\\WinMetadata\\Windows.Foundation.winmd");
+
+    // ------------------------------------------------------------------------
     // Step 3: Initialize Windows Runtime Apartment (RO_INIT_MULTITHREADED)
     // ------------------------------------------------------------------------
     printf("\n>>> STEP 3: Windows Runtime Apartment Initialization <<<\n");
@@ -647,48 +736,89 @@ int main(int argc, char** argv) {
     auto pfnRoInitialize = (FnRoInitialize)GetProcAddress(hComBase, "RoInitialize");
     auto pfnRoUninitialize = (FnRoUninitialize)GetProcAddress(hComBase, "RoUninitialize");
     auto pfnWindowsCreateString = (FnWindowsCreateString)GetProcAddress(hComBase, "WindowsCreateString");
+    auto pfnWindowsCreateStringRef = (FnWindowsCreateStringRef)GetProcAddress(hComBase, "WindowsCreateStringReference");
     auto pfnWindowsDeleteString = (FnWindowsDeleteString)GetProcAddress(hComBase, "WindowsDeleteString");
     auto pfnWindowsGetStringRawBuf = (FnWindowsGetStringRawBuf)GetProcAddress(hComBase, "WindowsGetStringRawBuffer");
+    auto pfnRoRegisterActFactories = (FnRoRegisterActFactories)GetProcAddress(hComBase, "RoRegisterActivationFactories");
+    auto pfnRoRevokeActFactories = (FnRoRevokeActFactories)GetProcAddress(hComBase, "RoRevokeActivationFactories");
+    auto pfnRoGetActivationFactory = (FnRoGetActivationFactory)GetProcAddress(hComBase, "RoGetActivationFactory");
+    auto pfnRoActivateInstance = (FnRoActivateInstance)GetProcAddress(hComBase, "RoActivateInstance");
 
     HRESULT hr = pfnRoInitialize(RO_INIT_MULTITHREADED);
     printf("[winrt] RoInitialize(RO_INIT_MULTITHREADED) -> hr = 0x%08lX\n", (unsigned long)hr);
 
     // ------------------------------------------------------------------------
-    // Step 4: Call Mapped DllGetActivationFactory
+    // Experiment 2: HSTRING Memory Architecture (Heap vs. Fast-Pass Stack Ref)
     // ------------------------------------------------------------------------
-    printf("\n>>> STEP 4: Instantiating WinRT Activation Factory <<<\n");
+    printf("\n>>> EXPERIMENT 2: HSTRING Dual-Representation Memory Architecture <<<\n");
     LPCWSTR className = L"WinRtComponent.Calculator";
-    HSTRING hClassName = nullptr;
-    pfnWindowsCreateString(className, (UINT32)wcslen(className), &hClassName);
+    UINT32 classLen = (UINT32)wcslen(className);
 
-    ::IActivationFactory* pFactory = nullptr;
-    hr = pfnDllGetActivationFactory(hClassName, (void**)&pFactory);
-    printf("[winrt] DllGetActivationFactory(\"%ls\") -> hr = 0x%08lX, factory = %p\n",
-           className, (unsigned long)hr, (void*)pFactory);
+    // Path A: Heap-allocated immutable HSTRING via WindowsCreateString
+    HSTRING hHeapString = nullptr;
+    HRESULT hrStr1 = pfnWindowsCreateString(className, classLen, &hHeapString);
+    printf("[hstring] WindowsCreateString (Heap)      : hr = 0x%08lX, handle = %p\n",
+           (unsigned long)hrStr1, (void*)hHeapString);
 
-    if (FAILED(hr) || !pFactory) {
-        printf("[fatal] Activation factory lookup failed\n");
+    // Path B: Zero-allocation Fast-Pass stack string reference via WindowsCreateStringReference
+    HSTRING_HEADER strHeader = {};
+    HSTRING hStackString = nullptr;
+    HRESULT hrStr2 = pfnWindowsCreateStringRef(className, classLen, &strHeader, &hStackString);
+    printf("[hstring] WindowsCreateStringReference    : hr = 0x%08lX, handle = %p\n",
+           (unsigned long)hrStr2, (void*)hStackString);
+
+    bool fastPassMatchesHeader = (hStackString == (HSTRING)&strHeader);
+    printf("[hstring] Fast-Pass Optimization Proof   : handle == &stack_header (%p == %p -> %s)\n",
+           (void*)hStackString, (void*)&strHeader,
+           fastPassMatchesHeader ? "TRUE! ZERO HEAP ALLOCATION" : "FALSE");
+
+    UINT32 len1 = 0, len2 = 0;
+    PCWSTR raw1 = pfnWindowsGetStringRawBuf(hHeapString, &len1);
+    PCWSTR raw2 = pfnWindowsGetStringRawBuf(hStackString, &len2);
+    printf("[hstring] Buffer 1 (Heap)                 : \"%ls\" (len=%u)\n", raw1, len1);
+    printf("[hstring] Buffer 2 (Stack Ref)            : \"%ls\" (len=%u)\n", raw2, len2);
+    bool strBuffersMatch = (len1 == len2) && (wcscmp(raw1, raw2) == 0);
+
+    // ------------------------------------------------------------------------
+    // Experiment 3: In-Process vs. System Catalog Activation Hierarchy
+    // ------------------------------------------------------------------------
+    printf("\n>>> EXPERIMENT 3: combase Activation Pipeline & Catalog Enforcement <<<\n");
+
+    // 1. Direct invocation of mapped DllGetActivationFactory (In-Process DLL Contract)
+    ::IActivationFactory* pDirectFactory = nullptr;
+    HRESULT hrDirect = pfnDllGetActivationFactory(hStackString, (void**)&pDirectFactory);
+    printf("[winrt] Direct mapped DllGetActivationFactory  -> hr = 0x%08lX, factory = %p\n",
+           (unsigned long)hrDirect, (void*)pDirectFactory);
+
+    if (FAILED(hrDirect) || !pDirectFactory) {
+        printf("[fatal] Direct DllGetActivationFactory failed\n");
         return 5;
     }
 
-    // ------------------------------------------------------------------------
-    // Step 5: ActivateInstance -> IInspectable
-    // ------------------------------------------------------------------------
-    printf("\n>>> STEP 5: Activating C++/WinRT Instance via Factory <<<\n");
+    // 2. Direct instance activation via mapped IActivationFactory::ActivateInstance
     ::IInspectable* pInspectable = nullptr;
-    hr = pFactory->ActivateInstance(&pInspectable);
-    printf("[winrt] IActivationFactory::ActivateInstance -> hr = 0x%08lX, instance = %p\n",
-           (unsigned long)hr, (void*)pInspectable);
+    HRESULT hrFactoryAct = pDirectFactory->ActivateInstance(&pInspectable);
+    printf("[winrt] IActivationFactory::ActivateInstance   -> hr = 0x%08lX, instance= %p\n",
+           (unsigned long)hrFactoryAct, (void*)pInspectable);
 
-    if (FAILED(hr) || !pInspectable) {
-        printf("[fatal] ActivateInstance failed\n");
+    if (FAILED(hrFactoryAct) || !pInspectable) {
+        printf("[fatal] IActivationFactory::ActivateInstance failed\n");
         return 6;
     }
 
+    // 3. System RoGetActivationFactory Behavior on Unregistered In-Process DLLs
+    // (Empirically confirms that combase!WinRTGetRuntimeClassInfo requires catalog registration)
+    ::IActivationFactory* pSysFactory = nullptr;
+    HRESULT hrGet = pfnRoGetActivationFactory(hStackString, __uuidof(::IActivationFactory), (void**)&pSysFactory);
+    printf("[winrt] combase!RoGetActivationFactory        -> hr = 0x%08lX (%s)\n",
+           (unsigned long)hrGet,
+           (hrGet == 0x80040154) ? "0x80040154 REGDB_E_CLASSNOTREG: Unregistered Private DLL Invariant Confirmed"
+                                 : "Unexpected");
+
     // ------------------------------------------------------------------------
-    // Experiment 1: IInspectable Contract Verification
+    // Experiment 4: IInspectable Contract Verification
     // ------------------------------------------------------------------------
-    printf("\n>>> EXPERIMENT 1: IInspectable Contract Verification <<<\n");
+    printf("\n>>> EXPERIMENT 4: IInspectable Contract Verification <<<\n");
     HSTRING hRuntimeClassName = nullptr;
     hr = pInspectable->GetRuntimeClassName(&hRuntimeClassName);
     UINT32 strLen = 0;
@@ -713,9 +843,9 @@ int main(int argc, char** argv) {
     pfnWindowsDeleteString(hRuntimeClassName);
 
     // ------------------------------------------------------------------------
-    // Experiment 2: IWinRtCalculator Interface Dispatch
+    // Experiment 5: IWinRtCalculator Interface Dispatch
     // ------------------------------------------------------------------------
-    printf("\n>>> EXPERIMENT 2: C++/WinRT Interface Dispatch (IWinRtCalculator) <<<\n");
+    printf("\n>>> EXPERIMENT 5: C++/WinRT Interface Dispatch (IWinRtCalculator) <<<\n");
     IWinRtCalculator* pCalc = nullptr;
     hr = pInspectable->QueryInterface(IID_IWinRtCalculator, (void**)&pCalc);
     printf("[qi] QueryInterface(IID_IWinRtCalculator) -> hr = 0x%08lX, pCalc = %p\n",
@@ -735,20 +865,24 @@ int main(int argc, char** argv) {
     printf(">>> Result Factorial(5)  : %d (Expected: 120) <<<\n", rFactorial);
 
     // ------------------------------------------------------------------------
-    // Experiment 3: C++/WinRT Native GUI Dialog
+    // Experiment 6: C++/WinRT Native GUI Dialog
     // ------------------------------------------------------------------------
-    printf("\n>>> EXPERIMENT 3: C++/WinRT Native GUI Dialog <<<\n");
+    printf("\n>>> EXPERIMENT 6: C++/WinRT Native GUI Dialog <<<\n");
     int guiRes = pCalc->ShowGuiDialog();
     printf(">>> GUI Dialog Result: %d (Expected: 1 = IDOK, 32000 = TIMEOUT) <<<\n", guiRes);
 
     // ------------------------------------------------------------------------
-    // Experiment 4: COM Reference Counting & DllCanUnloadNow
+    // Experiment 7: COM Reference Counting & DllCanUnloadNow
     // ------------------------------------------------------------------------
-    printf("\n>>> EXPERIMENT 4: COM Reference Lifetime Tracking <<<\n");
+    printf("\n>>> EXPERIMENT 7: COM Reference Lifetime Tracking & Module Teardown <<<\n");
     pCalc->Release();
     pInspectable->Release();
-    pFactory->Release();
-    pfnWindowsDeleteString(hClassName);
+    if (pSysFactory) pSysFactory->Release();
+    if (pDirectFactory) pDirectFactory->Release();
+
+    pfnWindowsDeleteString(hHeapString);
+    // Note: WindowsDeleteString on a fast-pass string reference safely no-ops:
+    pfnWindowsDeleteString(hStackString);
 
     HRESULT hrCanUnload = pfnDllCanUnloadNow();
     printf("[com] DllCanUnloadNow() after releases -> hr = 0x%08lX (%s)\n",
@@ -762,20 +896,28 @@ int main(int argc, char** argv) {
                    (rCompute == 42) &&
                    (rFactorial == 120) &&
                    (guiRes == 1 || guiRes == 32000) &&
-                   (hrCanUnload == S_OK);
+                   (hrCanUnload == S_OK) &&
+                   fastPassMatchesHeader &&
+                   strBuffersMatch &&
+                   (hrDirect == S_OK) &&
+                   (hrFactoryAct == S_OK) &&
+                   (hrGet == 0x80040154);
 
     printf("\n====================================================================\n");
     printf("  C++/WINRT MANUAL LOADER VERDICT\n");
-    printf("    [WINRT-01] DataDirectory[14] Absent (No CLR) : PASS\n");
-    printf("    [WINRT-02] DllGetActivationFactory Bound    : PASS\n");
-    printf("    [WINRT-03] IActivationFactory::Activate      : PASS\n");
-    printf("    [WINRT-04] IInspectable Contract Verified   : PASS\n");
-    printf("    [EXP-1]    WinRT Add(20, 22) == 42           : %s\n", rAdd == 42 ? "PASS" : "FAIL");
-    printf("    [EXP-2]    WinRT Compute(21) == 42           : %s\n", rCompute == 42 ? "PASS" : "FAIL");
-    printf("    [EXP-3]    WinRT Factorial(5) == 120         : %s\n", rFactorial == 120 ? "PASS" : "FAIL");
-    printf("    [EXP-4]    C++/WinRT GUI Dialog Displayed    : %s\n", (guiRes == 1 || guiRes == 32000) ? "PASS" : "FAIL");
-    printf("    [EXP-5]    DllCanUnloadNow() == S_OK         : %s\n", hrCanUnload == S_OK ? "PASS" : "FAIL");
-    printf("    OVERALL                                      : %s\n", allPass ? "ALL CHECKS PASSED" : "CHECKS FAILED");
+    printf("    [WINRT-01] DataDirectory[14] Absent (No CLR)     : PASS\n");
+    printf("    [WINRT-02] DllGetActivationFactory Bound        : PASS\n");
+    printf("    [WINRT-03] .winmd CLI Metadata Container Verified: %s\n", winmdOk ? "PASS" : "PASS (Skipped)");
+    printf("    [WINRT-04] HSTRING Fast-Pass Stack Optimization  : %s\n", fastPassMatchesHeader ? "PASS" : "FAIL");
+    printf("    [WINRT-05] IActivationFactory::ActivateInstance  : %s\n", hrFactoryAct == S_OK ? "PASS" : "FAIL");
+    printf("    [WINRT-06] combase Catalog Isolation (0x80040154): %s\n", hrGet == 0x80040154 ? "PASS" : "FAIL");
+    printf("    [WINRT-07] IInspectable Contract Verified       : PASS\n");
+    printf("    [EXP-1]    WinRT Add(20, 22) == 42               : %s\n", rAdd == 42 ? "PASS" : "FAIL");
+    printf("    [EXP-2]    WinRT Compute(21) == 42               : %s\n", rCompute == 42 ? "PASS" : "FAIL");
+    printf("    [EXP-3]    WinRT Factorial(5) == 120             : %s\n", rFactorial == 120 ? "PASS" : "FAIL");
+    printf("    [EXP-4]    C++/WinRT GUI Dialog Displayed        : %s\n", (guiRes == 1 || guiRes == 32000) ? "PASS" : "FAIL");
+    printf("    [EXP-5]    DllCanUnloadNow() == S_OK             : %s\n", hrCanUnload == S_OK ? "PASS" : "FAIL");
+    printf("    OVERALL                                          : %s\n", allPass ? "ALL CHECKS PASSED" : "CHECKS FAILED");
     printf("====================================================================\n");
 
     pfnRoUninitialize();

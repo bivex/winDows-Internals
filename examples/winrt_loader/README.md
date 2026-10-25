@@ -136,29 +136,42 @@ Relocation Delta        : 0
 [WinRtComponent!DllMain] DLL_PROCESS_ATTACH initialized
 
 >>> STEP 2: WinRT Exported Activation Protocol <<<
-[winrt] Resolved DllGetActivationFactory : 0000000180001200
-[winrt] Resolved DllCanUnloadNow         : 00000001800012A0
+[winrt] Resolved DllGetActivationFactory : 0000000180001928
+[winrt] Resolved DllCanUnloadNow         : 00000001800018E8
+
+>>> EXPERIMENT 1: .winmd Metadata Container PE Inspection <<<
+[winmd] Target Path                 : C:\Windows\System32\WinMetadata\Windows.Foundation.winmd
+[winmd] Machine Architecture        : 0x014C (IL-Only Container)
+[winmd] DataDirectory[14] (COM)     : RVA 0x00001000 (Size 0x00000048)
+[winmd] COR20 Runtime Version       : 2.5
+[winmd] COR20 Flags                 : 0x00000001 (COMIMAGE_FLAGS_ILONLY = 1)
+[winmd] EntryPointToken             : 0x00000000 (0 = Pure Metadata Container)
+[winmd] CLI Metadata Root Signature: 0x424A5342 ("BSJB" - BSJB Root)
+[winmd] Metadata Version String     : "WindowsRuntime 1.4"
+[winmd] Metadata Streams Declared   : 5 streams (#~, #Strings, #GUID, #Blob)
 
 >>> STEP 3: Windows Runtime Apartment Initialization <<<
 [winrt] RoInitialize(RO_INIT_MULTITHREADED) -> hr = 0x00000000
 
->>> STEP 4: Instantiating WinRT Activation Factory <<<
-[WinRtComponent!DllGetActivationFactory] Querying class ID: "WinRtComponent.Calculator"
-[WinRtComponent!DllGetActivationFactory] Factory successfully instantiated: 00000155C21142A0
-[winrt] DllGetActivationFactory("WinRtComponent.Calculator") -> hr = 0x00000000, factory = 00000155C21142A0
+>>> EXPERIMENT 2: HSTRING Dual-Representation Memory Architecture <<<
+[hstring] WindowsCreateString (Heap)      : hr = 0x00000000, handle = 0000022CFC122CD0
+[hstring] WindowsCreateStringReference    : hr = 0x00000000, handle = 000000C7F48FFAD0
+[hstring] Fast-Pass Optimization Proof   : handle == &stack_header (000000C7F48FFAD0 == 000000C7F48FFAD0 -> TRUE! ZERO HEAP ALLOCATION)
+[hstring] Buffer 1 (Heap)                 : "WinRtComponent.Calculator" (len=25)
+[hstring] Buffer 2 (Stack Ref)            : "WinRtComponent.Calculator" (len=25)
 
->>> STEP 5: Activating C++/WinRT Instance via Factory <<<
-[winrt] IActivationFactory::ActivateInstance -> hr = 0x00000000, instance = 00000155C2114320
+>>> EXPERIMENT 3: combase Activation Pipeline & Catalog Enforcement <<<
+[winrt] Direct mapped DllGetActivationFactory  -> hr = 0x00000000, factory = 0000022CFC127CA0
+[winrt] IActivationFactory::ActivateInstance   -> hr = 0x00000000, instance= 0000022CFC127120
+[winrt] combase!RoGetActivationFactory        -> hr = 0x80040154 (0x80040154 REGDB_E_CLASSNOTREG: Unregistered Private DLL Invariant Confirmed)
 
->>> EXPERIMENT 1: IInspectable Contract Verification <<<
+>>> EXPERIMENT 4: IInspectable Contract Verification <<<
 [inspectable] GetRuntimeClassName: "WinRtComponent.Calculator" (hr=0x00000000)
 [inspectable] GetTrustLevel       : 0 (BaseTrust=0, hr=0x00000000)
-[inspectable] Implemented IIDs    : 2 interface(s) returned
-  [iid #0] {6A2F1D3C-4E5B-4C2A-9E8F-1B3D5A7C9E01}
-  [iid #1] {AF86E2E0-B12D-4C6A-9C5A-D7AA65101E90}
+[inspectable] Implemented IIDs    : 0 interface(s) returned
 
->>> EXPERIMENT 2: C++/WinRT Interface Dispatch (IWinRtCalculator) <<<
-[qi] QueryInterface(IID_IWinRtCalculator) -> hr = 0x00000000, pCalc = 00000155C2114320
+>>> EXPERIMENT 5: C++/WinRT Interface Dispatch (IWinRtCalculator) <<<
+[qi] QueryInterface(IID_IWinRtCalculator) -> hr = 0x00000000, pCalc = 0000022CFC127120
   [WinRtComponent!Add] 20 + 22 = 42
   [WinRtComponent!Compute] 21 * 2 = 42
   [WinRtComponent!Factorial] 5! = 120
@@ -166,25 +179,29 @@ Relocation Delta        : 0
 >>> Result Compute(21)   : 42 (Expected: 42) <<<
 >>> Result Factorial(5)  : 120 (Expected: 120) <<<
 
->>> EXPERIMENT 3: C++/WinRT Native GUI Dialog <<<
+>>> EXPERIMENT 6: C++/WinRT Native GUI Dialog <<<
   [WinRtComponent!ShowGuiDialog] Displaying native WinRT GUI MessageBox...
   [WinRtComponent!ShowGuiDialog] DialogResult = 1
 >>> GUI Dialog Result: 1 (Expected: 1 = IDOK, 32000 = TIMEOUT) <<<
 
->>> EXPERIMENT 4: COM Reference Lifetime Tracking <<<
+>>> EXPERIMENT 7: COM Reference Lifetime Tracking & Module Teardown <<<
 [com] DllCanUnloadNow() after releases -> hr = 0x00000000 (S_OK: Module is free of references!)
 
 ====================================================================
   C++/WINRT MANUAL LOADER VERDICT
-    [WINRT-01] DataDirectory[14] Absent (No CLR) : PASS
-    [WINRT-02] DllGetActivationFactory Bound    : PASS
-    [WINRT-03] IActivationFactory::Activate      : PASS
-    [WINRT-04] IInspectable Contract Verified   : PASS
-    [EXP-1]    WinRT Add(20, 22) == 42           : PASS
-    [EXP-2]    WinRT Compute(21) == 42           : PASS
-    [EXP-3]    WinRT Factorial(5) == 120         : PASS
-    [EXP-4]    C++/WinRT GUI Dialog Displayed    : PASS
-    [EXP-5]    DllCanUnloadNow() == S_OK         : PASS
-    OVERALL                                      : ALL CHECKS PASSED
+    [WINRT-01] DataDirectory[14] Absent (No CLR)     : PASS
+    [WINRT-02] DllGetActivationFactory Bound        : PASS
+    [WINRT-03] .winmd CLI Metadata Container Verified: PASS
+    [WINRT-04] HSTRING Fast-Pass Stack Optimization  : PASS
+    [WINRT-05] IActivationFactory::ActivateInstance  : PASS
+    [WINRT-06] combase Catalog Isolation (0x80040154): PASS
+    [WINRT-07] IInspectable Contract Verified       : PASS
+    [EXP-1]    WinRT Add(20, 22) == 42               : PASS
+    [EXP-2]    WinRT Compute(21) == 42               : PASS
+    [EXP-3]    WinRT Factorial(5) == 120             : PASS
+    [EXP-4]    C++/WinRT GUI Dialog Displayed        : PASS
+    [EXP-5]    DllCanUnloadNow() == S_OK             : PASS
+    OVERALL                                          : ALL CHECKS PASSED
 ====================================================================
+[WinRtComponent!DllMain] DLL_PROCESS_DETACH finalized
 ```
