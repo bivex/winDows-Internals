@@ -38,7 +38,7 @@ if %ERRORLEVEL% neq 0 (
 )
 
 echo [*] Compiling CppCliLoader.exe (manual PE loader, no MixedLib.lib link)...
-cl /EHsc CppCliLoader.cpp /Fe:CppCliLoader.exe
+cl /EHsc CppCliLoader.cpp user32.lib /Fe:CppCliLoader.exe
 if %ERRORLEVEL% neq 0 (
     echo [ERROR] Failed to compile CppCliLoader.exe
     exit /b %ERRORLEVEL%

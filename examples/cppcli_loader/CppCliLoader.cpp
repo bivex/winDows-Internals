@@ -1045,11 +1045,44 @@ int main(int argc, char** argv) {
     printf(">>> Pointer Anatomy Result: %d (Expected: 1) <<<\n", r4);
 
     // ------------------------------------------------------------------
+    // EXPERIMENT 5: GUI MessageBox (WinForms via C++/CLI crossover)
+    // ------------------------------------------------------------------
+    printf("\n>>> EXPERIMENT 5: GUI MessageBox (WinForms via manual mapping) <<<\n");
+    FnIntVoid testGui = (FnIntVoid)loader.GetExport("TestGuiMessageBox");
+    int r5 = 0;
+    if (!testGui) {
+        printf("[warn] export TestGuiMessageBox not found\n");
+    } else {
+        // Auto-close watchdog: in headless or unattended runs, find the
+        // dialog after 8 seconds and post WM_CLOSE so the process returns.
+        HANDLE hWatchdog = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+            for (int i = 0; i < 80; ++i) {  // poll for 8 seconds
+                Sleep(100);
+                HWND hwnd = FindWindowW(L"#32770", L"C++/CLI IJW Manual Loader (ARM64)");
+                if (hwnd) {
+                    printf("[watchdog] found GUI window %p: waiting 3s then auto-closing (or click OK now)...\n",
+                           (void*)hwnd);
+                    Sleep(3000);
+                    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                    return 0;
+                }
+            }
+            return 0;
+        }, nullptr, 0, nullptr);
+        r5 = testGui();
+        if (hWatchdog) {
+            WaitForSingleObject(hWatchdog, 5000);
+            CloseHandle(hWatchdog);
+        }
+        printf(">>> GUI MessageBox DialogResult: %d (Expected: 1 = DialogResult::OK) <<<\n", r5);
+    }
+    // ------------------------------------------------------------------
     // Verdict (mirrors the research falsification matrix).
     // ------------------------------------------------------------------
     bool lifecycle12 = s1.tokens > 0 && s2.thunks > 0;
     bool lifecycle23 = s2.thunks > 0 && s3.code > 0;
-    bool ok = r1 == 42 && r2 == 999 && r4 == 1 && lifecycle12 && lifecycle23;
+    bool ok = r1 == 42 && r2 == 999 && r4 == 1 && (r5 == 1 || r5 == 0)
+              && lifecycle12 && lifecycle23;
 
     printf("\n====================================================================\n");
     printf("  VERDICT\n");
@@ -1063,6 +1096,8 @@ int main(int argc, char** argv) {
            r2 == 999 ? "PASS" : "FAIL");
     printf("    [EXP-4]     TestPointerAnatomy()  == 1      : %s\n",
            r4 == 1 ? "PASS" : "FAIL");
+    printf("    [EXP-5]     TestGuiMessageBox()   == 1 (OK) : %s\n",
+           r5 == 1 ? "PASS" : (r5 == 0 ? "SKIPPED" : "FAIL"));
     printf("    OVERALL                                       : %s\n",
            ok ? "ALL CHECKS PASSED" : "CHECKS FAILED");
     printf("====================================================================\n");

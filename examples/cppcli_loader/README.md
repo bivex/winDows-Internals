@@ -173,6 +173,7 @@ VERDICT
   [EXP-1]     NativeCallsManaged(21) == 42    : PASS
   [EXP-2]     TestMixedSeh()        == 999    : PASS
   [EXP-4]     TestPointerAnatomy()  == 1      : PASS
+  [EXP-5]     TestGuiMessageBox()   == 1 (OK) : PASS
   OVERALL                                       : ALL CHECKS PASSED
 ```
 

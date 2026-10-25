@@ -13,6 +13,7 @@
 #include <vcclr.h>
 #include <stdio.h>
 #include <windows.h>
+#using <System.Windows.Forms.dll>
 
 using namespace System;
 
@@ -135,4 +136,31 @@ extern "C" __declspec(dllexport) int TestPointerAnatomy() {
     
     delete pHolder;
     return 1;
+}
+
+// ----------------------------------------------------------------------------
+// 6. GUI: Managed WinForms MessageBox via C++/CLI
+// Called through native VTableFixup dispatch slot. Exercises CLR Fusion
+// assembly resolution (System.Windows.Forms from GAC) under manual mapping.
+// ----------------------------------------------------------------------------
+extern "C" __declspec(dllexport) int TestGuiMessageBox() {
+    printf("[MixedLib!TestGuiMessageBox] showing managed WinForms MessageBox...\n");
+    ::System::Windows::Forms::DialogResult r =
+        ::System::Windows::Forms::MessageBox::Show(
+            "Hello from a MANUALLY MAPPED C++/CLI (IJW) assembly!\n\n"
+            "Execution flow:\n"
+            "1. CppCliLoader maps MixedLib manually (no LoadLibrary)\n"
+            "2. ntdll!RtlRbInsertNodeEx inserts ghost LDR entry\n"
+            "3. Native entry stub tail-jumps to mscoree!_CorDllMain\n"
+            "4. CLR converts VTableFixup slot to IJW thunk\n"
+            "5. First crossover call JIT-compiles ManagedClass\n"
+            "6. WinForms assembly loaded via Fusion GAC\n"
+            "7. Managed MessageBox displayed on desktop!",
+            "C++/CLI IJW Manual Loader (ARM64)",
+            ::System::Windows::Forms::MessageBoxButtons::OK,
+            ::System::Windows::Forms::MessageBoxIcon::Information,
+            ::System::Windows::Forms::MessageBoxDefaultButton::Button1,
+            ::System::Windows::Forms::MessageBoxOptions::ServiceNotification);
+    printf("[MixedLib!TestGuiMessageBox] DialogResult = %d\n", (int)r);
+    return (int)r;
 }
