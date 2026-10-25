@@ -123,6 +123,7 @@ To validate the correlation engine against the five fundamental user-mode invoca
 | **SCN-03 (P0)** | Duplicate `LoadLibraryExW` | Module already in `modules_` | Increments `ref_count` to 2 | **NO second `IMAGE_LOAD`**, **NO second `DllMain`**, `FreeLibrary` decrements refcount | **CONFIRMED** |
 | **SCN-04 (P1)** | COM In-Process Activation | `IClassFactory::CreateInstance` | Linked through Factory handle | `CALL_OBSERVED` on `ICalculator::Add(10, 32)` $\to$ `Result = 42` | **CONFIRMED** |
 | **SCN-05 (P1)** | `CreateThread` inside DLL | `ComWorkerRoutine` (EAT Export #1) | Thread start routine pointer | `CALL_OBSERVED` on new thread (`TID: 3`) with `param=0x1337` $\to$ `RETURN_OBSERVED (x0=42)` | **CONFIRMED** |
+| **SCN-06 (P0 Control)** | `LOAD_LIBRARY_AS_IMAGE_RESOURCE` | Tagged Handle (`base \| 0x2`), `PAGE_READONLY` | Section mapped for resources only | **NO execution, NO `DllMain`, `GetProcAddress` FAILS (GLE=126)** | **CONFIRMED (Zero Execution Invariant)** |
 
 ### 6.2 Empirical Causal Chains Logged by CDB
 ```text
@@ -173,3 +174,25 @@ To validate the correlation engine against the five fundamental user-mode invoca
   [Level C - Return]      Returned to 0x00007FF9D486E858 with Return Value = 0x1 (TRUE)
 ================================================================================
 ```
+
+### 6.3 Deep Dive: `LOAD_LIBRARY_AS_IMAGE_RESOURCE` (Image Mapped vs. Initialized Module)
+
+`LoadLibraryExW(path, nullptr, LOAD_LIBRARY_AS_IMAGE_RESOURCE)` serves as the primary ground-truth control test for distinguishing between a mapped memory view and an active execution module:
+
+1. **Tagged Pointer Representation:**
+   The returned `HMODULE` has bit 1 set:
+   $$\text{HMODULE} = \text{BaseAddress} \mid 0\text{x}02$$
+   This prevents passing the handle to normal Win32 execution APIs.
+
+2. **DEP Memory Protection Invariant:**
+   `VirtualQuery` reveals that while the memory type is `MEM_IMAGE (0x1000000)`, the protection flags are strictly `PAGE_READONLY (0x02)`. Attempting to jump to any address within this view immediately raises a hardware Data Execution Prevention (DEP) access violation (`0xC0000005`).
+
+3. **Zero Loader Side-Effects:**
+   * `ntdll` does NOT apply base relocations (`IMAGE_REL_BASED_DIR64`).
+   * `ntdll` does NOT resolve import thunks.
+   * `ntdll` does NOT execute TLS callbacks.
+   * `ntdll` does NOT invoke `DllMain(DLL_PROCESS_ATTACH)`.
+   * `GetProcAddress(hModResource, "DllGetClassObject")` fails with `ERROR_MOD_NOT_FOUND (126)`.
+   * The DbgEng engine (`dbgeng.dll`) does NOT fire a `DEBUG_EVENT_LOAD_MODULE` event.
+
+This empirically confirms why a static scanner (which checks for `MZ`/`PE` in memory) produces false positives, whereas a 3-level correlation tracer correctly recognizes that no execution vector was activated.

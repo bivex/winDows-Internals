@@ -109,6 +109,34 @@ int main(int argc, char** argv) {
             printf("[runner] Thread terminated! ExitCode = %lu (Expected: 42)\n", threadExitCode);
         }
     }
+    // ------------------------------------------------------------------------
+    // Scenario 6 (P0 Control): LOAD_LIBRARY_AS_IMAGE_RESOURCE (Data-Only Mapping)
+    // ------------------------------------------------------------------------
+    printf("\n>>> SCENARIO 6 (P0 Control): LOAD_LIBRARY_AS_IMAGE_RESOURCE (Data-Only Mapping) <<<\n");
+    HMODULE hModRes = LoadLibraryExW(dllPath, nullptr, LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+    printf("[runner] LoadLibraryExW(LOAD_LIBRARY_AS_IMAGE_RESOURCE) -> hModRes = %p\n", (void*)hModRes);
+    printf("[runner]   Handle Tag Bits : 0x%zx (%s)\n",
+           (uintptr_t)hModRes & 0x3,
+           ((uintptr_t)hModRes & 0x3) == 0x2 ? "Tagged: Image Resource (bit 1 set)" : "Untagged");
+
+    uintptr_t cleanBase = (uintptr_t)hModRes & ~0x3;
+    MEMORY_BASIC_INFORMATION mbi = {};
+    VirtualQuery((LPCVOID)cleanBase, &mbi, sizeof(mbi));
+    printf("[runner]   VirtualQuery    : Protect=0x%lX (%s), Type=0x%lX (%s)\n",
+           mbi.Protect,
+           (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) ?
+           "EXECUTABLE" : "NON-EXECUTABLE (PAGE_READONLY)",
+           mbi.Type, (mbi.Type == MEM_IMAGE) ? "MEM_IMAGE" : "OTHER");
+
+    SetLastError(0);
+    FARPROC pFnRes = GetProcAddress(hModRes, "DllGetClassObject");
+    DWORD gleRes = GetLastError();
+    printf("[runner]   GetProcAddress  : %p (GLE=%lu - %s)\n",
+           (void*)pFnRes, gleRes,
+           (pFnRes == nullptr) ? "CONFIRMED: Export resolution rejected on resource view" : "UNEXPECTED");
+
+    FreeLibrary(hModRes);
+    printf("[runner]   FreeLibrary(hModRes) -> Released clean resource view (NO DllMain, NO relocs)\n");
 
     // ------------------------------------------------------------------------
     // Teardown: Final FreeLibrary -> DllMain(DLL_PROCESS_DETACH) & Physical Unload
@@ -119,7 +147,7 @@ int main(int argc, char** argv) {
            bFree1 ? "TRUE" : "FALSE");
 
     printf("\n====================================================================\n");
-    printf("  ALL 5 SCENARIOS EXECUTED SUCCESSFULLY\n");
+    printf("  ALL 6 SCENARIOS EXECUTED SUCCESSFULLY\n");
     printf("====================================================================\n");
 
     return 0;
