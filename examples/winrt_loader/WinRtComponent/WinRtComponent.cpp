@@ -61,15 +61,15 @@ struct WinRtCalculator : winrt::implements<WinRtCalculator, IWinRtCalculator> {
             L"Activation Path : DllGetActivationFactory -> IActivationFactory\n"
             L"Interface ABI   : IInspectable -> IWinRtCalculator\n"
             L"Apartment State : RO_INIT_MULTITHREADED (combase.dll)\n\n"
-            L"Click OK or wait 4 seconds for auto-close.";
+            L"Click OK to close (or auto-closes in 30 seconds).";
 
         int res = MessageBoxTimeoutW(
             nullptr,
             message,
             title,
-            MB_OK | MB_ICONINFORMATION | MB_SERVICE_NOTIFICATION,
+            MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND,
             0,
-            4000);
+            30000);
 
         printf("  [WinRtComponent!ShowGuiDialog] DialogResult = %d\n", res);
         return res;
