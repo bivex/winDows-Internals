@@ -21,7 +21,7 @@ if %ERRORLEVEL% neq 0 (
 
 :: 2. Compile petrace.dll
 echo [*] Compiling petrace.dll (DbgEng Extension for ARM64)...
-cl /nologo /LD /EHsc /std:c++20 src\petrace.cpp src\pe_analyzer.cpp src\disasm_engine.cpp dbgeng.lib /Fe:petrace.dll
+cl /nologo /LD /EHsc /std:c++20 src\petrace.cpp src\pe_analyzer.cpp src\disasm_engine.cpp src\correlator.cpp src\execution_tracer.cpp dbgeng.lib /Fe:petrace.dll
 if %ERRORLEVEL% neq 0 (
     echo [ERROR] Failed to compile petrace.dll
     exit /b %ERRORLEVEL%
@@ -55,5 +55,5 @@ echo [*] Test 3: Control Flow Graph (CFG) Reconstruction on calc (!pecfg)...
 "%CDB_EXE%" -c ".load C:\test_petrace\petrace.dll; !pecfg calc!wWinMainCRTStartup; .unload C:\test_petrace\petrace.dll; q" calc.exe
 
 echo.
-echo [*] Test 4: PE Invocation Vectors & CFG on ComComponent.dll (!pepaths / !pecfg)...
-"%CDB_EXE%" -c "sxe ld:ComComponent; g; .load C:\test_petrace\petrace.dll; !pepaths ComComponent; !pecfg ComComponent!DllGetClassObject; .unload C:\test_petrace\petrace.dll; q" regsvr32.exe /s C:\test_com_loader\ComComponent.dll
+echo [*] Test 4: Dynamic Level A -> Level C Execution Correlation on ComComponent.dll...
+"%CDB_EXE%" -c "sxe ld:ComComponent; g; .load C:\test_petrace\petrace.dll; !petrace ComComponent; g; !pechains; !pesummary; !peexport C:\test_petrace\com_trace.jsonl; .unload C:\test_petrace\petrace.dll; q" regsvr32.exe /s C:\test_com_loader\ComComponent.dll

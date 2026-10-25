@@ -45,10 +45,24 @@ Reconstructs the basic block topology and **Control Flow Graph (CFG)** from the 
   * Direct calls (`bl <target>`)
   * Indirect branches & calls (`br xn`, `blr xn`)
   * Terminal returns (`ret`)
-* Constructs directed execution edges between basic blocks.
-* Outputs an ASCII block tree or Mermaid flowchart (`[mermaid]` option).
+### 3. `!petrace <module_name>`
+Arms non-halting automated breakpoint traps on all Level A candidates discovered in the module.
+When any candidate is executed by the CPU, CDB triggers an automated handler (`!peonhit`) logging the `CALL_OBSERVED` event with stack trace and parameters, and sets a one-shot continuation trap (`!peonret`) to capture the `RETURN_OBSERVED` event and return value, resuming immediately.
 
-### 3. `!pehelp`
+### 4. `!pechains`
+Displays all confirmed causal execution chains:
+`Level A (Candidate) -> Level B (Resolved) -> Level C (Call Observed) -> Level C (Return Observed)`.
+
+### 5. `!pesummary`
+Displays correlation engine summary statistics across all 3 levels.
+
+### 6. `!peexport [filepath.jsonl]`
+Exports the full structured stream of all recorded Level A/B/C events to a JSONL file.
+
+### 7. `!pedisarm` & `!peclear`
+Disarms active breakpoint traps and clears correlation tables.
+
+### 8. `!pehelp`
 Displays the built-in help and syntax reference manual.
 
 ---
@@ -71,7 +85,7 @@ build.bat
 
 Or manually:
 ```cmd
-cl /nologo /LD /EHsc /std:c++20 src\petrace.cpp src\pe_analyzer.cpp src\disasm_engine.cpp dbgeng.lib /Fe:petrace.dll
+cl /nologo /LD /EHsc /std:c++20 src\petrace.cpp src\pe_analyzer.cpp src\disasm_engine.cpp src\correlator.cpp src\execution_tracer.cpp dbgeng.lib /Fe:petrace.dll
 ```
 
 ### Loading in CDB:
