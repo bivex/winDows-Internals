@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+    <assemblyIdentity
+        type="win32"
+        name="ComComponent"
+        version="1.0.0.0"
+        processorArchitecture="*" />
+    <file name="ComComponent.dll">
+        <comClass
+            clsid="{E5A20C21-48C7-4E26-9635-4D6F6A6E0001}"
+            threadingModel="Both"
+            description="Native In-Process COM Calculator Component" />
+    </file>
+</assembly>
