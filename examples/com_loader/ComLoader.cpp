@@ -396,6 +396,7 @@ void* ComPeLoader::GetExport(const char* name) {
 // Main Test Harness
 // ============================================================================
 int main(int argc, char** argv) {
+    setvbuf(stdout, nullptr, _IONBF, 0);
     printf("====================================================================\n");
     printf("  Windows Native COM Manual PE Loader & Reg-Free COM (SxS) Host\n");
     printf("  Architecture: %s | Windows 11 Build 26200\n", kHostArch);
