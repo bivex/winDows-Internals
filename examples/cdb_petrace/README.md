@@ -68,9 +68,10 @@ Displays the built-in help and syntax reference manual.
 ---
 
 ## Capstone Disassembly Engine Integration
-
-The repository includes the **Capstone Disassembly Engine** (`capstone/`) as a git submodule:
-* Source: `https://github.com/capstone-engine/capstone.git`
+The repository includes the **Capstone Disassembly Engine** (`capstone/`) as a git submodule pinned to **v5.0.9**:
+* Source: `https://github.com/capstone-engine/capstone.git` (tag: `5.0.9`)
+* Statically compiled with `-DCAPSTONE_ARM64_SUPPORT=ON -DCAPSTONE_X86_SUPPORT=ON`
+* Replaces legacy heuristic bit-decoding with full instruction decoding, extracting branch groups (`CS_GRP_JUMP`, `CS_GRP_CALL`, `CS_GRP_RET`) and exact immediate targets for ARM64 and x64 architectures.
 * Provides deep operand decomposition, register read/write tracking, and condition code extraction for advanced instruction-level CFG analysis on ARM64 and x86/x64.
 
 ---
@@ -82,10 +83,9 @@ From a Visual Studio Developer Command Prompt on ARM64:
 ```cmd
 build.bat
 ```
-
-Or manually:
 ```cmd
-cl /nologo /LD /EHsc /std:c++20 src\petrace.cpp src\pe_analyzer.cpp src\disasm_engine.cpp src\correlator.cpp src\execution_tracer.cpp dbgeng.lib /Fe:petrace.dll
+cl /nologo /LD /EHsc /std:c++20 /I ..\capstone\include src\petrace.cpp src\pe_analyzer.cpp src\disasm_engine.cpp src\correlator.cpp src\event_callbacks.cpp src\execution_tracer.cpp dbgeng.lib ..\capstone\build\capstone.lib /Fe:petrace.dll
+```
 
 ### Running the 5-Scenario Verification Matrix:
 ```cmd

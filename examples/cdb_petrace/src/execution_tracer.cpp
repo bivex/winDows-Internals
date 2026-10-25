@@ -1,13 +1,38 @@
 // ============================================================================
-// execution_tracer.cpp — Dynamic Level C Execution Tracer Implementation
+// execution_tracer.cpp — Level C trap engine + Level B API instrumentation
+//
+// Level C: candidate breakpoints (!peonhit) + one-shot return traps (!peonret).
+//          Breakpoint callbacks report REAL OS PID/TID via
+//          IDebugSystemObjects::GetCurrent{Process,Thread}SystemId.
+// Level B: entry traps on KERNEL32!GetProcAddress and ntdll!LdrLoadDll capture
+//          the caller's request (symbol name / module name) and the resolved
+//          address, emitting SYMBOL_RESOLVED / MODULE_LOAD_REQUEST events.
 // ============================================================================
 
 #include "execution_tracer.h"
+#include "event_callbacks.h"
 #include <vector>
 #include <set>
+#include <map>
+#include <string>
 
 // Tracked active breakpoint IDs
 static std::set<ULONG> g_activeBreakpointIds;
+
+// ----------------------------------------------------------------------------
+// Real OS identity helpers (NOT engine handles)
+// ----------------------------------------------------------------------------
+static uint32_t SysPid(DbgEngContext& ctx) {
+    ULONG pid = 0;
+    if (ctx.SystemObjects) ctx.SystemObjects->GetCurrentProcessSystemId(&pid);
+    return pid;
+}
+
+static uint32_t SysTid(DbgEngContext& ctx) {
+    ULONG tid = 0;
+    if (ctx.SystemObjects) ctx.SystemObjects->GetCurrentThreadSystemId(&tid);
+    return tid;
+}
 
 // ----------------------------------------------------------------------------
 // Helper: Disarm All Breakpoints
@@ -28,7 +53,7 @@ HRESULT DisarmAllBreakpoints(DbgEngContext& ctx) {
 }
 
 // ----------------------------------------------------------------------------
-// ArmCandidateBreakpoints
+// ArmCandidateBreakpoints — Level A discovery + Level C traps + Level B hooks
 // ----------------------------------------------------------------------------
 HRESULT ArmCandidateBreakpoints(DbgEngContext& ctx, const char* moduleName) {
     ULONG64 base = ctx.ResolveModuleBase(moduleName);
@@ -49,6 +74,10 @@ HRESULT ArmCandidateBreakpoints(DbgEngContext& ctx, const char* moduleName) {
         return E_FAIL;
     }
 
+    // Subscribe the engine event sink BEFORE arming, so lifecycle events
+    // (LoadModule/UnloadModule/ExitThread/Exception) feed the correlator.
+    PeTraceEventSink::Instance().Register((PDEBUG_CLIENT)ctx.Client);
+
     std::string modStr = moduleName ? moduleName : "TargetModule";
     InvocationCorrelator::Instance().RegisterModule(base, nt.OptionalHeader.SizeOfImage, modStr);
 
@@ -68,7 +97,6 @@ HRESULT ArmCandidateBreakpoints(DbgEngContext& ctx, const char* moduleName) {
         if (SUCCEEDED(hr) && bp) {
             bp->SetOffset(va);
             bp->AddFlags(DEBUG_BREAKPOINT_ENABLED);
-            // Non-halting automated event logging command in CDB:
             bp->SetCommand("!peonhit; g");
 
             ULONG id = 0;
@@ -129,38 +157,61 @@ HRESULT ArmCandidateBreakpoints(DbgEngContext& ctx, const char* moduleName) {
                 // Skip forwarders
                 if (fnRva >= expDir.VirtualAddress && fnRva < expDir.VirtualAddress + expDir.Size) continue;
 
-                ULONG64 fnVa = base + fnRva;
-                armTrap(fnVa, expName, "Exported Function");
+                armTrap(base + fnRva, expName, "Exported Function");
             }
         }
     }
 
-    ctx.Out("\n[tracer] Successfully armed %d candidate breakpoint(s). Resume target ('g') to trace!\n", armedCount);
+    ctx.Out("\n[tracer] Armed %d Level A candidate breakpoint(s).\n", armedCount);
+
+    // ---- Level B: API instrumentation hooks ----
+    int lvlB = 0;
+    auto armApiTrap = [&](const char* sym, const char* cmd, const char* what) {
+        ULONG64 va = 0;
+        if (ctx.Symbols && SUCCEEDED(ctx.Symbols->GetOffsetByName(sym, &va)) && va > 0x10000) {
+            IDebugBreakpoint* bp = nullptr;
+            if (SUCCEEDED(ctx.Control->AddBreakpoint(DEBUG_BREAKPOINT_CODE, DEBUG_ANY_ID, &bp)) && bp) {
+                bp->SetOffset(va);
+                bp->AddFlags(DEBUG_BREAKPOINT_ENABLED);
+                bp->SetCommand(cmd);
+                ULONG id = 0;
+                bp->GetId(&id);
+                g_activeBreakpointIds.insert(id);
+                ctx.Out("  [LEVEL B BP #%u] %s @ 0x%016llX (%s)\n",
+                        id, sym, (unsigned long long)va, what);
+                bp->Release();
+                lvlB++;
+            }
+        }
+    };
+
+    armApiTrap("KERNEL32!GetProcAddress", "!pegpa; g", "symbol resolution");
+    armApiTrap("KERNELBASE!GetProcAddress", "!pegpa; g", "symbol resolution");
+    armApiTrap("ntdll!LdrLoadDll", "!peldll; g", "module load request");
+
+    ctx.Out("[tracer] Armed %d Level B API instrumentation trap(s).\n", lvlB);
     ctx.Out("================================================================================\n\n");
     return S_OK;
 }
 
 // ----------------------------------------------------------------------------
-// OnBreakpointHit
+// Level C: candidate hit
 // ----------------------------------------------------------------------------
 HRESULT OnBreakpointHit(DbgEngContext& ctx) {
     if (!ctx.Control) return E_FAIL;
 
-    // Read Instruction Pointer & Link Register
-    DEBUG_VALUE dvPc = {}, dvLr = {}, dvX0 = {}, dvX1 = {};
-    ULONG64 pc = 0, lr = 0, x0 = 0, x1 = 0;
+    DEBUG_VALUE dvPc = {}, dvLr = {}, dvX0 = {}, dvX1 = {}, dvX2 = {};
+    ULONG64 pc = 0, lr = 0, x0 = 0, x1 = 0, x2 = 0;
 
     if (SUCCEEDED(ctx.Control->Evaluate("@$ip", DEBUG_VALUE_INT64, &dvPc, nullptr))) {
         pc = (ULONG64)dvPc.I64;
     }
-    // ARM64 Link Register is @lr (x30); x64 return address is on stack [@rsp]
+    // ARM64: link register @lr (x30); x64: return address at [@rsp]
     if (FAILED(ctx.Control->Evaluate("@lr", DEBUG_VALUE_INT64, &dvLr, nullptr))) {
         ctx.Control->Evaluate("poi(@$csp)", DEBUG_VALUE_INT64, &dvLr, nullptr);
     }
     lr = (ULONG64)dvLr.I64;
 
-    DEBUG_VALUE dvX2 = {};
-    ULONG64 x2 = 0;
     ctx.Control->Evaluate("@x0", DEBUG_VALUE_INT64, &dvX0, nullptr);
     x0 = (ULONG64)dvX0.I64;
     ctx.Control->Evaluate("@x1", DEBUG_VALUE_INT64, &dvX1, nullptr);
@@ -168,11 +219,8 @@ HRESULT OnBreakpointHit(DbgEngContext& ctx) {
     ctx.Control->Evaluate("@x2", DEBUG_VALUE_INT64, &dvX2, nullptr);
     x2 = (ULONG64)dvX2.I64;
 
-    ULONG pid = 0, tid = 0;
-    if (ctx.SystemObjects) {
-        ctx.SystemObjects->GetCurrentProcessId(&pid);
-        ctx.SystemObjects->GetCurrentThreadId(&tid);
-    }
+    uint32_t pid = SysPid(ctx);
+    uint32_t tid = SysTid(ctx);
 
     // Capture stack trace (up to 6 frames)
     DEBUG_STACK_FRAME frames[6] = {};
@@ -191,14 +239,17 @@ HRESULT OnBreakpointHit(DbgEngContext& ctx) {
     size_t plus = bareSym.find('+');
     if (plus != std::string::npos) bareSym = bareSym.substr(0, plus);
 
+    // Arity-aware argument reporting: never publish leftover register noise as
+    // "arguments" of a void(HRESULT) export.
     int arity = GetFunctionArity(bareSym);
-    char det[256] = {};
+    char det[320] = {};
     if (arity == 0) {
         snprintf(det, sizeof(det), "Parameters: void (no arguments)");
     } else if (arity == 1) {
         snprintf(det, sizeof(det), "Arg: param0=0x%016llX", (unsigned long long)x0);
-    } else if (arity == 3 && (bareSym == "DllMain" || bareSym.find("DllMain") != std::string::npos)) {
-        snprintf(det, sizeof(det), "DllMain Args: hinst=0x%016llX, fdwReason=%llu (%s), lpvReserved=0x%016llX",
+    } else if (bareSym.find("DllMain") != std::string::npos) {
+        snprintf(det, sizeof(det),
+                 "DllMain Args: hinst=0x%016llX, fdwReason=%llu (%s), lpvReserved=0x%016llX",
                  (unsigned long long)x0, (unsigned long long)x1,
                  (x1 == 1) ? "DLL_PROCESS_ATTACH" :
                  (x1 == 0) ? "DLL_PROCESS_DETACH" :
@@ -208,9 +259,10 @@ HRESULT OnBreakpointHit(DbgEngContext& ctx) {
         snprintf(det, sizeof(det), "Args: x0=0x%016llX, x1=0x%016llX, x2=0x%016llX",
                  (unsigned long long)x0, (unsigned long long)x1, (unsigned long long)x2);
     } else {
-        snprintf(det, sizeof(det), "Raw Regs: x0=0x%016llX, x1=0x%016llX (Arity unverified)",
+        snprintf(det, sizeof(det), "Raw Regs: x0=0x%016llX, x1=0x%016llX (arity unverified)",
                  (unsigned long long)x0, (unsigned long long)x1);
     }
+
     uint64_t chainId = InvocationCorrelator::Instance().RecordCallObserved(
         pc, lr, lr, pid, tid, stack, det
     );
@@ -220,9 +272,11 @@ HRESULT OnBreakpointHit(DbgEngContext& ctx) {
             (unsigned long long)pc, sym.empty() ? "" : "(", sym.c_str(), sym.empty() ? "" : ")");
     ctx.Out("  Source / Caller: 0x%016llX\n", (unsigned long long)lr);
     ctx.Out("  Thread ID      : %u (PID: %u)\n", tid, pid);
-    ctx.Out("  Parameters     : %s\n", det);
+    ctx.Out("  %s\n", det);
 
-    // Set one-shot return breakpoint on continuation address (lr)
+    // One-shot continuation trap on LR. NOTE: this assumes an ordinary return;
+    // tail calls / exceptions are handled by the event sink invalidating the
+    // in-flight call (OnException / OnThreadExit), not by this trap.
     if (lr > 0x10000) {
         IDebugBreakpoint* retBp = nullptr;
         if (SUCCEEDED(ctx.Control->AddBreakpoint(DEBUG_BREAKPOINT_CODE, DEBUG_ANY_ID, &retBp)) && retBp) {
@@ -237,7 +291,7 @@ HRESULT OnBreakpointHit(DbgEngContext& ctx) {
 }
 
 // ----------------------------------------------------------------------------
-// OnReturnHit
+// Level C: continuation reached
 // ----------------------------------------------------------------------------
 HRESULT OnReturnHit(DbgEngContext& ctx) {
     if (!ctx.Control) return E_FAIL;
@@ -248,22 +302,135 @@ HRESULT OnReturnHit(DbgEngContext& ctx) {
     if (SUCCEEDED(ctx.Control->Evaluate("@$ip", DEBUG_VALUE_INT64, &dvPc, nullptr))) {
         pc = (ULONG64)dvPc.I64;
     }
-    // ARM64 return value in x0; x64 return value in rax
     if (FAILED(ctx.Control->Evaluate("@x0", DEBUG_VALUE_INT64, &dvX0, nullptr))) {
         ctx.Control->Evaluate("@rax", DEBUG_VALUE_INT64, &dvX0, nullptr);
     }
     x0 = (ULONG64)dvX0.I64;
 
-    ULONG pid = 0, tid = 0;
-    if (ctx.SystemObjects) {
-        ctx.SystemObjects->GetCurrentProcessId(&pid);
-        ctx.SystemObjects->GetCurrentThreadId(&tid);
-    }
+    uint32_t pid = SysPid(ctx);
+    uint32_t tid = SysTid(ctx);
 
     InvocationCorrelator::Instance().RecordReturnObserved(pc, pid, tid, x0);
 
-    ctx.Out("<<< [LEVEL C: RETURN_OBSERVED] Return to: 0x%016llX | Return Val: 0x%llX (%lld) | TID: %u >>>\n\n",
+    ctx.Out("<<< [LEVEL C: RETURN_OBSERVED] Return to: 0x%016llX | Ret: 0x%llX (%lld) | TID: %u >>>\n\n",
             (unsigned long long)pc, (unsigned long long)x0, (long long)x0, tid);
 
+    return S_OK;
+}
+
+// ============================================================================
+// LEVEL B — API instrumentation (GetProcAddress / LdrLoadDll)
+// ============================================================================
+struct GpaPending {
+    std::string name;
+    ULONG64 lr = 0;
+};
+
+// Per-OS-TID stacks of in-flight API requests (recursion-safe)
+static std::map<uint32_t, std::vector<GpaPending>> g_gpaPending;
+
+static std::string ReadAnsiString(DbgEngContext& ctx, ULONG64 va, size_t maxLen = 128) {
+    std::string out;
+    if (va <= 0x10000) return out;
+    char buf[129] = {};
+    if (!ctx.ReadMemory(va, buf, (ULONG)maxLen)) return out;
+    buf[maxLen] = '\0';
+    out.assign(buf);
+    return out;
+}
+
+HRESULT OnGetProcAddressEntry(DbgEngContext& ctx) {
+    if (!ctx.Control) return E_FAIL;
+
+    DEBUG_VALUE dvX1 = {}, dvLr = {};
+    ULONG64 x1 = 0, lr = 0;
+    ctx.Control->Evaluate("@x1", DEBUG_VALUE_INT64, &dvX1, nullptr);
+    x1 = (ULONG64)dvX1.I64;
+    ctx.Control->Evaluate("@lr", DEBUG_VALUE_INT64, &dvLr, nullptr);
+    lr = (ULONG64)dvLr.I64;
+
+    std::string name;
+    if (x1 > 0 && x1 <= 0xFFFF) {
+        name = "#" + std::to_string((unsigned)(x1 & 0xFFFF)); // ordinal
+    } else {
+        name = ReadAnsiString(ctx, x1);
+    }
+
+    uint32_t tid = SysTid(ctx);
+    g_gpaPending[tid].push_back({ name, lr });
+
+    // One-shot exit trap on the caller continuation captures the resolved VA
+    if (lr > 0x10000) {
+        IDebugBreakpoint* bp = nullptr;
+        if (SUCCEEDED(ctx.Control->AddBreakpoint(DEBUG_BREAKPOINT_CODE, DEBUG_ANY_ID, &bp)) && bp) {
+            bp->SetOffset(lr);
+            bp->AddFlags(DEBUG_BREAKPOINT_ENABLED | DEBUG_BREAKPOINT_ONE_SHOT);
+            bp->SetCommand("!pegparet; g");
+            bp->Release();
+        }
+    }
+    return S_OK;
+}
+
+HRESULT OnGetProcAddressReturn(DbgEngContext& ctx) {
+    if (!ctx.Control) return E_FAIL;
+
+    DEBUG_VALUE dvX0 = {}, dvLr = {};
+    ULONG64 x0 = 0, lr = 0;
+    ctx.Control->Evaluate("@x0", DEBUG_VALUE_INT64, &dvX0, nullptr);
+    x0 = (ULONG64)dvX0.I64;
+    ctx.Control->Evaluate("@lr", DEBUG_VALUE_INT64, &dvLr, nullptr);
+    lr = (ULONG64)dvLr.I64;
+
+    uint32_t pid = SysPid(ctx);
+    uint32_t tid = SysTid(ctx);
+
+    auto it = g_gpaPending.find(tid);
+    if (it == g_gpaPending.end() || it->second.empty()) return S_OK; // stale / foreign one-shot
+
+    GpaPending p = it->second.back();
+    it->second.pop_back();
+    if (it->second.empty()) g_gpaPending.erase(it);
+
+    if (x0 > 0x10000) {
+        InvocationCorrelator::Instance().RecordSymbolResolved(x0, p.name, pid, tid, p.lr);
+        ctx.Out(">>> [LEVEL B: SYMBOL_RESOLVED] \"%s\" -> 0x%016llX (from caller 0x%016llX, TID %u)\n",
+                p.name.c_str(), (unsigned long long)x0, (unsigned long long)p.lr, tid);
+    }
+    return S_OK;
+}
+
+HRESULT OnLdrLoadDllEntry(DbgEngContext& ctx) {
+    if (!ctx.Control) return E_FAIL;
+
+    // LdrLoadDll(PWSTR path, PDWORD flags, PUNICODE_STRING name, PHMODULE base)
+    // x2 = PUNICODE_STRING { USHORT Length; USHORT MaximumLength; [pad] PWCH Buffer; }
+    DEBUG_VALUE dvX2 = {};
+    ULONG64 x2 = 0;
+    ctx.Control->Evaluate("@x2", DEBUG_VALUE_INT64, &dvX2, nullptr);
+    x2 = (ULONG64)dvX2.I64;
+
+    uint32_t pid = SysPid(ctx);
+    uint32_t tid = SysTid(ctx);
+
+    std::string name = "<unreadable>";
+    if (x2 > 0x10000) {
+        unsigned char us[16] = {};
+        if (ctx.ReadMemory(x2, us, sizeof(us))) {
+            USHORT len = *(USHORT*)(us + 0);
+            ULONG64 buf = *(ULONG64*)(us + 8);
+            if (len > 0 && len <= 520 && buf > 0x10000) {
+                std::vector<WCHAR> w(len / 2 + 1, L'\0');
+                if (ctx.ReadMemory(buf, w.data(), len)) {
+                    char narrow[264] = {};
+                    WideCharToMultiByte(CP_ACP, 0, w.data(), -1, narrow, sizeof(narrow) - 1, nullptr, nullptr);
+                    name = narrow;
+                }
+            }
+        }
+    }
+
+    InvocationCorrelator::Instance().RecordModuleLoadRequest(name, pid, tid);
+    ctx.Out(">>> [LEVEL B: MODULE_LOAD_REQUEST] \"%s\" (TID %u)\n", name.c_str(), tid);
     return S_OK;
 }

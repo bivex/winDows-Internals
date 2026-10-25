@@ -19,14 +19,24 @@ if %ERRORLEVEL% neq 0 (
     )
 )
 
-:: 2. Compile petrace.dll
-echo [*] Compiling petrace.dll (DbgEng Extension for ARM64)...
-cl /nologo /LD /EHsc /std:c++20 src\petrace.cpp src\pe_analyzer.cpp src\disasm_engine.cpp src\correlator.cpp src\execution_tracer.cpp dbgeng.lib /Fe:petrace.dll
+:: 2. Build capstone static library if missing
+if not exist "C:\test_petrace\capstone\build\capstone.lib" (
+    echo [*] Building capstone static library...
+    cd /d C:\test_petrace\capstone
+    cmake -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release -DCAPSTONE_BUILD_CSTOOL=OFF -DCAPSTONE_BUILD_TESTS=OFF -DCAPSTONE_ARCHITECTURE_DEFAULT=OFF -DCAPSTONE_ARM64_SUPPORT=ON -DCAPSTONE_X86_SUPPORT=ON
+    cmake --build build --config Release
+    cd /d C:\test_petrace
+)
+
+:: 3. Compile petrace.dll (linked against capstone)
+echo [*] Compiling petrace.dll (DbgEng Extension for ARM64, capstone decoder)...
+cl /nologo /LD /EHsc /std:c++20 /I C:\test_petrace\capstone\include src\petrace.cpp src\pe_analyzer.cpp src\disasm_engine.cpp src\correlator.cpp src\event_callbacks.cpp src\execution_tracer.cpp dbgeng.lib C:\test_petrace\capstone\build\capstone.lib /Fe:petrace.dll
 if %ERRORLEVEL% neq 0 (
     echo [ERROR] Failed to compile petrace.dll
     exit /b %ERRORLEVEL%
 )
-:: 3. Compile ComComponent.dll (with ComWorkerRoutine) and CorrelatorMatrixRunner.exe
+
+:: 4. Compile ComComponent.dll (with ComWorkerRoutine) and CorrelatorMatrixRunner.exe
 echo [*] Compiling ComComponent.dll and CorrelatorMatrixRunner.exe...
 if not exist "ComComponent" mkdir ComComponent
 if exist "C:\test_com_loader\ComComponent\ComComponent.h" copy /Y "C:\test_com_loader\ComComponent\ComComponent.*" "ComComponent\" >nul
@@ -49,21 +59,16 @@ if not exist "%CDB_EXE%" (
     exit /b 2
 )
 
+:: NOTE: petrace registers an engine event sink (IDebugEventCallbacks), so the
+:: extension is intentionally NOT unloaded mid-session (cdb exits with 'q').
+
 echo [*] Test 1: Extension Help Verification (!pehelp)...
-"%CDB_EXE%" -c ".load C:\test_petrace\petrace.dll; !pehelp; .unload C:\test_petrace\petrace.dll; q" calc.exe
+"%CDB_EXE%" -c ".load C:\test_petrace\petrace.dll; !pehelp; q" calc.exe
 
 echo.
-echo [*] Test 2: PE Invocation Vectors Analysis on calc.exe (!pepaths)...
-"%CDB_EXE%" -c ".load C:\test_petrace\petrace.dll; !pepaths calc; .unload C:\test_petrace\petrace.dll; q" calc.exe
+echo [*] Test 2: Capstone CFG Reconstruction (!pecfg)...
+"%CDB_EXE%" -c ".load C:\test_petrace\petrace.dll; !pecfg calc!wWinMainCRTStartup; q" calc.exe
 
 echo.
-echo [*] Test 3: Control Flow Graph (CFG) Reconstruction on calc (!pecfg)...
-"%CDB_EXE%" -c ".load C:\test_petrace\petrace.dll; !pecfg calc!wWinMainCRTStartup; .unload C:\test_petrace\petrace.dll; q" calc.exe
-
-echo.
-echo [*] Test 4: Dynamic Level A -> Level C Execution Correlation on ComComponent.dll...
-"%CDB_EXE%" -c "sxe ld:ComComponent; g; .load C:\test_petrace\petrace.dll; !petrace ComComponent; g; !pechains; !pesummary; !peexport C:\test_petrace\com_trace.jsonl; .unload C:\test_petrace\petrace.dll; q" regsvr32.exe /s C:\test_com_loader\ComComponent.dll
-
-echo.
-echo [*] Test 5: Full 5-Scenario Matrix Execution on CorrelatorMatrixRunner.exe (!petrace / !pechains)...
-"%CDB_EXE%" -c "sxe ld:ComComponent; g; .load C:\test_petrace\petrace.dll; !petrace ComComponent; g; !pechains; !pesummary; !peexport C:\test_petrace\matrix_trace.jsonl; .unload C:\test_petrace\petrace.dll; q" CorrelatorMatrixRunner.exe ComComponent.dll
+echo [*] Test 3: Full 5-Scenario Matrix with Level A/B/C correlation...
+"%CDB_EXE%" -c "sxe ld:ComComponent; g; .load C:\test_petrace\petrace.dll; !petrace ComComponent; g; !pechains; !pesummary; !peexport C:\test_petrace\matrix_trace.jsonl; q" CorrelatorMatrixRunner.exe ComComponent.dll

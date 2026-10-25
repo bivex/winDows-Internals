@@ -79,9 +79,14 @@ public:
                       const std::string& sym_name, const std::string& type_details);
 
     // Level B: Invocation Correlation
+    void RecordModuleLoadRequest(const std::string& module_name, uint32_t pid, uint32_t tid);
     void RecordSymbolResolved(uint64_t target_va, const std::string& sym_name,
                               uint32_t pid, uint32_t tid, uint64_t caller_va);
 
+    // Lifecycle invalidation (DbgEng event sink): a thread exit or an exception
+    // unwind crossing an in-flight call makes its pending LR return-trap stale.
+    void OnThreadExit(uint32_t tid);
+    void OnException(uint32_t tid);
     // Level C: Execution Trace
     uint64_t RecordCallObserved(uint64_t target_va, uint64_t source_va, uint64_t return_va,
                                 uint32_t pid, uint32_t tid,
@@ -97,6 +102,8 @@ public:
     size_t GetEventCount();
     size_t GetCandidateCount();
     size_t GetConfirmedCallCount();
+
+    size_t GetResolvedCount();
 
     const std::map<uint64_t, TraceEvent>& GetCandidates() const { return candidates_; }
 

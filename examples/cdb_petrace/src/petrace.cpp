@@ -5,6 +5,7 @@
 #include "petrace.h"
 #include "correlator.h"
 #include "execution_tracer.h"
+#include "event_callbacks.h"
 
 #pragma comment(linker, "/EXPORT:DebugExtensionInitialize")
 #pragma comment(linker, "/EXPORT:DebugExtensionUninitialize")
@@ -18,6 +19,9 @@
 #pragma comment(linker, "/EXPORT:peclear")
 #pragma comment(linker, "/EXPORT:peonhit")
 #pragma comment(linker, "/EXPORT:peonret")
+#pragma comment(linker, "/EXPORT:pegpa")
+#pragma comment(linker, "/EXPORT:pegparet")
+#pragma comment(linker, "/EXPORT:peldll")
 #pragma comment(linker, "/EXPORT:pehelp")
 
 static void DbgEngOutputAdapter(const char* text, void* context) {
@@ -39,6 +43,8 @@ __declspec(dllexport) HRESULT CALLBACK DebugExtensionInitialize(PULONG Version, 
 }
 
 __declspec(dllexport) void CALLBACK DebugExtensionUninitialize(void) {
+    // Drop the engine event sink if the extension is being torn down.
+    PeTraceEventSink::Instance().Unregister();
 }
 
 // ----------------------------------------------------------------------------
@@ -67,6 +73,7 @@ __declspec(dllexport) HRESULT CALLBACK pecfg(PDEBUG_CLIENT4 Client, PCSTR Args) 
 
 // ----------------------------------------------------------------------------
 // Command: !petrace <module_name>
+// Arms Level A/C candidate traps + Level B API hooks + engine event sink.
 // ----------------------------------------------------------------------------
 __declspec(dllexport) HRESULT CALLBACK petrace(PDEBUG_CLIENT4 Client, PCSTR Args) {
     DbgEngContext ctx;
@@ -151,7 +158,7 @@ __declspec(dllexport) HRESULT CALLBACK peclear(PDEBUG_CLIENT4 Client, PCSTR Args
 }
 
 // ----------------------------------------------------------------------------
-// Internal Breakpoint Trap Handlers: !peonhit & !peonret
+// Internal Breakpoint Trap Handlers: !peonhit & !peonret (Level C)
 // ----------------------------------------------------------------------------
 __declspec(dllexport) HRESULT CALLBACK peonhit(PDEBUG_CLIENT4 Client, PCSTR Args) {
     DbgEngContext ctx;
@@ -172,6 +179,33 @@ __declspec(dllexport) HRESULT CALLBACK peonret(PDEBUG_CLIENT4 Client, PCSTR Args
 }
 
 // ----------------------------------------------------------------------------
+// Internal Level B API Trap Handlers: !pegpa / !pegparet / !peldll
+// ----------------------------------------------------------------------------
+__declspec(dllexport) HRESULT CALLBACK pegpa(PDEBUG_CLIENT4 Client, PCSTR Args) {
+    DbgEngContext ctx;
+    if (!ctx.Init(Client)) return E_FAIL;
+    HRESULT hr = OnGetProcAddressEntry(ctx);
+    ctx.Release();
+    return hr;
+}
+
+__declspec(dllexport) HRESULT CALLBACK pegparet(PDEBUG_CLIENT4 Client, PCSTR Args) {
+    DbgEngContext ctx;
+    if (!ctx.Init(Client)) return E_FAIL;
+    HRESULT hr = OnGetProcAddressReturn(ctx);
+    ctx.Release();
+    return hr;
+}
+
+__declspec(dllexport) HRESULT CALLBACK peldll(PDEBUG_CLIENT4 Client, PCSTR Args) {
+    DbgEngContext ctx;
+    if (!ctx.Init(Client)) return E_FAIL;
+    HRESULT hr = OnLdrLoadDllEntry(ctx);
+    ctx.Release();
+    return hr;
+}
+
+// ----------------------------------------------------------------------------
 // Command: !pehelp
 // ----------------------------------------------------------------------------
 __declspec(dllexport) HRESULT CALLBACK pehelp(PDEBUG_CLIENT4 Client, PCSTR Args) {
@@ -186,21 +220,24 @@ __declspec(dllexport) HRESULT CALLBACK pehelp(PDEBUG_CLIENT4 Client, PCSTR Args)
     ctx.Out("       Enumerates all 6 static invocation vectors (EntryPoint, TLS, EAT,\n");
     ctx.Out("       CFG targets, .pdata SEH, COM/CLI headers) and registers candidates.\n\n");
     ctx.Out("    !pecfg <function_symbol | address> [mermaid]\n");
-    ctx.Out("       Reconstructs the basic block topology and CFG from function entry to ret.\n\n");
-    ctx.Out("  LEVEL B & C: DYNAMIC CORRELATION & EXECUTION TRACE\n");
+    ctx.Out("       Basic-block CFG reconstruction (capstone decoder; AArch64 + x64).\n\n");
+    ctx.Out("  LEVEL B: INVOCATION CORRELATION (API instrumentation)\n");
+    ctx.Out("    Armed automatically by !petrace: entry traps on\n");
+    ctx.Out("    KERNEL32/KERNELBASE!GetProcAddress and ntdll!LdrLoadDll.\n");
+    ctx.Out("    Emits SYMBOL_RESOLVED (name -> address) and MODULE_LOAD_REQUEST.\n\n");
+    ctx.Out("  LEVEL C: EXECUTION TRACE\n");
     ctx.Out("    !petrace <module_name>\n");
-    ctx.Out("       Arms dynamic non-halting breakpoint traps on all Level A candidates.\n");
-    ctx.Out("       When hit, logs CALL_OBSERVED and arms return traps for RETURN_OBSERVED.\n\n");
-    ctx.Out("    !pechains\n");
-    ctx.Out("       Displays all confirmed causal execution chains (Candidate -> Call -> Return).\n\n");
-    ctx.Out("    !pesummary\n");
-    ctx.Out("       Prints correlation engine summary counts across all 3 levels.\n\n");
-    ctx.Out("    !peexport [filepath.jsonl]\n");
-    ctx.Out("       Exports the full JSONL stream of all recorded Level A/B/C events.\n\n");
-    ctx.Out("    !pedisarm\n");
-    ctx.Out("       Removes all active tracer breakpoint traps.\n\n");
-    ctx.Out("    !peclear\n");
-    ctx.Out("       Resets correlation tables, module registry, and event streams.\n");
+    ctx.Out("       Arms non-halting traps on all Level A candidates. Each hit logs\n");
+    ctx.Out("       CALL_OBSERVED (with real OS PID/TID, stack, arity-aware args)\n");
+    ctx.Out("       plus a one-shot return trap (RETURN_OBSERVED). Engine lifecycle\n");
+    ctx.Out("       events (LoadModule/UnloadModule/ExitThread/Exception) are sinked\n");
+    ctx.Out("       automatically and invalidate stale return traps.\n\n");
+    ctx.Out("  REPORTING\n");
+    ctx.Out("    !pechains    Confirmed causal chains (A -> B -> C)\n");
+    ctx.Out("    !pesummary   Level counters\n");
+    ctx.Out("    !peexport [file.jsonl]  JSONL event stream export\n");
+    ctx.Out("    !pedisarm    Remove tracer breakpoints\n");
+    ctx.Out("    !peclear     Reset correlator state\n");
     ctx.Out("================================================================================\n\n");
 
     ctx.Release();

@@ -20,6 +20,9 @@ enum class TraceEventKind {
     ModuleRefIncrement,
     ModuleRefDecrement,
     EntryCandidate,
+
+    // Level B — Invocation Correlation (probable link, API-instrumented)
+    ModuleLoadRequest,
     SymbolResolved,
 
     // Level C — Execution Trace (Confirmed control transfer observed by CPU)
@@ -78,7 +81,7 @@ struct TraceEvent {
         case TraceEventKind::ImageUnload:        return "IMAGE_UNLOAD";
         case TraceEventKind::ModuleRefIncrement: return "MODULE_REF_INCREMENT";
         case TraceEventKind::ModuleRefDecrement: return "MODULE_REF_DECREMENT";
-        case TraceEventKind::EntryCandidate:     return "ENTRY_CANDIDATE";
+        case TraceEventKind::ModuleLoadRequest: return "MODULE_LOAD_REQUEST";
         case TraceEventKind::SymbolResolved:  return "SYMBOL_RESOLVED";
         case TraceEventKind::CallObserved:    return "CALL_OBSERVED";
         case TraceEventKind::ControlTransfer: return "CONTROL_TRANSFER";

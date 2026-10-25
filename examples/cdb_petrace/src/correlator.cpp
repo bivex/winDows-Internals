@@ -136,6 +136,29 @@ void InvocationCorrelator::AddCandidate(uint64_t target_va, uint64_t mod_base, c
     candidates_[target_va] = evt;
 }
 
+void InvocationCorrelator::RecordModuleLoadRequest(const std::string& module_name, uint32_t pid, uint32_t tid) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    TraceEvent evt;
+    evt.kind = TraceEventKind::ModuleLoadRequest;
+    evt.evidence = EvidenceSource::ApiInstrumentation;
+    evt.confidence = ConfidenceLevel::Probable;
+    evt.pid = pid;
+    evt.tid = tid;
+    evt.symbol_name = module_name;
+    evt.details = "Caller requested LdrLoadDll (image may or may not already be mapped)";
+    RecordEventLocked(evt);
+}
+
+void InvocationCorrelator::OnThreadExit(uint32_t tid) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    active_calls_by_tid_.erase(tid); // pending return-trap is unreachable
+}
+
+void InvocationCorrelator::OnException(uint32_t tid) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    active_calls_by_tid_.erase(tid); // unwinding invalidates LR-continuation assumption
+}
+
 void InvocationCorrelator::RecordSymbolResolved(uint64_t target_va, const std::string& sym_name,
                                                 uint32_t pid, uint32_t tid, uint64_t caller_va) {
     std::lock_guard<std::mutex> lock(mtx_);
@@ -281,7 +304,13 @@ size_t InvocationCorrelator::GetConfirmedCallCount() {
     for (const auto& ch : causal_chains_) {
         if (ch.has_call) count++;
     }
+
     return count;
+}
+
+size_t InvocationCorrelator::GetResolvedCount() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return resolved_symbols_.size();
 }
 
 void InvocationCorrelator::PrintSummary(void (*out_fn)(const char*, void*), void* context) {
