@@ -159,10 +159,14 @@ HRESULT OnBreakpointHit(DbgEngContext& ctx) {
     }
     lr = (ULONG64)dvLr.I64;
 
+    DEBUG_VALUE dvX2 = {};
+    ULONG64 x2 = 0;
     ctx.Control->Evaluate("@x0", DEBUG_VALUE_INT64, &dvX0, nullptr);
     x0 = (ULONG64)dvX0.I64;
     ctx.Control->Evaluate("@x1", DEBUG_VALUE_INT64, &dvX1, nullptr);
     x1 = (ULONG64)dvX1.I64;
+    ctx.Control->Evaluate("@x2", DEBUG_VALUE_INT64, &dvX2, nullptr);
+    x2 = (ULONG64)dvX2.I64;
 
     ULONG pid = 0, tid = 0;
     if (ctx.SystemObjects) {
@@ -180,11 +184,33 @@ HRESULT OnBreakpointHit(DbgEngContext& ctx) {
         }
     }
 
-    char det[256] = {};
-    snprintf(det, sizeof(det), "Args: x0=0x%016llX, x1=0x%016llX",
-             (unsigned long long)x0, (unsigned long long)x1);
-
     std::string sym = ctx.GetSymbolName(pc);
+    std::string bareSym = sym;
+    size_t bang = bareSym.find('!');
+    if (bang != std::string::npos) bareSym = bareSym.substr(bang + 1);
+    size_t plus = bareSym.find('+');
+    if (plus != std::string::npos) bareSym = bareSym.substr(0, plus);
+
+    int arity = GetFunctionArity(bareSym);
+    char det[256] = {};
+    if (arity == 0) {
+        snprintf(det, sizeof(det), "Parameters: void (no arguments)");
+    } else if (arity == 1) {
+        snprintf(det, sizeof(det), "Arg: param0=0x%016llX", (unsigned long long)x0);
+    } else if (arity == 3 && (bareSym == "DllMain" || bareSym.find("DllMain") != std::string::npos)) {
+        snprintf(det, sizeof(det), "DllMain Args: hinst=0x%016llX, fdwReason=%llu (%s), lpvReserved=0x%016llX",
+                 (unsigned long long)x0, (unsigned long long)x1,
+                 (x1 == 1) ? "DLL_PROCESS_ATTACH" :
+                 (x1 == 0) ? "DLL_PROCESS_DETACH" :
+                 (x1 == 2) ? "DLL_THREAD_ATTACH" : "DLL_THREAD_DETACH",
+                 (unsigned long long)x2);
+    } else if (arity == 3) {
+        snprintf(det, sizeof(det), "Args: x0=0x%016llX, x1=0x%016llX, x2=0x%016llX",
+                 (unsigned long long)x0, (unsigned long long)x1, (unsigned long long)x2);
+    } else {
+        snprintf(det, sizeof(det), "Raw Regs: x0=0x%016llX, x1=0x%016llX (Arity unverified)",
+                 (unsigned long long)x0, (unsigned long long)x1);
+    }
     uint64_t chainId = InvocationCorrelator::Instance().RecordCallObserved(
         pc, lr, lr, pid, tid, stack, det
     );

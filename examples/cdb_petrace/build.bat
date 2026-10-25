@@ -26,6 +26,12 @@ if %ERRORLEVEL% neq 0 (
     echo [ERROR] Failed to compile petrace.dll
     exit /b %ERRORLEVEL%
 )
+:: 3. Compile ComComponent.dll (with ComWorkerRoutine) and CorrelatorMatrixRunner.exe
+echo [*] Compiling ComComponent.dll and CorrelatorMatrixRunner.exe...
+if not exist "ComComponent" mkdir ComComponent
+if exist "C:\test_com_loader\ComComponent\ComComponent.h" copy /Y "C:\test_com_loader\ComComponent\ComComponent.*" "ComComponent\" >nul
+cl /nologo /LD /EHsc /std:c++20 ComComponent\ComComponent.cpp user32.lib /Fe:ComComponent.dll
+cl /nologo /EHsc /std:c++20 CorrelatorMatrixRunner.cpp user32.lib ole32.lib /Fe:CorrelatorMatrixRunner.exe
 
 echo.
 echo ====================================================================
@@ -57,3 +63,7 @@ echo [*] Test 3: Control Flow Graph (CFG) Reconstruction on calc (!pecfg)...
 echo.
 echo [*] Test 4: Dynamic Level A -> Level C Execution Correlation on ComComponent.dll...
 "%CDB_EXE%" -c "sxe ld:ComComponent; g; .load C:\test_petrace\petrace.dll; !petrace ComComponent; g; !pechains; !pesummary; !peexport C:\test_petrace\com_trace.jsonl; .unload C:\test_petrace\petrace.dll; q" regsvr32.exe /s C:\test_com_loader\ComComponent.dll
+
+echo.
+echo [*] Test 5: Full 5-Scenario Matrix Execution on CorrelatorMatrixRunner.exe (!petrace / !pechains)...
+"%CDB_EXE%" -c "sxe ld:ComComponent; g; .load C:\test_petrace\petrace.dll; !petrace ComComponent; g; !pechains; !pesummary; !peexport C:\test_petrace\matrix_trace.jsonl; .unload C:\test_petrace\petrace.dll; q" CorrelatorMatrixRunner.exe ComComponent.dll

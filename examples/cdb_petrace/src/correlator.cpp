@@ -43,9 +43,25 @@ void InvocationCorrelator::RecordEventLocked(TraceEvent evt) {
 
 void InvocationCorrelator::RegisterModule(uint64_t base, uint32_t size, const std::string& name) {
     std::lock_guard<std::mutex> lock(mtx_);
+    auto it = modules_.find(base);
+    if (it != modules_.end()) {
+        it->second.ref_count++;
+        TraceEvent evt;
+        evt.kind = TraceEventKind::ModuleRefIncrement;
+        evt.evidence = EvidenceSource::RuntimeObservation;
+        evt.confidence = ConfidenceLevel::Confirmed;
+        evt.module_base = base;
+        evt.module_name = name;
+        evt.target_va = base;
+        evt.details = "Refcount incremented to " + std::to_string(it->second.ref_count) + " (Image already mapped; duplicate IMAGE_LOAD suppressed)";
+        RecordEventLocked(evt);
+        return;
+    }
+
     LoadedModuleRecord rec;
     rec.base_va = base;
     rec.size = size;
+    rec.ref_count = 1;
     rec.name = name;
     rec.load_time = GetTimestampNow();
     modules_[base] = rec;
@@ -57,7 +73,7 @@ void InvocationCorrelator::RegisterModule(uint64_t base, uint32_t size, const st
     evt.module_base = base;
     evt.module_name = name;
     evt.target_va = base;
-    evt.details = "Size: 0x" + std::to_string(size);
+    evt.details = "Initial Image Mapping (Size: 0x" + std::to_string(size) + ")";
 
     RecordEventLocked(evt);
 }
@@ -65,8 +81,23 @@ void InvocationCorrelator::RegisterModule(uint64_t base, uint32_t size, const st
 void InvocationCorrelator::UnregisterModule(uint64_t base) {
     std::lock_guard<std::mutex> lock(mtx_);
     auto it = modules_.find(base);
-    std::string modName = (it != modules_.end()) ? it->second.name : "<unknown>";
+    if (it == modules_.end()) return;
 
+    if (it->second.ref_count > 1) {
+        it->second.ref_count--;
+        TraceEvent evt;
+        evt.kind = TraceEventKind::ModuleRefDecrement;
+        evt.evidence = EvidenceSource::RuntimeObservation;
+        evt.confidence = ConfidenceLevel::Confirmed;
+        evt.module_base = base;
+        evt.module_name = it->second.name;
+        evt.target_va = base;
+        evt.details = "Refcount decremented to " + std::to_string(it->second.ref_count) + " (Image remains mapped in memory)";
+        RecordEventLocked(evt);
+        return;
+    }
+
+    std::string modName = it->second.name;
     TraceEvent evt;
     evt.kind = TraceEventKind::ImageUnload;
     evt.evidence = EvidenceSource::RuntimeObservation;
@@ -74,6 +105,7 @@ void InvocationCorrelator::UnregisterModule(uint64_t base) {
     evt.module_base = base;
     evt.module_name = modName;
     evt.target_va = base;
+    evt.details = "Physical Image Unmapped";
     RecordEventLocked(evt);
 
     // Erase candidates belonging to this module to prevent stale address aliasing

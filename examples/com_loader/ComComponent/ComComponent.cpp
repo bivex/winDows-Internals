@@ -216,6 +216,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 #pragma comment(linker, "/EXPORT:DllCanUnloadNow,PRIVATE")
 #pragma comment(linker, "/EXPORT:DllRegisterServer,PRIVATE")
 #pragma comment(linker, "/EXPORT:DllUnregisterServer,PRIVATE")
+#pragma comment(linker, "/EXPORT:ComWorkerRoutine")
 
 extern "C" HRESULT WINAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv) {
     if (!ppv) return E_POINTER;
@@ -244,4 +245,10 @@ extern "C" HRESULT WINAPI DllRegisterServer(void) {
 
 extern "C" HRESULT WINAPI DllUnregisterServer(void) {
     return S_OK;
+}
+
+extern "C" DWORD WINAPI ComWorkerRoutine(LPVOID lpParam) {
+    printf("[ComComponent!ComWorkerRoutine] Worker thread entered! (TID=%lu, param=%p)\n",
+           GetCurrentThreadId(), lpParam);
+    return 42;
 }

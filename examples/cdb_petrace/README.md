@@ -86,6 +86,11 @@ build.bat
 Or manually:
 ```cmd
 cl /nologo /LD /EHsc /std:c++20 src\petrace.cpp src\pe_analyzer.cpp src\disasm_engine.cpp src\correlator.cpp src\execution_tracer.cpp dbgeng.lib /Fe:petrace.dll
+
+### Running the 5-Scenario Verification Matrix:
+```cmd
+cl /nologo /EHsc /std:c++20 CorrelatorMatrixRunner.cpp user32.lib ole32.lib /Fe:CorrelatorMatrixRunner.exe
+cdb.exe -c "sxe ld:ComComponent; g; .load C:\path\petrace.dll; !petrace ComComponent; g; !pechains; !pesummary; !peexport matrix_trace.jsonl; q" CorrelatorMatrixRunner.exe ComComponent.dll
 ```
 
 ### Loading in CDB:

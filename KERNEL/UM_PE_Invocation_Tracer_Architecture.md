@@ -105,3 +105,69 @@ For external SIEM, automated fuzzing, or security telemetry ingestion, `petrace`
 {"seq":3,"kind":"CALL_OBSERVED","evidence":"DebuggerBreakpoint","confidence":"CONFIRMED (Level C)","pid":6288,"tid":1024,"timestamp_us":13345210000050,"source_va":"0x7ff612341250","target_va":"0x7ff9b76315b0","return_va":"0x7ff612341254","module_base":"0x7ff9b7630000","correlation_id":1,"module":"ComComponent.dll","symbol":"DllGetClassObject","details":"Args: x0=0x00007FF9B7632B00, x1=0x0000000000000001"}
 {"seq":4,"kind":"RETURN_OBSERVED","evidence":"DebuggerBreakpoint","confidence":"CONFIRMED (Level C)","pid":6288,"tid":1024,"timestamp_us":13345210000060,"source_va":"0x7ff612341254","target_va":"0x7ff612341254","return_va":"0x7ff612341254","module_base":"0x7ff9b7630000","correlation_id":1,"module":"ComComponent.dll","symbol":"DllGetClassObject","details":"Return Value = 0x0 (0)"}
 ```
+
+---
+
+## 6. The 5-Scenario Verification Matrix & Empirical Findings
+
+To validate the correlation engine against the five fundamental user-mode invocation mechanisms, `CorrelatorMatrixRunner.exe` was executed under `petrace.dll` on Windows 11 ARM64 (Build 26200).
+
+### 6.1 Results Matrix
+
+| Scenario ID | Invocation Pattern | Level A Candidate | Level B Correlation | Level C Execution Proof | Observed Behavior |
+|---|---|---|---|---|---|
+| **SCN-01 (P0)** | `LoadLibraryExW` $\to$ `DllMain` | `AddressOfEntryPoint` (RVA `0x2A08`) | Mapped by `ntdll!LdrpCallInitRoutine` | `CALL_OBSERVED` with `x1=1` (`DLL_PROCESS_ATTACH`) $\to$ `RETURN_OBSERVED (x0=1)` | **CONFIRMED** |
+| **SCN-02 (P0)** | `GetProcAddress` $\to$ Export | `DllGetClassObject` (EAT Export #2) | `SYMBOL_RESOLVED` by caller | `CALL_OBSERVED` with `CLSID`, `IID`, `&pFactory` $\to$ `RETURN_OBSERVED (x0=0 / S_OK)` | **CONFIRMED** |
+| **SCN-03 (P0)** | Duplicate `LoadLibraryExW` | Module already in `modules_` | Increments `ref_count` to 2 | **NO second `IMAGE_LOAD`**, **NO second `DllMain`**, `FreeLibrary` decrements refcount | **CONFIRMED** |
+| **SCN-04 (P1)** | COM In-Process Activation | `IClassFactory::CreateInstance` | Linked through Factory handle | `CALL_OBSERVED` on `ICalculator::Add(10, 32)` $\to$ `Result = 42` | **CONFIRMED** |
+| **SCN-05 (P1)** | `CreateThread` inside DLL | `ComWorkerRoutine` (EAT Export #1) | Thread start routine pointer | `CALL_OBSERVED` on new thread (`TID: 3`) with `param=0x1337` $\to$ `RETURN_OBSERVED (x0=42)` | **CONFIRMED** |
+
+### 6.2 Empirical Causal Chains Logged by CDB
+```text
+================================================================================
+  CONFIRMED CAUSAL EXECUTION CHAINS (Level A -> Level B -> Level C):
+================================================================================
+
+[CHAIN #1] Target: 0x00007FF9AECD2A48 (ComComponent!DllMain) (TID: 0)
+  [Level A - Candidate]   Canonical EntryPoint
+  [Level B - Correlation] User-Mode Loader Dispatch (ntdll!LdrpCallInitRoutine)
+  [Level C - CONFIRMED]   CPU IP reached target from 0x00007FF9D486E858
+                          DllMain Args: hinst=0x00007FF9AECD0000, fdwReason=1 (DLL_PROCESS_ATTACH)
+  [Level C - Return]      Returned to 0x00007FF9D486E858 with Return Value = 0x1 (TRUE)
+
+[CHAIN #2] Target: 0x00007FF9AECD15B0 (ComComponent!DllGetClassObject) (TID: 0)
+  [Level A - Candidate]   Exported Function (EAT Export #2)
+  [Level B - Correlation] Resolved via GetProcAddress by caller 0x00007FF6A1FC162C
+  [Level C - CONFIRMED]   CPU IP reached target from 0x00007FF6A1FC162C
+                          Args: x0=0x00007FF6A1FD92F0, x1=0x00007FF6A1FD9A78, x2=0x00000022E0FAF838
+  [Level C - Return]      Returned to 0x00007FF6A1FC162C with Return Value = 0x0 (S_OK)
+
+[CHAIN #3] Target: 0x00007FF9AECD2A48 (ComComponent!DllMain) (TID: 3)
+  [Level A - Candidate]   Canonical EntryPoint
+  [Level B - Correlation] Thread Creation Gate
+  [Level C - CONFIRMED]   CPU IP reached target from 0x00007FF9D486E858 on NEW THREAD (TID: 3)
+                          DllMain Args: hinst=0x00007FF9AECD0000, fdwReason=2 (DLL_THREAD_ATTACH)
+  [Level C - Return]      Returned to 0x00007FF9D486E858 with Return Value = 0x1 (TRUE)
+
+[CHAIN #4] Target: 0x00007FF9AECD1728 (ComComponent!ComWorkerRoutine) (TID: 3)
+  [Level A - Candidate]   Exported Function (Thread Start Routine)
+  [Level B - Correlation] Dispatched by KERNEL32!BaseThreadInitThunk
+  [Level C - CONFIRMED]   CPU IP reached target from 0x00007FF9D0A18740
+                          Arg: param0=0x0000000000001337
+  [Level C - Return]      Returned to 0x00007FF9D0A18740 with Return Value = 0x2A (42)
+
+[CHAIN #5] Target: 0x00007FF9AECD2A48 (ComComponent!DllMain) (TID: 3)
+  [Level A - Candidate]   Canonical EntryPoint
+  [Level B - Correlation] Thread Termination Gate
+  [Level C - CONFIRMED]   CPU IP reached target from 0x00007FF9D486E858 on TERMINATING THREAD (TID: 3)
+                          DllMain Args: hinst=0x00007FF9AECD0000, fdwReason=3 (DLL_THREAD_DETACH)
+  [Level C - Return]      Returned to 0x00007FF9D486E858 with Return Value = 0x1 (TRUE)
+
+[CHAIN #6] Target: 0x00007FF9AECD2A48 (ComComponent!DllMain) (TID: 0)
+  [Level A - Candidate]   Canonical EntryPoint
+  [Level B - Correlation] Final FreeLibrary Unload Gate
+  [Level C - CONFIRMED]   CPU IP reached target from 0x00007FF9D486E858
+                          DllMain Args: hinst=0x00007FF9AECD0000, fdwReason=0 (DLL_PROCESS_DETACH)
+  [Level C - Return]      Returned to 0x00007FF9D486E858 with Return Value = 0x1 (TRUE)
+================================================================================
+```

@@ -17,9 +17,9 @@ enum class TraceEventKind {
     // Level A — PE Discovery (Candidates, not proof of execution)
     ImageLoad,
     ImageUnload,
+    ModuleRefIncrement,
+    ModuleRefDecrement,
     EntryCandidate,
-
-    // Level B — Invocation Correlation (Probable link to launch mechanism)
     SymbolResolved,
 
     // Level C — Execution Trace (Confirmed control transfer observed by CPU)
@@ -74,9 +74,11 @@ struct TraceEvent {
 
     const char* GetKindString() const {
         switch (kind) {
-        case TraceEventKind::ImageLoad:       return "IMAGE_LOAD";
-        case TraceEventKind::ImageUnload:     return "IMAGE_UNLOAD";
-        case TraceEventKind::EntryCandidate:  return "ENTRY_CANDIDATE";
+        case TraceEventKind::ImageLoad:          return "IMAGE_LOAD";
+        case TraceEventKind::ImageUnload:        return "IMAGE_UNLOAD";
+        case TraceEventKind::ModuleRefIncrement: return "MODULE_REF_INCREMENT";
+        case TraceEventKind::ModuleRefDecrement: return "MODULE_REF_DECREMENT";
+        case TraceEventKind::EntryCandidate:     return "ENTRY_CANDIDATE";
         case TraceEventKind::SymbolResolved:  return "SYMBOL_RESOLVED";
         case TraceEventKind::CallObserved:    return "CALL_OBSERVED";
         case TraceEventKind::ControlTransfer: return "CONTROL_TRANSFER";

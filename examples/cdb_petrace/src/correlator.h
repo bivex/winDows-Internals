@@ -37,14 +37,31 @@ struct CausalChain {
 };
 
 // ----------------------------------------------------------------------------
-// Active Loaded Module Record (Tracks Lifetime to Prevent Stale VA Aliasing)
-// ----------------------------------------------------------------------------
 struct LoadedModuleRecord {
-    uint64_t base_va = 0;
-    uint32_t size    = 0;
+    uint64_t base_va   = 0;
+    uint32_t size      = 0;
+    uint32_t ref_count = 1;
     std::string name;
     uint64_t load_time = 0;
 };
+
+inline int GetFunctionArity(const std::string& symName) {
+    if (symName == "DllRegisterServer" || symName == "DllUnregisterServer" || symName == "DllCanUnloadNow") {
+        return 0; // HRESULT (void) -> ZERO parameters!
+    }
+    if (symName == "ComWorkerRoutine" || symName.find("Worker") != std::string::npos ||
+        symName.find("ThreadProc") != std::string::npos) {
+        return 1; // DWORD WINAPI (LPVOID lpParam) -> 1 parameter
+    }
+    if (symName == "DllGetClassObject" || symName.find("DllMain") != std::string::npos ||
+        symName == "Add" || symName == "Subtract" || symName == "Multiply" || symName == "Divide") {
+        return 3;
+    }
+    if (symName == "ShowGuiDialog") {
+        return 1;
+    }
+    return -1; // Unverified
+}
 
 // ----------------------------------------------------------------------------
 // InvocationCorrelator Class

@@ -31,12 +31,10 @@ ICalculator : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE ShowGuiDialog(int* dialogResult) = 0;
 };
 
-// ----------------------------------------------------------------------------
-// Standard In-Process COM DLL Entry Points
-// ----------------------------------------------------------------------------
 extern "C" {
     HRESULT WINAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv);
     HRESULT WINAPI DllCanUnloadNow(void);
     HRESULT WINAPI DllRegisterServer(void);
     HRESULT WINAPI DllUnregisterServer(void);
+    DWORD   WINAPI ComWorkerRoutine(LPVOID lpParam);
 }
