@@ -108,11 +108,11 @@ public:
                           L"Interface       : ICalculator (uuid: B4D10F32-7A9B-4C18-8A5E-2C3D4E5F6A7B)\n"
                           L"Class Factory   : IClassFactory::CreateInstance\n"
                           L"Hosting Modes   : Registration-Free COM (SxS) & Manual PE Loader\n\n"
-                          L"Click OK or wait 4 seconds for auto-close.";
+                          L"Click OK or wait 30 seconds for auto-close.";
 
         int res = MessageBoxTimeoutW(nullptr, message, title,
                                      MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND,
-                                     0, 4000);
+                                     0, 30000);
         *dialogResult = res;
         printf("  [ComComponent!ShowGuiDialog] DialogResult = %d\n", res);
         return S_OK;
