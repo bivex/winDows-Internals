@@ -54,6 +54,14 @@ When an unmanaged caller invokes an `[UnmanagedCallersOnly]` export, NativeAOT e
 
 ### 3. W^X TLS Callback Order
 NativeAOT shared libraries emit a TLS callback (`__dyn_tls_init`) at `PIMAGE_TLS_DIRECTORY64.AddressOfCallBacks`. Calling callbacks while pages are still `PAGE_READWRITE` immediately triggers a hardware execution fault (`pacibsp` on ARM64). The loader enforces strict W^X sequencing: `ProtectSections()` executes *before* invoking TLS callbacks.
+### 4. Background Thread TLS Auto-Attachment (`KERNEL32!CreateThread`)
+NativeAOT spawns background runtime threads (e.g. the `.NET Finalizer` thread and threadpool workers). When manually mapped without the OS loader, newly spawned threads lack a `ThreadLocalStoragePointer` entry, causing immediate access violations upon reading TLS. The loader hooks `KERNEL32!CreateThread` inside the mapped image's IAT, wrapping thread start routines to automatically invoke `ThreadAttach()` before executing managed code.
+
+### 5. `ntdll!LdrpFreeTls` Heap Layout & `ExitThread`
+When threads terminate, `ntdll!LdrpFreeTls` frees `TEB->ThreadLocalStoragePointer` via `RtlFreeHeap(RtlProcessHeap(), 0, x21 - 0x10)`. The OS loader expects an exact 16-byte (`0x10`) header preceding the array pointer. Allocating with `calloc` or omitting the `0x10` prefix throws `0xC0000374` (`STATUS_HEAP_CORRUPTION`). The loader allocates `0x10 + N * 8` bytes via `HeapAlloc(GetProcessHeap(), ...)` and returns `ptr + 0x10`.
+
+### 6. Executable Binary (`.EXE`) Mode & CRT `exit()` Interception
+When loading a standalone NativeAOT executable (`AOT_Gui.exe`), the loader spawns a dedicated worker thread to invoke `wmainCRTStartup`. When `wmain` returns, the CRT calls `exit(0)` / `_exit(0)`. The loader intercepts `exit` and `ExitProcess` via IAT redirection to `ExitThread`, allowing the host loader process to survive, capture the exit code, and report success.
 
 ---
 
@@ -62,9 +70,11 @@ NativeAOT shared libraries emit a TLS callback (`__dyn_tls_init`) at `PIMAGE_TLS
 | File | Description |
 |---|---|
 | `AotLib/AotLib.csproj` | NativeAOT shared library project (`<NativeLib>Shared</NativeLib>`, `<PublishAot>true</PublishAot>`). |
-| `AotLib/AotLib.cs` | C# library declaring 6 unmanaged exports (`[UnmanagedCallersOnly]`) exercising the GC heap, bump allocator, exceptions, and BCL. |
-| `NativeAotLoader.cpp` | Manual PE loader in native Win32 C++ executing `AotLib.dll` with zero external CLR dependencies. |
-| `build.bat` | Automated compilation script for Visual Studio ARM64/x64 developer environments. |
+| `AotLib/AotLib.cs` | C# library declaring 7 unmanaged exports (`[UnmanagedCallersOnly]`) exercising the GC heap, bump allocator, exceptions, BCL, and GUI MessageBox. |
+| `AOT_Gui/AOT_Gui.csproj` | Standalone NativeAOT executable project (`<OutputType>Exe</OutputType>`). |
+| `AOT_Gui/Program.cs` | C# executable displaying an interactive native Win32 GUI MessageBox with bump allocation on `WKS::gc_heap`. |
+| `NativeAotLoader.cpp` | Dual-mode manual PE loader in native Win32 C++ supporting both `.dll` and `.exe` NativeAOT targets. |
+| `build.bat` | Automated compilation script building both targets and running the test suite. |
 
 ---
 
@@ -79,9 +89,12 @@ build.bat
 Or manually:
 ```cmd
 dotnet publish AotLib\AotLib.csproj -c Release -r win-arm64 -p:PublishAot=true
+dotnet publish AOT_Gui\AOT_Gui.csproj -c Release -r win-arm64 -p:PublishAot=true
 copy /y AotLib\bin\arm64\Release\net10.0\win-arm64\publish\AotLib.dll .
-cl /EHsc NativeAotLoader.cpp /Fe:NativeAotLoader.exe
+copy /y AOT_Gui\bin\arm64\Release\net10.0\win-arm64\publish\AOT_Gui.exe .
+cl /EHsc NativeAotLoader.cpp user32.lib /Fe:NativeAotLoader.exe
 NativeAotLoader.exe AotLib.dll
+NativeAotLoader.exe AOT_Gui.exe
 ```
 
 ---
@@ -185,3 +198,70 @@ Relocation Delta        : 0
     [EXP-7]  GUI MessageBox (IDOK=1)          : PASS
     OVERALL                                   : ALL CHECKS PASSED
 ====================================================================
+```
+
+### Test 2: Mapped Executable Mode (`AOT_Gui.exe`)
+
+```text
+====================================================================
+  Windows NativeAOT Manual PE Loader — host ARM64
+====================================================================
+[load] Target: AOT_Gui.exe
+
+--- PE Binary Anatomy (mirrors NativeAOT Research Section 2) ---
+Machine                 : 0xAA64 (ARM64 Native)
+Magic                   : 0x020B (PE32+)
+Binary Type             : Executable Binary (.EXE)
+Preferred ImageBase     : 0x0000000140000000
+AddressOfEntryPoint RVA : 0x000EA2D8 (Native wmainCRTStartup)
+COM Descriptor (dir 14) : RVA 0x00000000 Size 0x00000000
+  CLI Header Status     : ABSENT (0x00000000)                [AOT-01 OK]
+  Kernel Perception     : Pure Win32 Unmanaged Image          [AOT-01 OK]
+TLS Directory (dir 9)   : RVA 0x00142D80 Size 0x00000028
+  Native Win32 TLS      : POPULATED (TEB allocator context)  [AOT-02 OK]
+
+Mapped Base             : 0x0000000140000000 (size 0x18F000)
+Relocation Delta        : 0
+[reloc] Base relocations applied: 8001 (padding: 33)
+[imports] Resolving import directory dependencies:
+    * Hooked KERNEL32.dll!CreateThread -> LoaderCreateThreadHook (auto-TLS attach)
+    * Hooked api-ms-win-crt-runtime-l1-1-0.dll!_exit -> LoaderCrtExitHook
+    * Hooked api-ms-win-crt-runtime-l1-1-0.dll!exit -> LoaderCrtExitHook
+[imports] Zero CLR dependencies confirmed (pure OS & UCRT links) [AOT-03 OK]
+[tls] Bound TEB->ThreadLocalStoragePointer[4] (TEB + 0x58 with 0x10 header)
+[ldr] Registered LDR ghost entry & RB-tree node (path: "C:\test_nativeaot\AOT_Gui.exe")
+[pdata] KiUserInvertedFunctionTable at 00007FF94A33B4D0 (current=17, max=512)
+[pdata] Inserted entry at index 0: ImageBase=0000000140000000, Size=0x18F000
+[tls] Executing TLS callback (DLL_PROCESS_ATTACH)...
+[load] Mapping complete; ready for DllMain initialization
+
+>>> STEP 1: Launching Mapped AOT Executable Thread <<<
+[entry] Thread starting at AddressOfEntryPoint RVA 0x000EA2D8...
+====================================================================
+  AOT_Gui.exe - NativeAOT Standalone Executable (ARM64)
+====================================================================
+[AOT_Gui] Running in Process: NativeAotLoader (PID=10752)
+[AOT_Gui] Architecture      : Arm64
+[AOT_Gui] OS Description    : Microsoft Windows 10.0.26200
+[AOT_Gui] Framework         : .NET 10.0.8
+[AOT_Gui] Dynamic Code      : False (AOT Invariant)
+[AOT_Gui] GC Heap Memory    : 49176 -> 573488 bytes (bump allocation OK)
+[AOT_Gui] Displaying native Win32 GUI MessageBox (timeout=4000ms)...
+[AOT_Gui] MessageBox DialogResult = 1 (1=IDOK, 32000=TIMEOUT)
+[AOT_Gui] Exiting wmain with status 0...
+====================================================================
+
+[loader] Intercepted CRT exit(0) from mapped EXE -> calling ExitThread
+
+>>> Mapped EXE Thread Terminated. Exit Code: 0 <<<
+
+====================================================================
+  NATIVEAOT MANUAL LOADER VERDICT (EXE MODE)
+    [AOT-01] DataDirectory[14] Absent (No CLR): PASS
+    [AOT-02] Win32 TLS Bound for RhpNewFast    : PASS
+    [AOT-03] Zero External CLR DLL Imports    : PASS
+    [EXE-01] Mapped Execution Completed       : PASS
+    [EXE-02] ExitProcess Interception         : PASS
+    OVERALL                                   : ALL CHECKS PASSED
+====================================================================
+```

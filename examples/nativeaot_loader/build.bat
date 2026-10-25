@@ -47,10 +47,34 @@ if %ERRORLEVEL% neq 0 (
     echo [ERROR] Failed to compile NativeAotLoader.exe
     exit /b %ERRORLEVEL%
 )
+echo.
+echo ====================================================================
+echo   Test 1: Running NativeAotLoader.exe AotLib.dll (DLL Mode):
+echo ====================================================================
+NativeAotLoader.exe AotLib.dll
+if %ERRORLEVEL% neq 0 (
+    echo [ERROR] NativeAotLoader.exe AotLib.dll failed
+    exit /b %ERRORLEVEL%
+)
+
+echo.
+echo [*] Publishing NativeAOT Standalone Executable (AOT_Gui.exe)...
+dotnet publish AOT_Gui\AOT_Gui.csproj -c Release -r win-arm64 -p:PublishAot=true
+if %ERRORLEVEL% neq 0 (
+    echo [ERROR] Failed to publish AOT_Gui.exe
+    exit /b %ERRORLEVEL%
+)
+if exist "AOT_Gui\bin\arm64\Release\net10.0\win-arm64\publish\AOT_Gui.exe" (
+    copy /y "AOT_Gui\bin\arm64\Release\net10.0\win-arm64\publish\AOT_Gui.exe" . >nul
+    copy /y "AOT_Gui\bin\arm64\Release\net10.0\win-arm64\publish\AOT_Gui.pdb" . >nul
+) else (
+    copy /y "AOT_Gui\bin\Release\net10.0\win-arm64\publish\AOT_Gui.exe" . >nul
+    copy /y "AOT_Gui\bin\Release\net10.0\win-arm64\publish\AOT_Gui.pdb" . >nul
+)
 
 echo.
 echo ====================================================================
-echo   Running NativeAotLoader.exe AotLib.dll:
+echo   Test 2: Running NativeAotLoader.exe AOT_Gui.exe (Mapped EXE Mode):
 echo ====================================================================
-NativeAotLoader.exe AotLib.dll
+NativeAotLoader.exe AOT_Gui.exe
 exit /b %ERRORLEVEL%
