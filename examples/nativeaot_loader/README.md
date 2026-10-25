@@ -166,6 +166,11 @@ Relocation Delta        : 0
 [info ] Architecture: Arm64, OS: Microsoft Windows 10.0.26200, Framework: .NET 10.0.8, DynamicCode: False
 >>> IsDynamicCodeSupported == False: VERIFIED (Hallmark of NativeAOT) <<<
 
+>>> EXPERIMENT 7: GUI MessageBox (NativeAOT -> user32!MessageBoxW) <<<
+[AotLib!AotTestGuiMessageBox] Showing GUI MessageBox from NativeAOT...
+[watchdog] Found NativeAOT GUI window 00000000000A0388: waiting 3s then auto-closing (or click OK)...
+>>> NativeAOT GUI MessageBox Result: 1 (Expected: 1 = IDOK) <<<
+
 ====================================================================
   NATIVEAOT MANUAL LOADER VERDICT
     [AOT-01] DataDirectory[14] Absent (No CLR): PASS
@@ -173,10 +178,10 @@ Relocation Delta        : 0
     [AOT-03] Zero External CLR DLL Imports    : PASS
     [EXP-1]  ABI & Calling Convention (42)    : PASS
     [EXP-2]  RhpNewFast Bump Allocator (9900) : PASS
-    [EXP-3]  In-Binary WKS::gc_heap (Collect) : PASS
+    [EXP-3]  In-Binary WKS::gc_heap (Allocate): PASS
     [EXP-4]  BCL String Formatting            : PASS
     [EXP-5]  Internal Exception Unwinding (999): PASS
     [EXP-6]  IsDynamicCodeSupported == False  : PASS
+    [EXP-7]  GUI MessageBox (IDOK=1)          : PASS
     OVERALL                                   : ALL CHECKS PASSED
 ====================================================================
-```

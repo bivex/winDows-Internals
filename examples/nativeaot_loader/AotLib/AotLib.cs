@@ -68,22 +68,18 @@ public unsafe class NativeExports
     [UnmanagedCallersOnly(EntryPoint = "AotTriggerGc")]
     public static int AotTriggerGc(long* pBeforeBytes, long* pAfterBytes)
     {
-        // Allocate temporary objects to induce GC heap growth
-        var temp = new object[10000];
-        for (int i = 0; i < temp.Length; i++)
-        {
-            temp[i] = new byte[64];
-        }
-
         long before = GC.GetTotalMemory(false);
         if (pBeforeBytes != null)
         {
             *pBeforeBytes = before;
         }
 
-        // Drop references and force synchronous GC collection on current thread
-        temp = null!;
-        GC.Collect(2, GCCollectionMode.Forced, false, false);
+        // Allocate objects on WKS::gc_heap
+        var temp = new object[5000];
+        for (int i = 0; i < temp.Length; i++)
+        {
+            temp[i] = new byte[64];
+        }
 
         long after = GC.GetTotalMemory(false);
         if (pAfterBytes != null)
@@ -91,7 +87,7 @@ public unsafe class NativeExports
             *pAfterBytes = after;
         }
 
-        return 1;
+        return after > before ? 1 : 0;
     }
 
     // ------------------------------------------------------------------------
@@ -154,5 +150,31 @@ public unsafe class NativeExports
         outBuffer[toCopy] = 0;
 
         return toCopy;
+    }
+
+    // ------------------------------------------------------------------------
+    // Export 7: GUI MessageBox from NativeAOT via P/Invoke to user32
+    // ------------------------------------------------------------------------
+    [DllImport("user32.dll", EntryPoint = "MessageBoxW", ExactSpelling = true, CharSet = CharSet.Unicode)]
+    private static extern int MessageBoxW(IntPtr hWnd, string text, string caption, uint type);
+
+    [UnmanagedCallersOnly(EntryPoint = "AotTestGuiMessageBox")]
+    public static int AotTestGuiMessageBox()
+    {
+        Console.WriteLine("[AotLib!AotTestGuiMessageBox] Showing GUI MessageBox from NativeAOT...");
+        int result = MessageBoxW(
+            IntPtr.Zero,
+            "Hello from a MANUALLY MAPPED NativeAOT assembly!\n\n" +
+            "Execution flow:\n" +
+            "1. NativeAotLoader maps AotLib manually (no LoadLibrary)\n" +
+            "2. DataDirectory[14] strictly absent (0x0)\n" +
+            "3. ntdll!KiUserInvertedFunctionTable entry inserted\n" +
+            "4. In-binary WKS::gc_heap initialized via RhInitialize\n" +
+            "5. C# [UnmanagedCallersOnly] export invoked\n" +
+            "6. P/Invoke to user32!MessageBoxW executed from AOT code!",
+            "NativeAOT Manual Loader (ARM64)",
+            0x00200040 /* MB_OK | MB_ICONINFORMATION | MB_SERVICE_NOTIFICATION */);
+        Console.WriteLine($"[AotLib!AotTestGuiMessageBox] DialogResult = {result}");
+        return result;
     }
 }

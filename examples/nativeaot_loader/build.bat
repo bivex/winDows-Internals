@@ -42,7 +42,7 @@ if exist "AotLib\bin\arm64\Release\net10.0\win-arm64\publish\AotLib.dll" (
 )
 
 echo [*] Compiling NativeAotLoader.exe (Manual PE Loader)...
-cl /nologo /EHsc NativeAotLoader.cpp /Fe:NativeAotLoader.exe
+cl /nologo /EHsc NativeAotLoader.cpp user32.lib /Fe:NativeAotLoader.exe
 if %ERRORLEVEL% neq 0 (
     echo [ERROR] Failed to compile NativeAotLoader.exe
     exit /b %ERRORLEVEL%

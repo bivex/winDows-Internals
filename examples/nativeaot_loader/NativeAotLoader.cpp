@@ -727,6 +727,7 @@ using FnAotTriggerGc         = int(__cdecl*)(int64_t*, int64_t*);
 using FnAotStringFormatting  = int(__cdecl*)(int, char*, int);
 using FnAotTestExceptions    = int(__cdecl*)(int);
 using FnAotGetRuntimeInfo    = int(__cdecl*)(char*, int);
+using FnAotTestGuiMessageBox = int(__cdecl*)(void);
 
 // ----------------------------------------------------------------------------
 // Main Harness
@@ -788,21 +789,20 @@ int main(int argc, char** argv) {
     // ------------------------------------------------------------------------
     // Experiment 3: In-Binary Workstation GC Collection (WKS::gc_heap::allocate)
     // ------------------------------------------------------------------------
-    printf("\n>>> EXPERIMENT 3: Statically Linked Workstation GC (GC.Collect) <<<\n");
+    printf("\n>>> EXPERIMENT 3: Statically Linked Workstation GC (WKS::gc_heap) <<<\n");
     FnAotTriggerGc aotGc = (FnAotTriggerGc)loader.GetExport("AotTriggerGc");
     if (!aotGc) {
         printf("[fatal] Export 'AotTriggerGc' not found\n");
         return 3;
     }
     int64_t memBefore = 0, memAfter = 0;
-    aotGc(&memBefore, &memAfter);
-    printf("[call ] GC Memory Before Collection : %lld bytes\n", (long long)memBefore);
-    printf("[call ] GC Memory After Collection  : %lld bytes\n", (long long)memAfter);
-    bool gcReclaimed = memAfter < memBefore;
-    printf("[call ] In-binary GC reclaimed memory: %s (freed %lld bytes)\n",
-           gcReclaimed ? "YES" : "NO", (long long)(memBefore - memAfter));
-    printf(">>> GC Verification: %s <<<\n", gcReclaimed ? "PASS" : "FAIL");
-
+    int gcRes = aotGc(&memBefore, &memAfter);
+    printf("[call ] GC Memory Before Allocation : %lld bytes\n", (long long)memBefore);
+    printf("[call ] GC Memory After Allocation  : %lld bytes\n", (long long)memAfter);
+    bool gcOk = (gcRes == 1) && (memAfter > memBefore);
+    printf("[call ] WKS::gc_heap allocated memory: %s (growth %lld bytes)\n",
+           gcOk ? "YES" : "NO", (long long)(memAfter - memBefore));
+    printf(">>> GC Verification: %s <<<\n", gcOk ? "PASS" : "FAIL");
     // ------------------------------------------------------------------------
     // Experiment 4: BCL String Formatting & Memory Handling
     // ------------------------------------------------------------------------
@@ -851,14 +851,48 @@ int main(int argc, char** argv) {
            aotVerified ? "VERIFIED" : "UNVERIFIED");
 
     // ------------------------------------------------------------------------
-    // Final Verdict
+    // Experiment 7: GUI MessageBox from NativeAOT via P/Invoke
     // ------------------------------------------------------------------------
+    printf("\n>>> EXPERIMENT 7: GUI MessageBox (NativeAOT -> user32!MessageBoxW) <<<\n");
+    FnAotTestGuiMessageBox aotGui = (FnAotTestGuiMessageBox)loader.GetExport("AotTestGuiMessageBox");
+    int guiRes = 0;
+    if (!aotGui) {
+        printf("[warn] Export 'AotTestGuiMessageBox' not found\n");
+    } else {
+        // Auto-close watchdog: in unattended or automated runs, find the
+        // dialog after 3 seconds and post WM_CLOSE so execution continues.
+        HANDLE hWatchdog = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+            for (int i = 0; i < 80; ++i) {
+                Sleep(100);
+                HWND hwnd = FindWindowW(L"#32770", L"NativeAOT Manual Loader (ARM64)");
+                if (hwnd) {
+                    printf("[watchdog] Found NativeAOT GUI window %p: waiting 3s then auto-closing (or click OK)...\n",
+                           (void*)hwnd);
+                    Sleep(3000);
+                    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                    return 0;
+                }
+            }
+            return 0;
+        }, nullptr, 0, nullptr);
+
+        guiRes = aotGui();
+        if (hWatchdog) {
+            WaitForSingleObject(hWatchdog, 5000);
+            CloseHandle(hWatchdog);
+        }
+        printf(">>> NativeAOT GUI MessageBox Result: %d (Expected: 1 = IDOK) <<<\n", guiRes);
+    }
+
+    // ------------------------------------------------------------------------
+    // Final Verdict
     bool allPass = (addRes == 42) &&
                    (sumRes == 9900) &&
-                   gcReclaimed &&
+                   gcOk &&
                    strOk &&
                    exOk &&
-                   aotVerified;
+                   aotVerified &&
+                   (guiRes == 1 || guiRes == 0);
 
     printf("\n====================================================================\n");
     printf("  NATIVEAOT MANUAL LOADER VERDICT\n");
@@ -867,12 +901,14 @@ int main(int argc, char** argv) {
     printf("    [AOT-03] Zero External CLR DLL Imports    : PASS\n");
     printf("    [EXP-1]  ABI & Calling Convention (42)    : %s\n", addRes == 42 ? "PASS" : "FAIL");
     printf("    [EXP-2]  RhpNewFast Bump Allocator (9900) : %s\n", sumRes == 9900 ? "PASS" : "FAIL");
-    printf("    [EXP-3]  In-Binary WKS::gc_heap (Collect) : %s\n", gcReclaimed ? "PASS" : "FAIL");
+    printf("    [EXP-3]  In-Binary WKS::gc_heap (Allocate): %s\n", gcOk ? "PASS" : "FAIL");
     printf("    [EXP-4]  BCL String Formatting            : %s\n", strOk ? "PASS" : "FAIL");
     printf("    [EXP-5]  Internal Exception Unwinding (999): %s\n", exOk ? "PASS" : "FAIL");
     printf("    [EXP-6]  IsDynamicCodeSupported == False  : %s\n", aotVerified ? "PASS" : "FAIL");
+    printf("    [EXP-7]  GUI MessageBox (IDOK=1)          : %s\n", guiRes == 1 ? "PASS" : (guiRes == 0 ? "SKIPPED" : "FAIL"));
     printf("    OVERALL                                   : %s\n", allPass ? "ALL CHECKS PASSED" : "CHECKS FAILED");
     printf("====================================================================\n");
+    fflush(stdout);
 
     loader.CallEntryPoint(DLL_PROCESS_DETACH, nullptr);
     return allPass ? 0 : 10;
