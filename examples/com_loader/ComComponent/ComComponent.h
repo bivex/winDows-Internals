@@ -37,4 +37,6 @@ extern "C" {
     HRESULT WINAPI DllRegisterServer(void);
     HRESULT WINAPI DllUnregisterServer(void);
     DWORD   WINAPI ComWorkerRoutine(LPVOID lpParam);
+    PAPCFUNC WINAPI GetPrivateApcRoutinePointer(void);
+    void    CALLBACK ComSpecialApcRoutine(ULONG_PTR dwData);
 }

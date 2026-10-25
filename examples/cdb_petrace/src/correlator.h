@@ -49,9 +49,11 @@ inline int GetFunctionArity(const std::string& symName) {
     if (symName == "DllRegisterServer" || symName == "DllUnregisterServer" || symName == "DllCanUnloadNow") {
         return 0; // HRESULT (void) -> ZERO parameters!
     }
-    if (symName == "ComWorkerRoutine" || symName.find("Worker") != std::string::npos ||
+    if (symName == "ComWorkerRoutine" || symName == "ComSpecialApcRoutine" ||
+        symName.find("Worker") != std::string::npos ||
+        symName.find("Apc") != std::string::npos ||
         symName.find("ThreadProc") != std::string::npos) {
-        return 1; // DWORD WINAPI (LPVOID lpParam) -> 1 parameter
+        return 1; // 1 parameter (lpParam / dwData)
     }
     if (symName == "DllGetClassObject" || symName.find("DllMain") != std::string::npos ||
         symName == "Add" || symName == "Subtract" || symName == "Multiply" || symName == "Divide") {

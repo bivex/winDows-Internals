@@ -217,6 +217,8 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 #pragma comment(linker, "/EXPORT:DllRegisterServer,PRIVATE")
 #pragma comment(linker, "/EXPORT:DllUnregisterServer,PRIVATE")
 #pragma comment(linker, "/EXPORT:ComWorkerRoutine")
+#pragma comment(linker, "/EXPORT:GetPrivateApcRoutinePointer")
+#pragma comment(linker, "/EXPORT:ComSpecialApcRoutine")
 
 extern "C" HRESULT WINAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv) {
     if (!ppv) return E_POINTER;
@@ -251,4 +253,20 @@ extern "C" DWORD WINAPI ComWorkerRoutine(LPVOID lpParam) {
     printf("[ComComponent!ComWorkerRoutine] Worker thread entered! (TID=%lu, param=%p)\n",
            GetCurrentThreadId(), lpParam);
     return 42;
+}
+
+// ----------------------------------------------------------------------------
+// Exotic Vector: Private Unexported Special User APC Routine
+// ----------------------------------------------------------------------------
+extern "C" void CALLBACK ComSpecialApcRoutine(ULONG_PTR dwData) {
+    printf("[ComComponent!ComSpecialApcRoutine] >>> EXOTIC SPECIAL USER APC DELIVERED! <<<\n");
+    printf("  Target Function : ComSpecialApcRoutine (VA: %p)\n", (void*)&ComSpecialApcRoutine);
+    printf("  Mechanism       : QueueUserAPC2 -> ntdll!KiUserApcDispatcher\n");
+    printf("  Interrupted Loop: Strictly non-alertable Sleep(10) interrupted mid-flight!\n");
+    printf("  Argument dwData : 0x%llX\n", (unsigned long long)dwData);
+    printf("  Current Thread  : TID %lu\n", GetCurrentThreadId());
+}
+
+extern "C" PAPCFUNC WINAPI GetPrivateApcRoutinePointer(void) {
+    return (PAPCFUNC)&ComSpecialApcRoutine;
 }

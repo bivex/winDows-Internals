@@ -42,6 +42,7 @@ if not exist "ComComponent" mkdir ComComponent
 if exist "C:\test_com_loader\ComComponent\ComComponent.h" copy /Y "C:\test_com_loader\ComComponent\ComComponent.*" "ComComponent\" >nul
 cl /nologo /LD /EHsc /std:c++20 ComComponent\ComComponent.cpp user32.lib /Fe:ComComponent.dll
 cl /nologo /EHsc /std:c++20 CorrelatorMatrixRunner.cpp user32.lib ole32.lib /Fe:CorrelatorMatrixRunner.exe
+cl /nologo /EHsc /std:c++20 SpecialApcRunner.cpp user32.lib /Fe:SpecialApcRunner.exe
 
 echo.
 echo ====================================================================
@@ -72,3 +73,7 @@ echo [*] Test 2: Capstone CFG Reconstruction (!pecfg)...
 echo.
 echo [*] Test 3: Full 6-Scenario Matrix with Level A/B/C correlation (incl. LOAD_LIBRARY_AS_IMAGE_RESOURCE)...
 "%CDB_EXE%" -c "sxe ld:ComComponent; g; .load C:\test_petrace\petrace.dll; !petrace ComComponent; g; !pechains; !pesummary; !peexport C:\test_petrace\matrix_trace.jsonl; q" CorrelatorMatrixRunner.exe ComComponent.dll
+
+echo.
+echo [*] Test 4: Exotic Vector - Special User APC Execution (!petrace / !pechains)...
+"%CDB_EXE%" -c "sxe ld:ComComponent; g; .load C:\test_petrace\petrace.dll; !petrace ComComponent; g; !pechains; !pesummary; !peexport C:\test_petrace\apc_trace.jsonl; q" SpecialApcRunner.exe ComComponent.dll

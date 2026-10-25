@@ -196,3 +196,78 @@ To validate the correlation engine against the five fundamental user-mode invoca
    * The DbgEng engine (`dbgeng.dll`) does NOT fire a `DEBUG_EVENT_LOAD_MODULE` event.
 
 This empirically confirms why a static scanner (which checks for `MZ`/`PE` in memory) produces false positives, whereas a 3-level correlation tracer correctly recognizes that no execution vector was activated.
+
+---
+
+## 7. Exotic Execution Vector: Windows 11 Special User APC (`QueueUserAPC2`)
+
+In Windows 11 / Windows 10 2004+, Microsoft introduced `QueueUserAPC2` with `QUEUE_USER_APC_FLAGS_SPECIAL_USER_APC (0x00000001)`. Unlike classic User APCs (which require an alertable wait state such as `SleepEx(..., TRUE)`), Special User APCs **force immediate execution on the target thread without alertable wait**.
+
+### 7.1 Delivery Mechanics & Architecture
+
+```
+[Host Caller: SpecialApcRunner.exe]
+           │
+           ▼
+[KERNELBASE!QueueUserAPC2(pfnApc, hThread, dwData, 0x1)]
+           │
+           ▼
+[Syscall: ntdll!NtQueueApcThreadEx2]
+           │
+           ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Windows Kernel (ntoskrnl.exe):                              │
+│ • Sets SpecialUserApc flag on target KTHREAD                │
+│ • Interrupts thread mid-execution during non-alertable sleep│
+│ • Pushes trap frame onto user-mode stack                    │
+│ • Redirects Instruction Pointer to ntdll!KiUserApcDispatcher │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+[ntdll!KiUserApcDispatcher] ──► [ntdll!RtlDispatchAPC]
+                               │
+                               ▼
+[ComComponent!ComSpecialApcRoutine(dwData = 0xDEADBEEF1337)]
+                               │
+                               ▼
+[ntdll!NtContinue] ──► Resumes interrupted Sleep(10) non-alertable loop!
+```
+
+### 7.2 Empirical Level C Execution Proof Logged in `apc_trace.jsonl`
+
+Event sequence 51 captures the exact delivery into `ComSpecialApcRoutine`:
+```json
+{
+  "seq": 51,
+  "kind": "CALL_OBSERVED",
+  "evidence": "DebuggerBreakpoint",
+  "confidence": "CONFIRMED (Level C)",
+  "pid": 9996,
+  "tid": 7728,
+  "timestamp_us": 13437444483899791,
+  "source_va": "0x7ff9d47e5428",
+  "target_va": "0x7ff9ae1d1778",
+  "return_va": "0x7ff9d47e5428",
+  "module": "ComComponent",
+  "symbol": "ComSpecialApcRoutine",
+  "details": "Arg: param0=0x0000DEADBEEF1337",
+  "stack": [
+    "0x7ff9ae1d1778",
+    "0x7ff9d47e5428",
+    "0x7ff9d4875a18",
+    "0x7ff9d4711384",
+    "0x7ff9d477348c",
+    "0x7ff9d03a940c"
+  ]
+}
+```
+
+#### Dissecting the Stack Trace:
+* `Frame #0: 0x7ff9ae1d1778`: Target function (`ComComponent!ComSpecialApcRoutine`).
+* `Frame #1: 0x7ff9d47e5428`: Dispatched from `ntdll!RtlDispatchAPC+0x68`.
+* `Frame #2: 0x7ff9d4875a18`: Dispatched from `ntdll!KiUserApcDispatcher+0x38`.
+* `Frame #3: 0x7ff9d4711384`: **Interrupted kernel syscall** (`ntdll!NtDelayExecution`).
+* `Frame #4: 0x7ff9d477348c`: Calling wrapper `KERNELBASE!SleepEx(10, FALSE)`.
+* `Frame #5: 0x7ff9d03a940c`: Non-alertable caller `KERNEL32!Sleep(10)`.
+
+This provides undeniable proof: the thread was asleep inside non-alertable `Sleep(10)`. The kernel forcibly interrupted it, routed execution through `KiUserApcDispatcher`, and entered the DLL code, returning via `NtContinue` without terminating the worker loop.
