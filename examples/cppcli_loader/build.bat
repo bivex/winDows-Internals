@@ -37,9 +37,22 @@ if %ERRORLEVEL% neq 0 (
     exit /b %ERRORLEVEL%
 )
 
+echo [*] Compiling CppCliLoader.exe (manual PE loader, no MixedLib.lib link)...
+cl /EHsc CppCliLoader.cpp /Fe:CppCliLoader.exe
+if %ERRORLEVEL% neq 0 (
+    echo [ERROR] Failed to compile CppCliLoader.exe
+    exit /b %ERRORLEVEL%
+)
+
 echo.
 echo ====================================================================
 echo   Build Successful! Running MixedExe.exe:
 echo ====================================================================
 MixedExe.exe
 
+echo.
+echo ====================================================================
+echo   Running CppCliLoader.exe (manual mapping, no LoadLibrary):
+echo ====================================================================
+CppCliLoader.exe MixedLib.dll
+exit /b %ERRORLEVEL%
