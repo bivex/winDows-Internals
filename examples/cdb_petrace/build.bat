@@ -1,0 +1,59 @@
+@echo off
+setlocal enabledelayedexpansion
+
+echo ====================================================================
+echo  Building PE Path Tracer (petrace) DbgEng Extension (ARM64)
+echo ====================================================================
+
+:: 1. Initialize MSVC Environment
+where cl.exe >nul 2>&1
+if %ERRORLEVEL% neq 0 (
+    echo [*] Initializing MSVC ARM64 developer environment...
+    if exist "C:\Program Files\Microsoft Visual Studio\18\Insiders\VC\Auxiliary\Build\vcvarsarm64.bat" (
+        call "C:\Program Files\Microsoft Visual Studio\18\Insiders\VC\Auxiliary\Build\vcvarsarm64.bat"
+    ) else if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsarm64.bat" (
+        call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsarm64.bat"
+    ) else (
+        echo [ERROR] Could not find Visual Studio environment.
+        exit /b 1
+    )
+)
+
+:: 2. Compile petrace.dll
+echo [*] Compiling petrace.dll (DbgEng Extension for ARM64)...
+cl /nologo /LD /EHsc /std:c++20 src\petrace.cpp src\pe_analyzer.cpp src\disasm_engine.cpp dbgeng.lib /Fe:petrace.dll
+if %ERRORLEVEL% neq 0 (
+    echo [ERROR] Failed to compile petrace.dll
+    exit /b %ERRORLEVEL%
+)
+
+echo.
+echo ====================================================================
+echo  Build Successful! Testing petrace.dll in cdb.exe...
+echo ====================================================================
+setlocal disabledelayedexpansion
+set "CDB_EXE=C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\cdb.exe"
+if not exist "%CDB_EXE%" (
+    echo [WARN] cdb.exe not found at standard path. Searching...
+    for /f "delims=" %%i in ('where cdb.exe 2^>nul') do set "CDB_EXE=%%i"
+)
+
+if not exist "%CDB_EXE%" (
+    echo [ERROR] Could not locate cdb.exe for ARM64.
+    exit /b 2
+)
+
+echo [*] Test 1: Extension Help Verification (!pehelp)...
+"%CDB_EXE%" -c ".load C:\test_petrace\petrace.dll; !pehelp; .unload C:\test_petrace\petrace.dll; q" calc.exe
+
+echo.
+echo [*] Test 2: PE Invocation Vectors Analysis on calc.exe (!pepaths)...
+"%CDB_EXE%" -c ".load C:\test_petrace\petrace.dll; !pepaths calc; .unload C:\test_petrace\petrace.dll; q" calc.exe
+
+echo.
+echo [*] Test 3: Control Flow Graph (CFG) Reconstruction on calc (!pecfg)...
+"%CDB_EXE%" -c ".load C:\test_petrace\petrace.dll; !pecfg calc!wWinMainCRTStartup; .unload C:\test_petrace\petrace.dll; q" calc.exe
+
+echo.
+echo [*] Test 4: PE Invocation Vectors & CFG on ComComponent.dll (!pepaths / !pecfg)...
+"%CDB_EXE%" -c "sxe ld:ComComponent; g; .load C:\test_petrace\petrace.dll; !pepaths ComComponent; !pecfg ComComponent!DllGetClassObject; .unload C:\test_petrace\petrace.dll; q" regsvr32.exe /s C:\test_com_loader\ComComponent.dll
